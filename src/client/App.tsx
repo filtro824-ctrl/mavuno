@@ -3,7 +3,7 @@ import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
 import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type Message, type User } from './api';
 
-type ModalType = 'community' | 'channel' | 'profile' | null;
+type ModalType = 'community' | 'channel' | 'profile' | 'account' | null;
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
 
 function initials(value: string): string {
@@ -115,6 +115,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const listRef = useRef<HTMLDivElement | null>(null);
   const nearBottom = useRef(true);
   const tuckTimer = useRef<number | undefined>(undefined);
@@ -389,8 +390,16 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       <footer className="side-footer">
         <Avatar name={user.username} url={user.avatarUrl}/>
         <span style={{ minWidth: 0, flex: 1 }}><strong style={{ fontSize: 13, display: 'block', overflow: 'hidden', textOverflow: 'ellipsis' }}>{user.username}</strong><span className="muted" style={{ fontSize: 11 }}>{online ? 'Ligado' : 'Sem ligação'}</span></span>
-        <button className="icon-button" aria-label="Editar perfil" title="Editar perfil" onClick={() => setModal('profile')}>◎</button>
-        <button className="icon-button" aria-label="Terminar sessão" title="Terminar sessão" onClick={() => void logout()}>↗</button>
+        <button className="icon-button" aria-label="Editar perfil" title="Editar perfil" onClick={() => { setAccountMenuOpen(false); setModal('profile'); }}>◎</button>
+        <div className="account-menu-wrap">
+          <button className="icon-button" aria-label="Abrir menu da conta" title="Menu da conta" aria-haspopup="menu" aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((value) => !value)}>⋯</button>
+          {accountMenuOpen && <div className="account-menu" role="menu">
+            <strong className="account-menu-title">Conta</strong>
+            <button role="menuitem" className="account-menu-item" onClick={() => { setAccountMenuOpen(false); setModal('profile'); }}>Editar perfil</button>
+            <button role="menuitem" className="account-menu-item" onClick={() => { setAccountMenuOpen(false); setModal('account'); }}>Planos e funcionalidades</button>
+            <button role="menuitem" className="account-menu-item danger-text" onClick={() => { setAccountMenuOpen(false); void logout(); }}>Terminar sessão</button>
+          </div>}
+        </div>
       </footer>
     </aside>
 
@@ -461,6 +470,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     {modal === 'community' && <CommunityModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createCommunity(data)}/>}
     {modal === 'channel' && <ChannelModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createChannel(data)}/>}
     {modal === 'profile' && <ProfileModal user={user} busy={profileBusy} onClose={() => setModal(null)} onSave={(data) => void updateProfile(data)}/>}
+    {modal === 'account' && <AccountModal user={user} onClose={() => setModal(null)} onEditProfile={() => setModal('profile')}/>}
     {toast && <div className="toast" role="status">{toast}</div>}
   </div>;
 }
@@ -512,6 +522,18 @@ function ProfileModal({ user, busy, onClose, onSave }: {
         <p className="muted" style={{ fontSize: 12 }}>A imagem remota é carregada apenas quando necessária.</p>
         <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar perfil'}</button></div>
       </form>
+    </section>
+  </div>;
+}
+
+function AccountModal({ user, onClose, onEditProfile }: { user: User; onClose: () => void; onEditProfile: () => void }) {
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="modal account-modal" role="dialog" aria-modal="true" aria-labelledby="account-title">
+      <div className="account-modal-heading"><Avatar name={user.username} url={user.avatarUrl} size={42}/><div><h2 id="account-title">A tua conta</h2><p className="muted" style={{ margin: 0 }}>@{user.username}</p></div></div>
+      <div className="account-tabs" role="tablist" aria-label="Área da conta"><button className="account-tab active" role="tab" aria-selected="true">Conta</button><button className="account-tab" role="tab" aria-selected="false" disabled>Planos</button></div>
+      <div className="account-section"><strong>Planos e funcionalidades</strong><p className="muted">A área de planos está preparada para uma futura implementação de subscrições. Nenhum plano pago está ativo nesta versão.</p><span className="account-status">Em preparação</span></div>
+      <div className="account-section"><strong>Perfil</strong><p className="muted">Atualiza o teu nome de utilizador e avatar sem sair da sessão.</p><button className="secondary" onClick={onEditProfile}>Editar perfil</button></div>
+      <div className="modal-actions"><button className="primary" onClick={onClose}>Fechar</button></div>
     </section>
   </div>;
 }
