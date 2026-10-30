@@ -205,16 +205,53 @@ try {
   const pageTwo = await userA.request<{ messages: Array<{ id: string }>; hasMore: boolean }>(`/api/channels/${channelId}/messages?before=${encodeURIComponent(pageOne.data.nextCursor!)}`);
   record(pageTwo.status === 200 && pageTwo.data.messages.length === 2 && !pageTwo.data.hasMore && !pageTwo.data.messages.some((message) => pageOne.data.messages.some((first) => first.id === message.id)), 'Cursor page has no duplicates and covers the remaining history');
 
-  const reply = await userA.request<{ message: { replyToId: string | null } }>(`/api/channels/${channelId}/messages`, {
+  const reply = await userA.request<{ message: { id: string; replyToId: string | null } }>(`/api/channels/${channelId}/messages`, {
     method: 'POST', body: { clientMessageId: randomUUID(), body: `Resposta ${runId}`, replyToId: firstMessage.data.message.id },
   });
   record(reply.status === 201 && reply.data.message.replyToId === firstMessage.data.message.id, 'Reply remains linked to a message in this channel');
+
+  const pin = await userA.request<{ message: { pinnedAt: string | null } }>(`/api/messages/${reply.data.message.id}/pin`, { method: 'POST', body: {} });
+  record(pin.status === 200 && Boolean(pin.data.message.pinnedAt), 'Authorized moderator can pin a message');
+  const pinnedHistory = await userB.request<{ messages: Array<{ id: string; pinnedAt: string | null }> }>(`/api/channels/${channelId}/messages`);
+  record(pinnedHistory.status === 200 && pinnedHistory.data.messages.some((message) => message.id === reply.data.message.id && Boolean(message.pinnedAt)), 'Pinned state persists in PostgreSQL and is visible to members');
+  const unpin = await userA.request(`/api/messages/${reply.data.message.id}/pin`, { method: 'DELETE' });
+  record(unpin.status === 200, 'Authorized moderator can unpin a message');
+
+  const mute = await userA.request<{ expiresAt: string }>(`/api/communities/${privateCommunityId}/members/${registerB.data.user.id}/mute`, { method: 'POST', body: { durationMinutes: 5, reason: 'Teste de moderação' } });
+  record(mute.status === 200 && new Date(mute.data.expiresAt).getTime() > Date.now(), 'Owner can apply a temporary mute with an expiry');
+  const mutedSend = await userB.request(`/api/channels/${channelId}/messages`, { method: 'POST', body: { clientMessageId: randomUUID(), body: `Bloqueada ${runId}` } });
+  record(mutedSend.status === 403, 'Muted member cannot send messages through the HTTP API');
+  const unmute = await userA.request(`/api/communities/${privateCommunityId}/members/${registerB.data.user.id}/mute`, { method: 'DELETE' });
+  record(unmute.status === 200, 'Owner can remove an active mute');
+
+  const ban = await userA.request(`/api/communities/${privateCommunityId}/members/${registerB.data.user.id}/ban`, { method: 'POST', body: { reason: 'Teste de banimento' } });
+  record(ban.status === 200, 'Owner can ban a lower-hierarchy member');
+  const bannedJoin = await userB.request(`/api/invites/${invite.data.token}/join`, { method: 'POST', body: {} });
+  record(bannedJoin.status === 403, 'Banned member cannot rejoin through an invitation');
+  const unban = await userA.request(`/api/communities/${privateCommunityId}/bans/${registerB.data.user.id}`, { method: 'DELETE' });
+  record(unban.status === 200, 'Owner can revoke a ban');
+  const rejoinAfterUnban = await userB.request(`/api/invites/${invite.data.token}/join`, { method: 'POST', body: {} });
+  record(rejoinAfterUnban.status === 200, 'Revoked ban permits a new invitation join');
+
+  const livekitConfigured = Boolean(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET);
+  const rejectedCall = await userA.request<{ call: { id: string; status: string } }>('/api/calls', { method: 'POST', body: { calleeId: registerB.data.user.id } });
+  record(rejectedCall.status === 201 && rejectedCall.data.call.status === 'ringing', 'Authenticated user can initiate a private call in ringing state');
+  const rejectCall = await userB.request(`/api/calls/${rejectedCall.data.call.id}`, { method: 'PATCH', body: { status: 'rejected' } });
+  record(rejectCall.status === 200, 'Recipient can reject a private call');
+  const acceptedCall = await userA.request<{ call: { id: string; status: string } }>('/api/calls', { method: 'POST', body: { calleeId: registerB.data.user.id } });
+  assert.equal(acceptedCall.status, 201);
+  const acceptCall = await userB.request(`/api/calls/${acceptedCall.data.call.id}`, { method: 'PATCH', body: { status: 'accepted' } });
+  record(acceptCall.status === 200, 'Recipient can accept a private call');
+  const callToken = await userA.request<{ token?: string }>(`/api/calls/${acceptedCall.data.call.id}/token`, { method: 'POST', body: {} });
+  if (livekitConfigured) record(callToken.status === 200 && Boolean(callToken.data.token), 'Accepted private call receives a server-issued LiveKit token');
+  else record(callToken.status === 503, 'Private call reports missing LiveKit configuration without simulating audio');
+  const endCall = await userA.request(`/api/calls/${acceptedCall.data.call.id}`, { method: 'PATCH', body: { status: 'ended' } });
+  record(endCall.status === 200, 'Participant can terminate a private call');
 
   const voiceChannel = await userA.request<{ channel: { id: string; kind: string } }>(`/api/communities/${privateCommunityId}/channels`, {
     method: 'POST', body: { name: `voz_${runId}`, topic: 'Smoke test', kind: 'voice' },
   });
   record(voiceChannel.status === 201 && voiceChannel.data.channel.kind === 'voice', 'Authorized user creates a real voice-room database record');
-  const livekitConfigured = Boolean(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET);
   const voiceToken = await userA.request<{ token?: string; serverUrl?: string }>(`/api/channels/${voiceChannel.data.channel.id}/voice-token`, { method: 'POST', body: {} });
   if (livekitConfigured) record(voiceToken.status === 200 && Boolean(voiceToken.data.token) && Boolean(voiceToken.data.serverUrl), 'Backend issues a signed LiveKit token to an authorized member');
   else record(voiceToken.status === 503, 'Voice endpoint reports missing LiveKit configuration without simulation');

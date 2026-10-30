@@ -351,3 +351,11 @@ O ZIP foi validado com teste de integridade e extração numa pasta limpa.
 [5]: https://docs.github.com/en/get-started/learning-to-code/storing-your-secrets-safely "GitHub — Storing your secrets safely"
 [6]: https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository "GitHub — Removing sensitive data from a repository"
 [7]: https://render.com/pricing "Render Pricing"
+
+## 15. Estado final — chamadas privadas e módulo multimédia
+
+A implementação final acrescentou chamadas privadas entre membros, persistidas no PostgreSQL, com convite Socket.IO, aceitação, recusa, término, estados de ligação, controlos de microfone e tokens LiveKit emitidos somente pelo backend. Os canais de voz de comunidade existentes foram preservados. Como as credenciais LiveKit não estavam configuradas, não foi declarado áudio real funcional.
+
+O módulo multimédia e AutoMod recebido em 2026-10-31 foi analisado, mas não é declarado concluído. O projeto ainda não possui armazenamento de anexos, upload multipart com validação do tipo real, imagens/GIFs/vídeos/documentos, reações persistentes, emojis/stickers personalizados, preview de links, capacidades por canal ou AutoMod persistente. Também não existe serviço externo de classificação/análise de conteúdo integrado. Essas funções permanecem pendentes e não foram substituídas por botões sem backend.
+
+A validação final passou `pnpm typecheck`, `pnpm test` com 4/4 testes unitários e `pnpm build`. O smoke test de integração passou com 65 verificações; `pnpm db:migrate` passou no PostgreSQL configurado. Nenhum serviço foi publicado nesta entrega.

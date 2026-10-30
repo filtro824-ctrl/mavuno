@@ -2,7 +2,9 @@ import { pgTable, pgEnum, uuid, varchar, text, boolean, timestamp, integer, uniq
 
 export const roleKey = pgEnum('role_key', ['owner', 'admin', 'moderator', 'member']);
 export const permissionKey = pgEnum('permission_key', [
-  'manage_community', 'manage_channels', 'delete_messages', 'kick_members', 'create_invites', 'send_messages', 'join_voice',
+  'manage_community', 'manage_channels', 'manage_members', 'manage_roles', 'manage_channel_permissions',
+  'delete_messages', 'pin_messages', 'kick_members', 'ban_members', 'mute_members', 'view_audit_log',
+  'create_invites', 'send_messages', 'join_voice',
 ]);
 
 export const users = pgTable('users', {
@@ -28,6 +30,8 @@ export const communities = pgTable('communities', {
   slug: varchar('slug', { length: 100 }).notNull().unique(),
   description: varchar('description', { length: 500 }).notNull().default(''),
   category: varchar('category', { length: 40 }).notNull().default('Geral'),
+  imageUrl: text('image_url'),
+  rules: varchar('rules', { length: 4000 }).notNull().default(''),
   isPrivate: boolean('is_private').notNull().default(false),
   ownerId: uuid('owner_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -38,11 +42,12 @@ export const communityRoles = pgTable('community_roles', {
   communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'cascade' }),
   key: roleKey('key').notNull(),
   name: varchar('name', { length: 40 }).notNull(),
+  hierarchy: integer('hierarchy').notNull().default(10),
 }, (t) => [uniqueIndex('community_roles_key_unique').on(t.communityId, t.key)]);
 
 export const rolePermissions = pgTable('role_permissions', {
   roleId: uuid('role_id').notNull().references(() => communityRoles.id, { onDelete: 'cascade' }),
-  permission: permissionKey('permission').notNull(),
+  permission: varchar('permission', { length: 50 }).notNull(),
 }, (t) => [uniqueIndex('role_permissions_unique').on(t.roleId, t.permission)]);
 
 export const communityMembers = pgTable('community_members', {
@@ -70,7 +75,49 @@ export const messages = pgTable('messages', {
   body: varchar('body', { length: 2000 }).notNull(),
   replyToId: uuid('reply_to_id'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  pinnedAt: timestamp('pinned_at', { withTimezone: true }),
+  pinnedBy: uuid('pinned_by').references(() => users.id, { onDelete: 'set null' }),
 }, (t) => [uniqueIndex('messages_client_unique').on(t.channelId, t.authorId, t.clientMessageId), index('messages_channel_cursor_idx').on(t.channelId, t.createdAt, t.id)]);
+
+export const channelPermissions = pgTable('channel_permissions', {
+  channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
+  roleId: uuid('role_id').notNull().references(() => communityRoles.id, { onDelete: 'cascade' }),
+  permission: varchar('permission', { length: 50 }).notNull(),
+  enabled: boolean('enabled').notNull().default(true),
+}, (t) => [uniqueIndex('channel_permissions_unique').on(t.channelId, t.roleId, t.permission)]);
+
+export const communityBans = pgTable('community_bans', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'cascade' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  actorId: uuid('actor_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  reason: varchar('reason', { length: 500 }).notNull().default(''),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+}, (t) => [index('community_bans_lookup_idx').on(t.communityId, t.userId, t.revokedAt)]);
+
+export const communityMutes = pgTable('community_mutes', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'cascade' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  actorId: uuid('actor_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  reason: varchar('reason', { length: 500 }).notNull().default(''),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+}, (t) => [index('community_mutes_lookup_idx').on(t.communityId, t.userId, t.expiresAt, t.revokedAt)]);
+
+export const moderationAuditLogs = pgTable('moderation_audit_logs', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'cascade' }),
+  actorId: uuid('actor_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  targetUserId: uuid('target_user_id').references(() => users.id, { onDelete: 'set null' }),
+  action: varchar('action', { length: 60 }).notNull(),
+  reason: varchar('reason', { length: 500 }).notNull().default(''),
+  durationSeconds: integer('duration_seconds'),
+  metadata: text('metadata').notNull().default('{}'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index('moderation_audit_community_idx').on(t.communityId, t.createdAt)]);
 
 export const messageMentions = pgTable('message_mentions', {
   messageId: uuid('message_id').notNull().references(() => messages.id, { onDelete: 'cascade' }),
@@ -95,6 +142,17 @@ export const voiceRooms = pgTable('voice_rooms', {
   livekitRoom: varchar('livekit_room', { length: 120 }).notNull().unique(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const privateCalls = pgTable('private_calls', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  callerId: uuid('caller_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  calleeId: uuid('callee_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  status: varchar('status', { length: 20 }).notNull().default('initiated'),
+  livekitRoom: varchar('livekit_room', { length: 140 }).notNull().unique(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  answeredAt: timestamp('answered_at', { withTimezone: true }),
+  endedAt: timestamp('ended_at', { withTimezone: true }),
+}, (t) => [index('private_calls_participants_idx').on(t.callerId, t.calleeId, t.createdAt)]);
 
 export const passwordResetTokens = pgTable('password_reset_tokens', {
   id: uuid('id').defaultRandom().primaryKey(),

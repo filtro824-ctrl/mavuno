@@ -1,9 +1,9 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
-import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type Message, type User } from './api';
+import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type Message, type PrivateCall, type PrivateCallStatus, type User } from './api';
 
-type ModalType = 'community' | 'channel' | 'profile' | 'account' | null;
+type ModalType = 'community' | 'channel' | 'profile' | 'account' | 'admin' | null;
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
 
 function initials(value: string): string {
@@ -116,6 +116,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [callTarget, setCallTarget] = useState<Member | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const nearBottom = useRef(true);
   const tuckTimer = useRef<number | undefined>(undefined);
@@ -223,6 +224,8 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     });
     socket.on('message:new', (message: Message) => setMessages((current) => mergeMessage(current, message)));
     socket.on('message:deleted', (event: { id: string }) => setMessages((current) => current.filter((message) => message.id !== event.id)));
+    socket.on('message:pinned', (event: { id: string; pinnedAt: string; pinnedBy: string }) => setMessages((current) => current.map((message) => message.id === event.id ? { ...message, ...event } : message)));
+    socket.on('message:unpinned', (event: { id: string }) => setMessages((current) => current.map((message) => message.id === event.id ? { ...message, pinnedAt: null, pinnedBy: null } : message)));
     socket.on('channel:deleted', (event: { id: string }) => {
       if (event.id === channel.id) { setChannel(null); notify('Este canal foi removido.'); }
     });
@@ -333,6 +336,26 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       notify(`${member.username} foi removido.`);
     } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível remover este membro.'); }
   };
+  const deleteMessage = async (message: Message) => {
+    if (!window.confirm('Apagar esta mensagem permanentemente?')) return;
+    try { await api(`/messages/${message.id}`, { method: 'DELETE' }); setMessages((current) => current.filter((item) => item.id !== message.id)); notify('Mensagem apagada.'); }
+    catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível apagar a mensagem.'); }
+  };
+  const togglePin = async (message: Message) => {
+    try {
+      if (message.pinnedAt) { await api(`/messages/${message.id}/pin`, { method: 'DELETE' }); setMessages((current) => current.map((item) => item.id === message.id ? { ...item, pinnedAt: null, pinnedBy: null } : item)); notify('Mensagem desafixada.'); }
+      else { const result = await api<{ message: { pinnedAt: string; pinnedBy: string } }>(`/messages/${message.id}/pin`, { method: 'POST', body: '{}' }); setMessages((current) => current.map((item) => item.id === message.id ? { ...item, ...result.message } : item)); notify('Mensagem fixada.'); }
+    } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível atualizar a mensagem.'); }
+  };
+  const moderateMember = async (action: 'mute' | 'unmute' | 'ban' | 'kick', member: Member, durationMinutes?: number) => {
+    if (!activeCommunityId) return;
+    try {
+      if (action === 'kick') await kickMember(member);
+      else if (action === 'ban') { if (!window.confirm(`Banir ${member.username}?`)) return; await api(`/communities/${activeCommunityId}/members/${member.id}/ban`, { method: 'POST', body: JSON.stringify({}) }); setDetails((current) => current ? { ...current, members: current.members.filter((item) => item.id !== member.id) } : current); notify(`${member.username} foi banido.`); }
+      else if (action === 'mute') { const result = await api<{ expiresAt: string }>(`/communities/${activeCommunityId}/members/${member.id}/mute`, { method: 'POST', body: JSON.stringify({ durationMinutes }) }); setDetails((current) => current ? { ...current, members: current.members.map((item) => item.id === member.id ? { ...item, mutedUntil: result.expiresAt } : item) } : current); notify(`${member.username} foi silenciado.`); }
+      else { await api(`/communities/${activeCommunityId}/members/${member.id}/mute`, { method: 'DELETE' }); setDetails((current) => current ? { ...current, members: current.members.map((item) => item.id === member.id ? { ...item, mutedUntil: null } : item) } : current); notify('Silenciamento removido.'); }
+    } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível aplicar a ação de moderação.'); }
+  };
   const updateProfile = async (data: { username?: string; avatarUrl?: string | null }) => {
     setProfileBusy(true);
     try {
@@ -357,6 +380,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       <header className="side-header">
         <strong>{explore ? 'Explorar' : details?.community.name ?? 'As tuas conversas'}</strong>
         <div style={{ display: 'flex', gap: 4 }}>
+          {details && isManager && <button className="icon-button" title="Configurações da comunidade" aria-label="Configurações da comunidade" onClick={() => setModal('admin')}>⚙</button>}
           {details && isManager && <button className="icon-button" title="Criar convite" aria-label="Criar convite" onClick={() => void createInvite()}>↗</button>}
           {details && isManager && <button className="icon-button" title="Criar canal" aria-label="Criar canal" onClick={() => setModal('channel')}>＋</button>}
         </div>
@@ -379,7 +403,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
           {isManager && member.role !== 'owner' ? <select className="role-select" aria-label={`Cargo de ${member.username}`} value={member.role} onChange={(event) => void changeRole(member, event.target.value)}>
             <option value="admin">Admin</option><option value="moderator">Moderador</option><option value="member">Membro</option>
           </select> : <small className="member-role">{roleLabels[member.role] ?? member.role}</small>}
-          {canKick && member.id !== user.id && member.role !== 'owner' && <button className="member-remove" title={`Remover ${member.username}`} aria-label={`Remover ${member.username}`} onClick={() => void kickMember(member)}>×</button>}
+          {canKick && member.id !== user.id && member.role !== 'owner' && <MemberActions member={member} onAction={(action, duration) => void moderateMember(action, member, duration)} onCall={() => setCallTarget(member)}/>} 
         </div>)}
         {details.myRole && details.myRole !== 'owner' && <button className="text-button" style={{ marginTop: 12 }} onClick={() => void leaveCommunity()}>Sair da comunidade</button>}
         {!details.myRole && <p className="muted" style={{ fontSize: 12, padding: 8 }}>Precisas de um convite para abrir os canais.</p>}
@@ -433,12 +457,12 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
             <div style={{ minWidth: 0, flex: 1 }}>
               <div className="message-meta">{message.username}<time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time></div>
               {message.replyToId && <div className="muted" style={{ fontSize: 11 }}>↳ resposta a uma mensagem</div>}
-              <div className="message-body">{message.body}</div>
+              <div className="message-body">{message.pinnedAt && <span className="pinned-label">Fixada · </span>}{message.body}</div>
               {message.delivery === 'sending' && <span className="muted" style={{ fontSize: 11 }}>A enviar…</span>}
               {message.delivery === 'failed' && <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span style={{ fontSize: 11, color: 'var(--danger)' }}>Falhou enviar</span><button className="text-button" onClick={() => void sendMessage(message.body, message.clientMessageId)}>Tentar novamente</button></div>}
-              <div style={{ display: 'flex', gap: 8 }}>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 {!message.delivery && <button className="text-button" style={{ fontSize: 11 }} onClick={() => setReply(message)}>Responder</button>}
-                {!message.delivery && (message.authorId === user.id || ['owner', 'admin', 'moderator'].includes(details?.myRole ?? '')) && <button className="text-button" style={{ fontSize: 11, color: 'var(--danger)' }} onClick={() => void api(`/messages/${message.id}`, { method: 'DELETE' }).then(() => setMessages((prev) => prev.filter((item) => item.id !== message.id))).catch((cause: Error) => notify(cause.message))}>Apagar</button>}
+                {!message.delivery && <MessageActions message={message} own={message.authorId === user.id} canModerate={['owner', 'admin', 'moderator'].includes(details?.myRole ?? '')} onDelete={() => void deleteMessage(message)} onPin={() => void togglePin(message)}/>} 
               </div>
             </div>
           </article>)}
@@ -471,8 +495,61 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     {modal === 'channel' && <ChannelModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createChannel(data)}/>}
     {modal === 'profile' && <ProfileModal user={user} busy={profileBusy} onClose={() => setModal(null)} onSave={(data) => void updateProfile(data)}/>}
     {modal === 'account' && <AccountModal user={user} onClose={() => setModal(null)} onEditProfile={() => setModal('profile')}/>}
+    <PrivateCallDock target={callTarget} onClearTarget={() => setCallTarget(null)} notify={notify}/>
     {toast && <div className="toast" role="status">{toast}</div>}
   </div>;
+}
+
+function MessageActions({ message, own, canModerate, onDelete, onPin }: { message: Message; own: boolean; canModerate: boolean; onDelete: () => void; onPin: () => void }) {
+  const [open, setOpen] = useState(false);
+  if (!own && !canModerate) return null;
+  return <span className="context-menu-wrap"><button className="text-button context-trigger" aria-label="Ações da mensagem" aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}>⋯</button>{open && <span className="context-menu" role="menu">
+    {canModerate && <button role="menuitem" onClick={() => { setOpen(false); onPin(); }}>{message.pinnedAt ? 'Desafixar' : 'Fixar'}</button>}
+    {(own || canModerate) && <button role="menuitem" className="danger-text" onClick={() => { setOpen(false); onDelete(); }}>Apagar</button>}
+  </span>}</span>;
+}
+
+function MemberActions({ member, onAction, onCall }: { member: Member; onAction: (action: 'mute' | 'unmute' | 'ban' | 'kick', duration?: number) => void; onCall: () => void }) {
+  const [open, setOpen] = useState(false);
+  return <span className="context-menu-wrap"><button className="member-remove" aria-label={`Ações de ${member.username}`} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}>⋯</button>{open && <span className="context-menu member-context-menu" role="menu">
+    {member.mutedUntil ? <button role="menuitem" onClick={() => { setOpen(false); onAction('unmute'); }}>Remover silêncio</button> : <><button role="menuitem" onClick={() => { setOpen(false); onAction('mute', 5); }}>Silenciar · 5 min</button><button role="menuitem" onClick={() => { setOpen(false); onAction('mute', 60); }}>Silenciar · 1 hora</button></>}
+    <button role="menuitem" onClick={() => { setOpen(false); onCall(); }}>Chamada de voz</button><button role="menuitem" onClick={() => { setOpen(false); onAction('kick'); }}>Expulsar</button><button role="menuitem" className="danger-text" onClick={() => { setOpen(false); onAction('ban'); }}>Banir</button>
+  </span>}</span>;
+}
+
+function PrivateCallDock({ target, onClearTarget, notify }: { target: Member | null; onClearTarget: () => void; notify: (text: string) => void }) {
+  const [call, setCall] = useState<PrivateCall | null>(null); const [error, setError] = useState(''); const [connecting, setConnecting] = useState(false); const [micOn, setMicOn] = useState(true); const roomRef = useRef<Room | null>(null); const connectedCall = useRef<string | null>(null);
+  const statusLabels: Record<PrivateCallStatus, string> = { initiated: 'Iniciada', ringing: 'A tocar', accepted: 'Aceite', connecting: 'A ligar', in_progress: 'Em curso', rejected: 'Recusada', timeout: 'Sem resposta', failed: 'Falhada', ended: 'Terminada' };
+  useEffect(() => {
+    const socket = io({ withCredentials: true, transports: ['websocket', 'polling'] });
+    socket.on('call:incoming', (event: { callId: string; caller: { id: string; username: string; avatarUrl: string | null }; status: PrivateCallStatus }) => setCall({ id: event.callId, status: event.status, peer: event.caller }));
+    socket.on('call:status', (event: { callId: string; status: PrivateCallStatus }) => setCall((current) => current?.id === event.callId ? { ...current, status: event.status } : current));
+    return () => { socket.disconnect(); };
+  }, []);
+  useEffect(() => {
+    if (!target || call) return;
+    setError(''); setCall({ id: '', status: 'initiated', peer: { id: target.id, username: target.username, avatarUrl: target.avatarUrl } });
+    void api<{ call: { id: string; status: PrivateCallStatus; peer: PrivateCall['peer'] } }>('/calls', { method: 'POST', body: JSON.stringify({ calleeId: target.id }) }).then((result) => setCall({ id: result.call.id, status: result.call.status, peer: result.call.peer })).catch((cause) => { setCall({ id: '', status: 'failed', peer: { id: target.id, username: target.username, avatarUrl: target.avatarUrl } }); setError(cause instanceof Error ? cause.message : 'Não foi possível iniciar a chamada.'); }).finally(onClearTarget);
+  }, [target, call, onClearTarget]);
+  const update = async (status: 'accepted' | 'rejected' | 'timeout' | 'ended') => { if (!call?.id) return; try { await api(`/calls/${call.id}`, { method: 'PATCH', body: JSON.stringify({ status }) }); setCall((current) => current ? { ...current, status } : current); if (status !== 'accepted') { await roomRef.current?.disconnect(); roomRef.current = null; } } catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível atualizar a chamada.'); } };
+  useEffect(() => {
+    if (!call || call.status !== 'accepted' || connectedCall.current === call.id) return;
+    connectedCall.current = call.id; setConnecting(true); setError(''); setCall((current) => current ? { ...current, status: 'connecting' } : current);
+    void api<{ token: string; serverUrl: string }>(`/calls/${call.id}/token`, { method: 'POST', body: '{}' }).then(async (credentials) => { const { Room: LiveKitRoom, RoomEvent } = await import('livekit-client'); const room = new LiveKitRoom({ adaptiveStream: true, dynacast: true }); roomRef.current = room; room.on(RoomEvent.Disconnected, () => { roomRef.current = null; setCall((current) => current ? { ...current, status: 'ended' } : current); }); await room.connect(credentials.serverUrl, credentials.token); await room.localParticipant.setMicrophoneEnabled(true); setMicOn(true); setCall((current) => current ? { ...current, status: 'in_progress' } : current); }).catch((cause) => { connectedCall.current = null; setCall((current) => current ? { ...current, status: 'failed' } : current); setError(cause instanceof Error ? cause.message : 'Falha ao ligar o áudio.'); }).finally(() => setConnecting(false));
+  }, [call]);
+  if (!call) return null;
+  const close = async () => { await roomRef.current?.disconnect(); roomRef.current = null; if (call.id && !['ended', 'rejected', 'timeout', 'failed'].includes(call.status)) await update('ended'); else setCall(null); };
+  return <aside className="call-dock" role="dialog" aria-label="Chamada privada"><div className="call-dock-header"><Avatar name={call.peer?.username ?? 'Utilizador'} url={call.peer?.avatarUrl} size={38}/><div><strong>Chamada com {call.peer?.username ?? 'utilizador'}</strong><span className="muted">{statusLabels[call.status]}{connecting ? '…' : ''}</span></div></div>{error && <p className="error-banner">{error}</p>}{call.status === 'ringing' && <div className="call-actions"><button className="primary" onClick={() => void update('accepted')}>Aceitar</button><button className="secondary" onClick={() => void update('rejected')}>Recusar</button></div>}{call.status === 'in_progress' && <div className="call-actions"><button className="secondary" onClick={() => { const room = roomRef.current; if (!room) return; void room.localParticipant.setMicrophoneEnabled(!micOn); setMicOn((value) => !value); }}>{micOn ? 'Silenciar' : 'Ativar microfone'}</button><button className="danger-button" onClick={() => void close()}>Terminar</button></div>}{['failed', 'ended', 'rejected', 'timeout'].includes(call.status) && <button className="secondary" onClick={() => setCall(null)}>Fechar</button>}</aside>;
+}
+
+function AdminModal({ details, onClose, onSaved }: { details: CommunityDetails; onClose: () => void; onSaved: () => void }) {
+  const [busy, setBusy] = useState(false); const [error, setError] = useState('');
+  const save = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setBusy(true); setError(''); const form = new FormData(event.currentTarget);
+    try { await api(`/communities/${details.community.id}`, { method: 'PATCH', body: JSON.stringify({ name: String(form.get('name')), description: String(form.get('description')), category: String(form.get('category')), rules: String(form.get('rules')) }) }); onSaved(); onClose(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível guardar.'); } finally { setBusy(false); }
+  };
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="modal admin-modal" role="dialog" aria-modal="true" aria-labelledby="admin-title"><h2 id="admin-title">⚙ Administração</h2><p className="muted" style={{ fontSize: 13 }}>Configura a comunidade. As ações de membros e canais continuam protegidas no servidor.</p>{error && <p className="error-banner">{error}</p>}<form onSubmit={(event) => void save(event)}><label className="field">Nome<input name="name" defaultValue={details.community.name} required/></label><label className="field">Descrição<textarea name="description" defaultValue={details.community.description} rows={3}/></label><label className="field">Categoria<input name="category" defaultValue={details.community.category} required/></label><label className="field">Regras<textarea name="rules" defaultValue={details.community.rules ?? ''} rows={4} placeholder="Regras da comunidade"/></label><div className="admin-summary"><strong>Gestão</strong><span>{details.members.length} membros · {details.channels.length} canais</span><span>Funções: proprietário, administrador, moderador e membro</span><span>Auditoria e moderação estão protegidas por permissões do backend.</span></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar alterações'}</button></div></form></section></div>;
 }
 
 function CommunityModal({ busy, onClose, onCreate }: {

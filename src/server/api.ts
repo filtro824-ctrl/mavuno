@@ -5,19 +5,20 @@ import { AccessToken } from 'livekit-server-sdk';
 import { db, pool } from './db/index.js';
 import {
   channels, communities, communityMembers, communityRoles, invitations, messages,
-  messageMentions, rolePermissions, sessions, users, voiceRooms,
+  messageMentions, rolePermissions, sessions, users, voiceRooms, communityBans, communityMutes,
+  moderationAuditLogs, privateCalls,
 } from './db/schema.js';
 import { createOpaqueToken, digestToken, hashPassword, readSessionCookie, setCsrfCookie, setSessionCookie, clearSessionCookie, verifyPassword } from './security.js';
-import { hasPermission, isMember, roleIdFor, type Permission } from './permissions.js';
+import { hasPermission, isMember, roleFor, roleIdFor, type Permission } from './permissions.js';
 import type { Server as SocketServer } from 'socket.io';
 
 interface PublicUser { id: string; username: string; email: string; avatarUrl: string | null }
-interface RoleDef { key: 'owner' | 'admin' | 'moderator' | 'member'; name: string; permissions: Permission[] }
+interface RoleDef { key: 'owner' | 'admin' | 'moderator' | 'member'; name: string; hierarchy: number; permissions: Permission[] }
 const permissionSet: RoleDef[] = [
-  { key: 'owner', name: 'Proprietário', permissions: ['manage_community', 'manage_channels', 'delete_messages', 'kick_members', 'create_invites', 'send_messages', 'join_voice'] },
-  { key: 'admin', name: 'Administrador', permissions: ['manage_community', 'manage_channels', 'delete_messages', 'kick_members', 'create_invites', 'send_messages', 'join_voice'] },
-  { key: 'moderator', name: 'Moderador', permissions: ['delete_messages', 'kick_members', 'create_invites', 'send_messages', 'join_voice'] },
-  { key: 'member', name: 'Membro', permissions: ['send_messages', 'join_voice'] },
+  { key: 'owner', name: 'Proprietário', hierarchy: 100, permissions: ['manage_community', 'manage_channels', 'manage_members', 'manage_roles', 'manage_channel_permissions', 'delete_messages', 'pin_messages', 'kick_members', 'ban_members', 'mute_members', 'view_audit_log', 'create_invites', 'send_messages', 'join_voice'] },
+  { key: 'admin', name: 'Administrador', hierarchy: 80, permissions: ['manage_community', 'manage_channels', 'manage_members', 'manage_roles', 'manage_channel_permissions', 'delete_messages', 'pin_messages', 'kick_members', 'ban_members', 'mute_members', 'view_audit_log', 'create_invites', 'send_messages', 'join_voice'] },
+  { key: 'moderator', name: 'Moderador', hierarchy: 50, permissions: ['delete_messages', 'pin_messages', 'kick_members', 'ban_members', 'mute_members', 'view_audit_log', 'create_invites', 'send_messages', 'join_voice'] },
+  { key: 'member', name: 'Membro', hierarchy: 10, permissions: ['send_messages', 'join_voice'] },
 ];
 const asyncRoute = (fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>): RequestHandler =>
   (req, res, next) => { void fn(req, res, next).catch(next); };
@@ -52,6 +53,28 @@ async function removeCommunitySocketAccess(io: SocketServer, userId: string, com
       if (channel?.communityId === communityId) await socket.leave(room);
     }
   }
+}
+
+async function activeBan(communityId: string, userId: string): Promise<boolean> {
+  const [ban] = await db.select({ id: communityBans.id }).from(communityBans)
+    .where(and(eq(communityBans.communityId, communityId), eq(communityBans.userId, userId), isNull(communityBans.revokedAt))).limit(1);
+  return Boolean(ban);
+}
+
+async function activeMute(communityId: string, userId: string): Promise<{ expiresAt: Date } | null> {
+  const [mute] = await db.select({ expiresAt: communityMutes.expiresAt }).from(communityMutes)
+    .where(and(eq(communityMutes.communityId, communityId), eq(communityMutes.userId, userId), isNull(communityMutes.revokedAt), gt(communityMutes.expiresAt, new Date()))).limit(1);
+  return mute ?? null;
+}
+
+async function audit(communityId: string, actorId: string, action: string, targetUserId: string | null, reason = '', durationSeconds: number | null = null, metadata: Record<string, unknown> = {}): Promise<void> {
+  await db.insert(moderationAuditLogs).values({ communityId, actorId, targetUserId, action, reason, durationSeconds, metadata: JSON.stringify(metadata) });
+}
+
+async function canActOnTarget(actorId: string, communityId: string, targetUserId: string): Promise<boolean> {
+  const actor = await roleFor(actorId, communityId);
+  const target = await roleFor(targetUserId, communityId);
+  return Boolean(actor && target && target.role !== 'owner' && actor.hierarchy > target.hierarchy);
 }
 
 export function createApi(io: SocketServer): Router {
@@ -149,7 +172,7 @@ export function createApi(io: SocketServer): Router {
     const slug = `${input.data.name.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-|-$/g, '').slice(0, 70) || 'comunidade'}-${id.slice(0, 8)}`;
     const community = await db.transaction(async (tx) => {
       const [created] = await tx.insert(communities).values({ id, ...input.data, slug, ownerId }).returning();
-      const roles = await tx.insert(communityRoles).values(permissionSet.map(({ key, name }) => ({ communityId: id, key, name }))).returning();
+      const roles = await tx.insert(communityRoles).values(permissionSet.map(({ key, name, hierarchy }) => ({ communityId: id, key, name, hierarchy }))).returning();
       const roleByKey = new Map(roles.map((role) => [role.key, role.id]));
       for (const def of permissionSet) {
         const roleId = roleByKey.get(def.key);
@@ -166,7 +189,7 @@ export function createApi(io: SocketServer): Router {
 
   router.get('/communities/:communityId', asyncRoute(async (req, res) => {
     if (!uuid.safeParse(req.params.communityId).success) { res.status(400).json({ error: 'Comunidade inválida.' }); return; }
-    const [community] = await db.select({ id: communities.id, name: communities.name, slug: communities.slug, description: communities.description, category: communities.category, isPrivate: communities.isPrivate, ownerId: communities.ownerId })
+    const [community] = await db.select({ id: communities.id, name: communities.name, slug: communities.slug, description: communities.description, category: communities.category, imageUrl: communities.imageUrl, rules: communities.rules, isPrivate: communities.isPrivate, ownerId: communities.ownerId })
       .from(communities).where(eq(communities.id, req.params.communityId)).limit(1);
     if (!community || (community.isPrivate && !(await isMember(currentUser(res).id, community.id)))) { res.status(404).json({ error: 'Comunidade não encontrada.' }); return; }
     const mine = await db.select({ role: communityRoles.key }).from(communityMembers).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
@@ -177,6 +200,17 @@ export function createApi(io: SocketServer): Router {
     const channelRows = await db.select({ id: channels.id, name: channels.name, topic: channels.topic, kind: channels.kind })
       .from(channels).where(eq(channels.communityId, community.id)).orderBy(channels.createdAt);
     res.json({ community, myRole: mine[0]?.role ?? null, members: memberRows, channels: channelRows });
+  }));
+
+  router.patch('/communities/:communityId', asyncRoute(async (req, res) => {
+    const communityId = req.params.communityId;
+    if (!await hasPermission(currentUser(res).id, communityId, 'manage_community')) { res.status(403).json({ error: 'Não tens permissão para gerir a comunidade.' }); return; }
+    const input = z.object({ name: z.string().trim().min(2).max(80).optional(), description: z.string().trim().max(500).optional(), category: z.string().trim().min(1).max(40).optional(), imageUrl: z.string().url().max(500).startsWith('https://').nullable().optional(), rules: z.string().trim().max(4000).optional() }).safeParse(req.body);
+    if (!input.success || Object.keys(input.data).length === 0) { res.status(400).json({ error: 'Dados da comunidade inválidos.' }); return; }
+    const [updated] = await db.update(communities).set(input.data).where(eq(communities.id, communityId)).returning();
+    if (!updated) { res.status(404).json({ error: 'Comunidade não encontrada.' }); return; }
+    await audit(communityId, currentUser(res).id, 'community.updated', null, '', null, { fields: Object.keys(input.data) });
+    res.json({ community: updated });
   }));
 
   router.post('/communities/:communityId/leave', asyncRoute(async (req, res) => {
@@ -205,6 +239,7 @@ export function createApi(io: SocketServer): Router {
     if (!invite || (invite.expiresAt && invite.expiresAt <= new Date()) || (invite.maxUses !== null && invite.useCount >= invite.maxUses)) { res.status(404).json({ error: 'Convite inválido ou expirado.' }); return; }
     const already = await isMember(currentUser(res).id, invite.communityId);
     if (already) { res.json({ communityId: invite.communityId, alreadyMember: true }); return; }
+    if (await activeBan(invite.communityId, currentUser(res).id)) { res.status(403).json({ error: 'Não podes entrar nesta comunidade enquanto o banimento estiver ativo.' }); return; }
     const [claimed] = await db.update(invitations).set({ useCount: sql`${invitations.useCount} + 1` })
       .where(and(eq(invitations.id, invite.id), or(isNull(invitations.maxUses), sql`${invitations.useCount} < ${invitations.maxUses}`), or(isNull(invitations.expiresAt), gt(invitations.expiresAt, new Date())))).returning({ id: invitations.id });
     if (!claimed) { res.status(409).json({ error: 'O convite atingiu o limite de utilizações.' }); return; }
@@ -242,6 +277,7 @@ export function createApi(io: SocketServer): Router {
   router.get('/channels/:channelId/messages', asyncRoute(async (req, res) => {
     const [channel] = await db.select({ id: channels.id, communityId: channels.communityId }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
     if (!channel || !await isMember(currentUser(res).id, channel.communityId)) { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
+    if (await activeBan(channel.communityId, currentUser(res).id)) { res.status(403).json({ error: 'O teu acesso a esta comunidade está banido.' }); return; }
     const cursor = typeof req.query.before === 'string' ? req.query.before.split('~') : null;
     const before = cursor ? new Date(cursor[0]) : null;
     const beforeId = cursor?.[1];
@@ -249,7 +285,7 @@ export function createApi(io: SocketServer): Router {
     const pageSize = 50;
     const filters = [eq(messages.channelId, channel.id)];
     if (before && beforeId) filters.push(or(lt(messages.createdAt, before), and(eq(messages.createdAt, before), lt(messages.id, beforeId)))!);
-    const rows = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, createdAt: messages.createdAt, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
+    const rows = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
       .from(messages).innerJoin(users, eq(messages.authorId, users.id)).where(and(...filters)).orderBy(desc(messages.createdAt), desc(messages.id)).limit(pageSize + 1);
     const hasMore = rows.length > pageSize;
     res.setHeader('Cache-Control', 'private, no-store');
@@ -261,6 +297,9 @@ export function createApi(io: SocketServer): Router {
   router.post('/channels/:channelId/messages', asyncRoute(async (req, res) => {
     const [channel] = await db.select({ id: channels.id, communityId: channels.communityId, kind: channels.kind }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
     if (!channel || channel.kind !== 'text' || !await hasPermission(currentUser(res).id, channel.communityId, 'send_messages')) { res.status(404).json({ error: 'Canal não encontrado ou acesso não autorizado.' }); return; }
+    if (await activeBan(channel.communityId, currentUser(res).id)) { res.status(403).json({ error: 'O teu acesso a esta comunidade está banido.' }); return; }
+    const mute = await activeMute(channel.communityId, currentUser(res).id);
+    if (mute) { res.status(403).json({ error: `Estás silenciado até ${mute.expiresAt.toISOString()}.` }); return; }
     const input = z.object({ clientMessageId: uuid, body: z.string().trim().min(1).max(2000), replyToId: uuid.nullable().optional() }).safeParse(req.body);
     if (!input.success) { res.status(400).json({ error: 'Mensagem inválida (máximo 2000 caracteres).' }); return; }
     if (input.data.replyToId) {
@@ -269,7 +308,7 @@ export function createApi(io: SocketServer): Router {
     }
     const author = currentUser(res);
     const [created] = await db.insert(messages).values({ channelId: channel.id, authorId: author.id, ...input.data }).onConflictDoNothing().returning();
-    const [row] = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, createdAt: messages.createdAt, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
+    const [row] = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
       .from(messages).innerJoin(users, eq(messages.authorId, users.id))
       .where(and(eq(messages.channelId, channel.id), eq(messages.authorId, author.id), eq(messages.clientMessageId, input.data.clientMessageId))).limit(1);
     if (created && row) {
@@ -301,6 +340,122 @@ export function createApi(io: SocketServer): Router {
     res.json({ ok: true });
   }));
 
+  router.post('/messages/:messageId/pin', asyncRoute(async (req, res) => {
+    const [message] = await db.select({ id: messages.id, channelId: messages.channelId, communityId: channels.communityId, pinnedAt: messages.pinnedAt })
+      .from(messages).innerJoin(channels, eq(messages.channelId, channels.id)).where(eq(messages.id, req.params.messageId)).limit(1);
+    if (!message || !await hasPermission(currentUser(res).id, message.communityId, 'pin_messages')) { res.status(403).json({ error: 'Não tens permissão para fixar mensagens.' }); return; }
+    const [updated] = await db.update(messages).set({ pinnedAt: new Date(), pinnedBy: currentUser(res).id }).where(eq(messages.id, message.id)).returning({ id: messages.id, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy });
+    await audit(message.communityId, currentUser(res).id, 'message.pinned', null, '', null, { messageId: message.id });
+    io.to(`channel:${message.channelId}`).emit('message:pinned', updated);
+    res.json({ message: updated });
+  }));
+
+  router.delete('/messages/:messageId/pin', asyncRoute(async (req, res) => {
+    const [message] = await db.select({ id: messages.id, channelId: messages.channelId, communityId: channels.communityId })
+      .from(messages).innerJoin(channels, eq(messages.channelId, channels.id)).where(eq(messages.id, req.params.messageId)).limit(1);
+    if (!message || !await hasPermission(currentUser(res).id, message.communityId, 'pin_messages')) { res.status(403).json({ error: 'Não tens permissão para desafixar mensagens.' }); return; }
+    await db.update(messages).set({ pinnedAt: null, pinnedBy: null }).where(eq(messages.id, message.id));
+    await audit(message.communityId, currentUser(res).id, 'message.unpinned', null, '', null, { messageId: message.id });
+    io.to(`channel:${message.channelId}`).emit('message:unpinned', { id: message.id });
+    res.json({ ok: true });
+  }));
+
+  router.post('/communities/:communityId/members/:userId/mute', asyncRoute(async (req, res) => {
+    const communityId = req.params.communityId; const actorId = currentUser(res).id;
+    if (!await hasPermission(actorId, communityId, 'mute_members') || !await canActOnTarget(actorId, communityId, req.params.userId)) { res.status(403).json({ error: 'Não tens permissão para silenciar este membro.' }); return; }
+    const input = z.object({ durationMinutes: z.union([z.literal(5), z.literal(10), z.literal(60), z.literal(1440)]), reason: z.string().trim().max(500).default('') }).safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: 'Duração de silêncio inválida.' }); return; }
+    const durationSeconds = input.data.durationMinutes * 60; const expiresAt = new Date(Date.now() + durationSeconds * 1000);
+    await db.update(communityMutes).set({ revokedAt: new Date() }).where(and(eq(communityMutes.communityId, communityId), eq(communityMutes.userId, req.params.userId), isNull(communityMutes.revokedAt)));
+    await db.insert(communityMutes).values({ communityId, userId: req.params.userId, actorId, expiresAt, reason: input.data.reason });
+    await audit(communityId, actorId, 'member.muted', req.params.userId, input.data.reason, durationSeconds);
+    io.in(`user:${req.params.userId}`).emit('community:muted', { communityId, expiresAt });
+    res.json({ expiresAt });
+  }));
+
+  router.delete('/communities/:communityId/members/:userId/mute', asyncRoute(async (req, res) => {
+    const communityId = req.params.communityId; const actorId = currentUser(res).id;
+    if (!await hasPermission(actorId, communityId, 'mute_members') || !await canActOnTarget(actorId, communityId, req.params.userId)) { res.status(403).json({ error: 'Não tens permissão para remover este silêncio.' }); return; }
+    await db.update(communityMutes).set({ revokedAt: new Date() }).where(and(eq(communityMutes.communityId, communityId), eq(communityMutes.userId, req.params.userId), isNull(communityMutes.revokedAt)));
+    await audit(communityId, actorId, 'member.unmuted', req.params.userId);
+    io.in(`user:${req.params.userId}`).emit('community:unmuted', { communityId });
+    res.json({ ok: true });
+  }));
+
+  router.post('/communities/:communityId/members/:userId/ban', asyncRoute(async (req, res) => {
+    const communityId = req.params.communityId; const actorId = currentUser(res).id;
+    if (!await hasPermission(actorId, communityId, 'ban_members') || !await canActOnTarget(actorId, communityId, req.params.userId)) { res.status(403).json({ error: 'Não tens permissão para banir este membro.' }); return; }
+    const input = z.object({ reason: z.string().trim().max(500).default('') }).safeParse(req.body ?? {});
+    if (!input.success) { res.status(400).json({ error: 'Motivo inválido.' }); return; }
+    await db.insert(communityBans).values({ communityId, userId: req.params.userId, actorId, reason: input.data.reason });
+    await db.delete(communityMembers).where(and(eq(communityMembers.communityId, communityId), eq(communityMembers.userId, req.params.userId)));
+    await audit(communityId, actorId, 'member.banned', req.params.userId, input.data.reason);
+    io.in(`user:${req.params.userId}`).emit('community:banned', { communityId });
+    await removeCommunitySocketAccess(io, req.params.userId, communityId);
+    res.json({ ok: true });
+  }));
+
+  router.delete('/communities/:communityId/bans/:userId', asyncRoute(async (req, res) => {
+    const communityId = req.params.communityId; const actorId = currentUser(res).id;
+    if (!await hasPermission(actorId, communityId, 'ban_members')) { res.status(403).json({ error: 'Não tens permissão para revogar banimentos.' }); return; }
+    await db.update(communityBans).set({ revokedAt: new Date() }).where(and(eq(communityBans.communityId, communityId), eq(communityBans.userId, req.params.userId), isNull(communityBans.revokedAt)));
+    await audit(communityId, actorId, 'member.unbanned', req.params.userId);
+    res.json({ ok: true });
+  }));
+
+  router.get('/communities/:communityId/audit-log', asyncRoute(async (req, res) => {
+    const communityId = req.params.communityId;
+    if (!await hasPermission(currentUser(res).id, communityId, 'view_audit_log')) { res.status(403).json({ error: 'Não tens permissão para consultar o registo.' }); return; }
+    const rows = await db.select({ id: moderationAuditLogs.id, action: moderationAuditLogs.action, reason: moderationAuditLogs.reason, durationSeconds: moderationAuditLogs.durationSeconds, metadata: moderationAuditLogs.metadata, createdAt: moderationAuditLogs.createdAt, actorId: moderationAuditLogs.actorId, actorUsername: users.username, targetUserId: moderationAuditLogs.targetUserId })
+      .from(moderationAuditLogs).innerJoin(users, eq(moderationAuditLogs.actorId, users.id)).where(eq(moderationAuditLogs.communityId, communityId)).orderBy(desc(moderationAuditLogs.createdAt)).limit(100);
+    res.json({ entries: rows });
+  }));
+
+  router.post('/calls', asyncRoute(async (req, res) => {
+    const caller = currentUser(res);
+    const input = z.object({ calleeId: uuid }).safeParse(req.body);
+    if (!input.success || input.data.calleeId === caller.id) { res.status(400).json({ error: 'Destinatário de chamada inválido.' }); return; }
+    const [callee] = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl }).from(users).where(eq(users.id, input.data.calleeId)).limit(1);
+    if (!callee) { res.status(404).json({ error: 'Utilizador não encontrado.' }); return; }
+    const [busy] = await db.select({ id: privateCalls.id }).from(privateCalls).where(and(or(eq(privateCalls.callerId, caller.id), eq(privateCalls.calleeId, caller.id)), or(eq(privateCalls.callerId, input.data.calleeId), eq(privateCalls.calleeId, input.data.calleeId)), or(eq(privateCalls.status, 'initiated'), eq(privateCalls.status, 'ringing'), eq(privateCalls.status, 'accepted'), eq(privateCalls.status, 'connecting'), eq(privateCalls.status, 'in_progress')))).limit(1);
+    if (busy) { res.status(409).json({ error: 'Já existe uma chamada ativa entre estes utilizadores.' }); return; }
+    const [call] = await db.insert(privateCalls).values({ callerId: caller.id, calleeId: callee.id, status: 'ringing', livekitRoom: `mavuno-call-${crypto.randomUUID()}` }).returning();
+    io.in(`user:${callee.id}`).emit('call:incoming', { callId: call.id, caller: { id: caller.id, username: caller.username, avatarUrl: caller.avatarUrl }, status: 'ringing' });
+    io.in(`user:${caller.id}`).emit('call:status', { callId: call.id, status: 'ringing', peer: callee });
+    res.status(201).json({ call: { id: call.id, status: call.status, peer: callee } });
+  }));
+
+  router.patch('/calls/:callId', asyncRoute(async (req, res) => {
+    const actorId = currentUser(res).id;
+    const input = z.object({ status: z.enum(['accepted', 'rejected', 'timeout', 'ended']) }).safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: 'Estado de chamada inválido.' }); return; }
+    const [call] = await db.select().from(privateCalls).where(eq(privateCalls.id, req.params.callId)).limit(1);
+    if (!call || (call.callerId !== actorId && call.calleeId !== actorId)) { res.status(404).json({ error: 'Chamada não encontrada.' }); return; }
+    const active = ['ringing', 'accepted', 'connecting', 'in_progress'].includes(call.status);
+    if (!active && input.data.status !== 'ended') { res.status(409).json({ error: 'A chamada já não está disponível.' }); return; }
+    const next = input.data.status === 'accepted' ? 'accepted' : input.data.status;
+    const [updated] = await db.update(privateCalls).set({ status: next, answeredAt: next === 'accepted' ? new Date() : call.answeredAt, endedAt: ['rejected', 'timeout', 'ended'].includes(next) ? new Date() : call.endedAt }).where(eq(privateCalls.id, call.id)).returning({ id: privateCalls.id, status: privateCalls.status });
+    const peerId = call.callerId === actorId ? call.calleeId : call.callerId;
+    io.in(`user:${peerId}`).emit('call:status', { callId: updated.id, status: updated.status });
+    io.in(`user:${actorId}`).emit('call:status', { callId: updated.id, status: updated.status });
+    res.json({ call: updated });
+  }));
+
+  router.post('/calls/:callId/token', asyncRoute(async (req, res) => {
+    const actorId = currentUser(res).id;
+    const [call] = await db.select().from(privateCalls).where(eq(privateCalls.id, req.params.callId)).limit(1);
+    if (!call || (call.callerId !== actorId && call.calleeId !== actorId)) { res.status(404).json({ error: 'Chamada não encontrada.' }); return; }
+    if (call.status !== 'accepted' && call.status !== 'connecting' && call.status !== 'in_progress') { res.status(409).json({ error: 'A chamada ainda não foi aceite.' }); return; }
+    const { LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET } = process.env;
+    if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) { res.status(503).json({ error: 'O serviço LiveKit ainda não está configurado.' }); return; }
+    await db.update(privateCalls).set({ status: 'in_progress' }).where(eq(privateCalls.id, call.id));
+    const user = currentUser(res);
+    const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, { identity: user.id, name: user.username, ttl: '15m' });
+    token.addGrant({ roomJoin: true, room: call.livekitRoom, canPublish: true, canSubscribe: true });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ token: await token.toJwt(), serverUrl: LIVEKIT_URL, room: call.livekitRoom, status: 'in_progress' });
+  }));
+
   router.delete('/communities/:communityId/members/:userId', asyncRoute(async (req, res) => {
     const communityId = req.params.communityId;
     if (!await hasPermission(currentUser(res).id, communityId, 'kick_members')) { res.status(403).json({ error: 'Não tens permissão para remover membros.' }); return; }
@@ -310,8 +465,9 @@ export function createApi(io: SocketServer): Router {
     const [target] = await db.select({ role: communityRoles.key }).from(communityMembers).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
       .where(and(eq(communityMembers.communityId, communityId), eq(communityMembers.userId, req.params.userId))).limit(1);
     if (!target || target.role === 'owner') { res.status(404).json({ error: 'Membro não encontrado ou protegido.' }); return; }
-    if (!actor || (actor.role === 'moderator' && target.role !== 'member') || (actor.role === 'admin' && target.role === 'admin')) { res.status(403).json({ error: 'O teu cargo não pode remover este membro.' }); return; }
+    if (!actor || !await canActOnTarget(currentUser(res).id, communityId, req.params.userId)) { res.status(403).json({ error: 'O teu cargo não pode remover este membro.' }); return; }
     await db.delete(communityMembers).where(and(eq(communityMembers.communityId, communityId), eq(communityMembers.userId, req.params.userId)));
+    await audit(communityId, currentUser(res).id, 'member.kicked', req.params.userId);
     io.in(`user:${req.params.userId}`).emit('community:kicked', { communityId });
     await removeCommunitySocketAccess(io, req.params.userId, communityId);
     res.json({ ok: true });
@@ -327,10 +483,13 @@ export function createApi(io: SocketServer): Router {
     const [target] = await db.select({ role: communityRoles.key }).from(communityMembers).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
       .where(and(eq(communityMembers.communityId, communityId), eq(communityMembers.userId, req.params.userId))).limit(1);
     if (!target || target.role === 'owner') { res.status(404).json({ error: 'Membro não encontrado ou protegido.' }); return; }
-    if (actor?.role === 'admin' && (target.role === 'admin' || input.data.role === 'admin')) { res.status(403).json({ error: 'Apenas o proprietário pode gerir administradores.' }); return; }
+    if (!actor || !await canActOnTarget(currentUser(res).id, communityId, req.params.userId)) { res.status(403).json({ error: 'O teu cargo não pode gerir este membro.' }); return; }
+    const targetHierarchy = input.data.role === 'admin' ? 80 : input.data.role === 'moderator' ? 50 : 10;
+    if (actor.role !== 'owner' && actor.role !== 'admin' && targetHierarchy >= (await roleFor(currentUser(res).id, communityId))!.hierarchy) { res.status(403).json({ error: 'Não podes atribuir uma função igual ou superior à tua.' }); return; }
     const targetRoleId = await roleIdFor(communityId, input.data.role);
     const [result] = await db.update(communityMembers).set({ roleId: targetRoleId }).where(and(eq(communityMembers.communityId, communityId), eq(communityMembers.userId, req.params.userId))).returning({ id: communityMembers.id });
     if (!result) { res.status(404).json({ error: 'Membro não encontrado.' }); return; }
+    await audit(communityId, currentUser(res).id, 'member.role_changed', req.params.userId, '', null, { role: input.data.role });
     res.json({ ok: true });
   }));
 

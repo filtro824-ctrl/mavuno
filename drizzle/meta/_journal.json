@@ -8,6 +8,41 @@
       "when": 1793189903430,
       "tag": "0000_odd_epoch",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1793220000000,
+      "tag": "0001_moderation",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793220001000,
+      "tag": "0002_moderation_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793220002000,
+      "tag": "0003_moderation_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793220003000,
+      "tag": "0004_private_calls",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1793220004000,
+      "tag": "0005_permissions_text",
+      "breakpoints": true
     }
   ]
 }

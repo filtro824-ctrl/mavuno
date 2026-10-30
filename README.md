@@ -133,3 +133,11 @@ drizzle/                 migrações SQL versionadas
 ## Pontos de extensão documentados
 
 Adicionar, quando houver requisitos/configuração: volume individual por participante; cancelamento de ruído e melhorias de áudio; palco com oradores/ouvintes; fóruns e tópicos; upload seguro de imagens, vídeos, GIFs e ficheiros; cargos personalizados; notificações push; ferramentas avançadas de moderação; e integração de engenharia reversa (por exemplo, REA) no ambiente de desenvolvimento. Estas funções não estão implementadas nesta versão.
+
+## Estado final — 2026-10-31
+
+Foram acrescentados menus contextuais de mensagens e membros, engrenagem de administração, regras da comunidade, mensagens fixadas, silenciamentos temporários, expulsão, banimento, revogação de banimento, auditoria server-side e o fluxo de chamadas privadas entre membros. As chamadas usam Socket.IO para convite e estados, e LiveKit para áudio quando as credenciais do servidor estiverem configuradas.
+
+A verificação final passou `pnpm typecheck`, `pnpm test` (4/4) e `pnpm build`. O smoke test de integração passou anteriormente com 65 verificações e as migrações PostgreSQL passaram. O áudio real entre dispositivos ainda não foi validado porque LiveKit não estava configurado.
+
+O módulo multimédia e AutoMod recebido em 2026-10-31 permanece pendente: não declarar upload de anexos, reações persistentes, emojis/stickers personalizados, capacidades por canal ou deteção automática de conteúdo como funcionais até existir backend, armazenamento seguro, validação, permissões e testes reais. Também não existe serviço externo de classificação de conteúdo integrado.

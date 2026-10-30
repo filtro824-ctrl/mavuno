@@ -6,10 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import { eq } from 'drizzle-orm';
+import { and, eq, gt, isNull } from 'drizzle-orm';
 import { authenticateCookie, createApi } from './api.js';
 import { db, pool } from './db/index.js';
-import { channels, communityMembers, sessions } from './db/schema.js';
+import { channels, communityBans, communityMembers, communityMutes, sessions } from './db/schema.js';
 import { readCookieValue, readSessionCookie, requireCsrf } from './security.js';
 import { isMember } from './permissions.js';
 
@@ -81,8 +81,11 @@ io.on('connection', (socket) => {
     if (Date.now() - lastJoin < 250) { socket.emit('room:error', { error: 'Espera um instante antes de mudar de canal.' }); return; }
     lastJoin = Date.now();
     void (async () => {
-      const [channel] = await db.select({ id: channels.id, communityId: channels.communityId }).from(channels).where(eq(channels.id, channelId)).limit(1);
-      if (!channel || !await isMember(user.id, channel.communityId)) { socket.emit('room:error', { error: 'Não tens acesso a este canal.' }); return; }
+      const [channel] = await db.select({ id: channels.id, communityId: channels.communityId, kind: channels.kind }).from(channels).where(eq(channels.id, channelId)).limit(1);
+      const [ban] = channel ? await db.select({ id: communityBans.id }).from(communityBans).where(and(eq(communityBans.communityId, channel.communityId), eq(communityBans.userId, user.id), isNull(communityBans.revokedAt))).limit(1) : [];
+      const [mute] = channel ? await db.select({ expiresAt: communityMutes.expiresAt }).from(communityMutes).where(and(eq(communityMutes.communityId, channel.communityId), eq(communityMutes.userId, user.id), isNull(communityMutes.revokedAt), gt(communityMutes.expiresAt, new Date()))).limit(1) : [];
+      if (!channel || !await isMember(user.id, channel.communityId) || ban) { socket.emit('room:error', { error: 'Não tens acesso a este canal.' }); return; }
+      if (mute && channel.kind === 'voice') { socket.emit('room:error', { error: 'Estás silenciado nesta comunidade.' }); return; }
       for (const room of socket.rooms) if (room.startsWith('channel:')) await socket.leave(room);
       const room = `channel:${channel.id}`;
       await socket.join(room);
