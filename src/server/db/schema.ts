@@ -79,6 +79,17 @@ export const messages = pgTable('messages', {
   pinnedBy: uuid('pinned_by').references(() => users.id, { onDelete: 'set null' }),
 }, (t) => [uniqueIndex('messages_client_unique').on(t.channelId, t.authorId, t.clientMessageId), index('messages_channel_cursor_idx').on(t.channelId, t.createdAt, t.id)]);
 
+export const messageReactions = pgTable('message_reactions', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  messageId: uuid('message_id').notNull().references(() => messages.id, { onDelete: 'cascade' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  emoji: varchar('emoji', { length: 32 }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex('message_reactions_message_user_emoji_unique').on(t.messageId, t.userId, t.emoji),
+  index('message_reactions_message_idx').on(t.messageId),
+]);
+
 export const channelPermissions = pgTable('channel_permissions', {
   channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
   roleId: uuid('role_id').notNull().references(() => communityRoles.id, { onDelete: 'cascade' }),

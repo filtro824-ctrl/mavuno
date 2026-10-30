@@ -43,6 +43,13 @@
       "when": 1793220004000,
       "tag": "0005_permissions_text",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793402711276,
+      "tag": "0006_dashing_maverick",
+      "breakpoints": true
     }
   ]
 }

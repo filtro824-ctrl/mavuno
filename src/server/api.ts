@@ -1,5 +1,5 @@
 import { Router, type Request, type Response, type NextFunction, type RequestHandler } from 'express';
-import { and, count, desc, eq, gt, inArray, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gt, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 import { AccessToken } from 'livekit-server-sdk';
@@ -7,10 +7,11 @@ import { db, pool } from './db/index.js';
 import {
   channels, communities, communityMembers, communityRoles, invitations, messages,
   messageMentions, rolePermissions, sessions, users, voiceRooms, communityBans, communityMutes,
-  moderationAuditLogs, privateCalls,
+  moderationAuditLogs, privateCalls, messageReactions,
 } from './db/schema.js';
 import { createOpaqueToken, digestToken, hashPassword, readSessionCookie, setCsrfCookie, setSessionCookie, clearSessionCookie, verifyPassword } from './security.js';
 import { hasPermission, isMember, roleFor, roleIdFor, type Permission } from './permissions.js';
+import { groupReactionAggregates, isUnicodeEmoji } from './reaction-utils.js';
 import type { Server as SocketServer } from 'socket.io';
 
 const replyMessages = alias(messages, 'reply_messages');
@@ -72,6 +73,19 @@ async function activeMute(communityId: string, userId: string): Promise<{ expire
   const [mute] = await db.select({ expiresAt: communityMutes.expiresAt }).from(communityMutes)
     .where(and(eq(communityMutes.communityId, communityId), eq(communityMutes.userId, userId), isNull(communityMutes.revokedAt), gt(communityMutes.expiresAt, new Date()))).limit(1);
   return mute ?? null;
+}
+
+async function reactionSummariesFor(messageIds: string[], userId: string): Promise<Record<string, { emoji: string; count: number; reactedByMe: boolean }[]>> {
+  if (!messageIds.length) return {};
+  const rows = await db.select({
+    messageId: messageReactions.messageId,
+    emoji: messageReactions.emoji,
+    count: count(),
+    reactedByMe: sql<boolean>`bool_or(${messageReactions.userId} = ${userId})`,
+  }).from(messageReactions)
+    .where(inArray(messageReactions.messageId, messageIds))
+    .groupBy(messageReactions.messageId, messageReactions.emoji);
+  return groupReactionAggregates(rows);
 }
 
 async function audit(communityId: string, actorId: string, action: string, targetUserId: string | null, reason = '', durationSeconds: number | null = null, metadata: Record<string, unknown> = {}): Promise<void> {
@@ -300,7 +314,22 @@ export function createApi(io: SocketServer): Router {
     res.setHeader('Cache-Control', 'private, no-store');
     const selected = rows.slice(0, pageSize);
     const oldest = selected[selected.length - 1];
-    res.json({ messages: selected.reverse(), hasMore, nextCursor: oldest ? `${oldest.createdAt.toISOString()}~${oldest.id}` : null });
+    const ordered = selected.reverse();
+    const reactions = await reactionSummariesFor(ordered.map((message) => message.id), currentUser(res).id);
+    res.json({ messages: ordered.map((message) => ({ ...message, reactions: reactions[message.id] ?? [] })), hasMore, nextCursor: oldest ? `${oldest.createdAt.toISOString()}~${oldest.id}` : null });
+  }));
+
+  router.get('/channels/:channelId/pinned', asyncRoute(async (req, res) => {
+    const [channel] = await db.select({ id: channels.id, communityId: channels.communityId }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
+    const userId = currentUser(res).id;
+    if (!channel || !await isMember(userId, channel.communityId) || await activeBan(channel.communityId, userId)) { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
+    const rows = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
+      .from(messages).innerJoin(users, eq(messages.authorId, users.id)).innerJoin(channels, eq(messages.channelId, channels.id))
+      .leftJoin(replyMessages, eq(messages.replyToId, replyMessages.id)).leftJoin(replyAuthors, eq(replyMessages.authorId, replyAuthors.id))
+      .where(and(eq(messages.channelId, channel.id), isNotNull(messages.pinnedAt))).orderBy(desc(messages.pinnedAt), desc(messages.id));
+    const reactions = await reactionSummariesFor(rows.map((message) => message.id), userId);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ messages: rows.map((message) => ({ ...message, reactions: reactions[message.id] ?? [] })) });
   }));
 
   router.post('/channels/:channelId/messages', asyncRoute(async (req, res) => {
@@ -335,6 +364,52 @@ export function createApi(io: SocketServer): Router {
       io.to(`channel:${channel.id}`).emit('message:new', row);
     }
     res.status(created ? 201 : 200).json({ message: row });
+  }));
+
+  router.post('/messages/:messageId/reactions', asyncRoute(async (req, res) => {
+    const input = z.object({ emoji: z.string().min(1).max(32).refine(isUnicodeEmoji), active: z.boolean() }).safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: 'Escolhe um único emoji válido.' }); return; }
+    const userId = currentUser(res).id;
+    const outcome = await db.transaction(async (tx) => {
+      const [message] = await tx.select({ id: messages.id, channelId: messages.channelId, communityId: channels.communityId })
+        .from(messages).innerJoin(channels, eq(messages.channelId, channels.id)).where(eq(messages.id, req.params.messageId)).for('update');
+      if (!message) return { status: 404, error: 'Mensagem não encontrada.' };
+      const [member] = await tx.select({ id: communityMembers.id }).from(communityMembers)
+        .where(and(eq(communityMembers.communityId, message.communityId), eq(communityMembers.userId, userId))).limit(1);
+      if (!member) return { status: 404, error: 'Não tens acesso a esta mensagem.' };
+      const [ban] = await tx.select({ id: communityBans.id }).from(communityBans)
+        .where(and(eq(communityBans.communityId, message.communityId), eq(communityBans.userId, userId), isNull(communityBans.revokedAt))).limit(1);
+      if (ban) return { status: 403, error: 'Não podes reagir nesta comunidade.' };
+      const [mute] = await tx.select({ id: communityMutes.id }).from(communityMutes)
+        .where(and(eq(communityMutes.communityId, message.communityId), eq(communityMutes.userId, userId), isNull(communityMutes.revokedAt), gt(communityMutes.expiresAt, new Date()))).limit(1);
+      if (mute) return { status: 403, error: 'Não podes reagir enquanto estiveres silenciado.' };
+      const [existing] = await tx.select({ id: messageReactions.id }).from(messageReactions)
+        .where(and(eq(messageReactions.messageId, message.id), eq(messageReactions.userId, userId), eq(messageReactions.emoji, input.data.emoji))).limit(1);
+      if (input.data.active && !existing) {
+        const distinct = await tx.selectDistinct({ emoji: messageReactions.emoji }).from(messageReactions).where(eq(messageReactions.messageId, message.id));
+        if (!distinct.some((item) => item.emoji === input.data.emoji) && distinct.length >= 20) return { status: 409, error: 'Esta mensagem já tem 20 emojis diferentes.' };
+        await tx.insert(messageReactions).values({ messageId: message.id, userId, emoji: input.data.emoji }).onConflictDoNothing();
+      } else if (!input.data.active && existing) await tx.delete(messageReactions).where(eq(messageReactions.id, existing.id));
+      return { status: 200, channelId: message.channelId };
+    });
+    if (outcome.status !== 200 || !('channelId' in outcome)) { res.status(outcome.status).json({ error: outcome.error }); return; }
+    const reactions = (await reactionSummariesFor([req.params.messageId], userId))[req.params.messageId] ?? [];
+    io.to(`channel:${outcome.channelId}`).emit('message:reactions', { messageId: req.params.messageId, reactions });
+    res.json({ reactions });
+  }));
+
+  router.get('/messages/:messageId/reactions/:emoji/users', asyncRoute(async (req, res) => {
+    const parsedEmoji = z.string().min(1).max(32).refine(isUnicodeEmoji).safeParse(req.params.emoji);
+    if (!parsedEmoji.success) { res.status(400).json({ error: 'Emoji inválido.' }); return; }
+    const userId = currentUser(res).id;
+    const [message] = await db.select({ id: messages.id, communityId: channels.communityId }).from(messages)
+      .innerJoin(channels, eq(messages.channelId, channels.id)).where(eq(messages.id, req.params.messageId)).limit(1);
+    if (!message || !await isMember(userId, message.communityId) || await activeBan(message.communityId, userId)) { res.status(404).json({ error: 'Mensagem não encontrada.' }); return; }
+    const rows = await db.select({ username: users.username }).from(messageReactions)
+      .innerJoin(users, eq(messageReactions.userId, users.id))
+      .where(and(eq(messageReactions.messageId, message.id), eq(messageReactions.emoji, parsedEmoji.data))).orderBy(users.username);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ users: rows.map((row) => row.username) });
   }));
 
   router.delete('/messages/:messageId', asyncRoute(async (req, res) => {

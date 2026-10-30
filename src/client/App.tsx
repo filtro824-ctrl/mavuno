@@ -2,7 +2,9 @@ import { type FormEvent, type ReactNode, useCallback, useEffect, useLayoutEffect
 import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
-import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type Message, type PrivateCall, type PrivateCallStatus, type User } from './api';
+import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type Message, type PrivateCall, type PrivateCallStatus, type ReactionSummary, type User } from './api';
+import { EMOJI_CATEGORIES, EMOJI_INDEX, type EmojiCategoryId } from './emoji-data';
+import { toggleReactionSummary } from './reaction-state';
 
 type ModalType = 'community' | 'channel' | 'profile' | 'account' | 'admin' | null;
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
@@ -129,6 +131,12 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const [tucked, setTucked] = useState(false);
   const [reply, setReply] = useState<Message | null>(null);
   const [pinnedOpen, setPinnedOpen] = useState(false);
+  const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
+  const [emojiPickerTarget, setEmojiPickerTarget] = useState<'composer' | { messageId: string } | null>(null);
+  const [reactionUsers, setReactionUsers] = useState<{ messageId: string; emoji: string; users: string[]; loading: boolean } | null>(null);
+  const [pendingReactionKeys, setPendingReactionKeys] = useState<Set<string>>(new Set());
+  const pendingReactionKeysRef = useRef(new Set<string>());
+  const composerInputRef = useRef<HTMLInputElement | null>(null);
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
@@ -172,6 +180,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       setExplore(false);
       setChannel(null);
       setMessages([]);
+      setPinnedMessages([]);
       navigateMobile('channels');
       if (autoChannel && data.myRole) {
         const first = data.channels.find((item) => item.kind === 'text') ?? data.channels[0];
@@ -213,6 +222,10 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     return () => { if (tuckTimer.current) window.clearTimeout(tuckTimer.current); };
   }, [quickOpen]);
 
+  const fetchPinnedMessages = useCallback(async (channelId: string) => {
+    try { const result = await api<{ messages: Message[] }>(`/channels/${channelId}/pinned`); setPinnedMessages(result.messages); }
+    catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível carregar as mensagens fixadas.'); }
+  }, [notify]);
   const fetchMessages = useCallback(async (channelId: string, before?: string) => {
     const params = before ? `?before=${encodeURIComponent(before)}` : '';
     setLoadingMessages(true);
@@ -229,9 +242,11 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   useEffect(() => {
     nearBottom.current = true;
     setNewMessages(0);
-    if (!channel || channel.kind !== 'text') { setMessages([]); setReconnecting(false); return; }
+    if (!channel || channel.kind !== 'text') { setMessages([]); setPinnedMessages([]); setReconnecting(false); return; }
+    setPinnedMessages([]);
     void fetchMessages(channel.id);
-  }, [channel?.id, channel?.kind, fetchMessages]);
+    void fetchPinnedMessages(channel.id);
+  }, [channel?.id, channel?.kind, fetchMessages, fetchPinnedMessages]);
   useEffect(() => {
     if (nearBottom.current && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [messages.length, channel?.id]);
@@ -272,6 +287,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
             setHasMore(result.hasMore);
           })
           .catch((cause) => notify(cause instanceof Error ? cause.message : 'Não foi possível atualizar mensagens após a reconexão.'));
+        void fetchPinnedMessages(channel.id);
       }
       connectedBefore = true;
     });
@@ -283,9 +299,10 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       if (!known && !nearBottom.current && message.authorId !== user.id) setNewMessages((count) => count + 1);
       setMessages((current) => mergeMessage(current, message));
     });
-    socket.on('message:deleted', (event: { id: string }) => setMessages((current) => current.filter((message) => message.id !== event.id).map((message) => message.replyToId === event.id ? { ...message, replyAuthor: null, replyBody: null } : message)));
-    socket.on('message:pinned', (event: { id: string; pinnedAt: string; pinnedBy: string }) => setMessages((current) => current.map((message) => message.id === event.id ? { ...message, ...event } : message)));
-    socket.on('message:unpinned', (event: { id: string }) => setMessages((current) => current.map((message) => message.id === event.id ? { ...message, pinnedAt: null, pinnedBy: null } : message)));
+    socket.on('message:deleted', (event: { id: string }) => { setMessages((current) => current.filter((message) => message.id !== event.id).map((message) => message.replyToId === event.id ? { ...message, replyAuthor: null, replyBody: null } : message)); setPinnedMessages((current) => current.filter((message) => message.id !== event.id)); });
+    socket.on('message:pinned', (event: { id: string; pinnedAt: string; pinnedBy: string }) => { setMessages((current) => current.map((message) => message.id === event.id ? { ...message, ...event } : message)); setPinnedMessages((current) => current.map((message) => message.id === event.id ? { ...message, ...event } : message)); });
+    socket.on('message:unpinned', (event: { id: string }) => { setMessages((current) => current.map((message) => message.id === event.id ? { ...message, pinnedAt: null, pinnedBy: null } : message)); setPinnedMessages((current) => current.filter((message) => message.id !== event.id)); });
+    socket.on('message:reactions', (event: { messageId: string; reactions: ReactionSummary[] }) => { setMessages((current) => current.map((message) => message.id === event.messageId ? { ...message, reactions: event.reactions } : message)); setPinnedMessages((current) => current.map((message) => message.id === event.messageId ? { ...message, reactions: event.reactions } : message)); });
     socket.on('channel:deleted', (event: { id: string }) => {
       if (event.id === channel.id) { setChannel(null); notify('Este canal foi removido.'); }
     });
@@ -295,7 +312,55 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     socket.on('room:error', () => notify('Não foi possível ligar à sala. Tenta novamente.'));
     socket.on('mention:new', (event: { username: string }) => notify(`Mencionaram-te numa conversa, ${event.username}.`));
     return () => { socket.disconnect(); };
-  }, [channel?.id, channel?.kind, details?.community.id, loadCommunities, notify, user.id]);
+  }, [channel?.id, channel?.kind, details?.community.id, fetchPinnedMessages, loadCommunities, notify, user.id]);
+
+  const updateReactionLists = (messageId: string, reactions: ReactionSummary[]) => {
+    setMessages((current) => current.map((message) => message.id === messageId ? { ...message, reactions } : message));
+    setPinnedMessages((current) => current.map((message) => message.id === messageId ? { ...message, reactions } : message));
+  };
+  const toggleReaction = async (message: Message, emoji: string) => {
+    if (!channel || channel.kind !== 'text') return;
+    const key = `${message.id}:${emoji}`;
+    if (pendingReactionKeysRef.current.has(key)) return;
+    const latest = messages.find((item) => item.id === message.id) ?? pinnedMessages.find((item) => item.id === message.id) ?? message;
+    const previous = latest.reactions ?? [];
+    const active = !previous.some((item) => item.emoji === emoji && item.reactedByMe);
+    pendingReactionKeysRef.current.add(key);
+    setPendingReactionKeys((current) => new Set(current).add(key));
+    updateReactionLists(message.id, toggleReactionSummary(previous, emoji));
+    try {
+      const result = await api<{ reactions: ReactionSummary[] }>(`/messages/${message.id}/reactions`, { method: 'POST', body: JSON.stringify({ emoji, active }) });
+      updateReactionLists(message.id, result.reactions);
+    } catch {
+      updateReactionLists(message.id, previous);
+      notify('Não foi possível reagir. Tenta de novo.');
+    } finally {
+      pendingReactionKeysRef.current.delete(key);
+      setPendingReactionKeys((current) => { const next = new Set(current); next.delete(key); return next; });
+    }
+  };
+  const showReactionUsers = async (messageId: string, emoji: string) => {
+    setReactionUsers({ messageId, emoji, users: [], loading: true });
+    try {
+      const result = await api<{ users: string[] }>(`/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/users`);
+      setReactionUsers({ messageId, emoji, users: result.users, loading: false });
+    } catch {
+      setReactionUsers(null);
+      notify('Não foi possível carregar quem reagiu.');
+    }
+  };
+  const openPinned = async () => {
+    if (!channel) return;
+    setPinnedOpen(true);
+    await fetchPinnedMessages(channel.id);
+  };
+  const insertComposerEmoji = (emoji: string) => {
+    const input = composerInputRef.current;
+    const start = input?.selectionStart ?? draft.length;
+    const end = input?.selectionEnd ?? start;
+    setDraft((current) => `${current.slice(0, start)}${emoji}${current.slice(end)}`);
+    window.requestAnimationFrame(() => { input?.focus(); input?.setSelectionRange(start + emoji.length, start + emoji.length); });
+  };
 
   const sendMessage = async (body: string, clientMessageId: string = crypto.randomUUID(), replyToId: string | null = reply?.id ?? null) => {
     if (!channel || channel.kind !== 'text') return;
@@ -380,7 +445,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const joinPublic = async (community: Community) => { await openCommunity(community.id, false); };
   const selectChannel = (item: Channel) => {
     if (!details?.myRole) { notify('Para abrir este canal, entra através de um convite válido.'); return; }
-    setChannel(item); navigateMobile('chat'); setReply(null);
+    setChannel(item); setPinnedMessages([]); navigateMobile('chat'); setReply(null);
   };
   const changeRole = async (member: Member, role: string) => {
     if (!activeCommunityId || !['admin', 'moderator', 'member'].includes(role)) return;
@@ -400,13 +465,13 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   };
   const deleteMessage = async (message: Message) => {
     if (!window.confirm('Apagar esta mensagem permanentemente?')) return;
-    try { await api(`/messages/${message.id}`, { method: 'DELETE' }); setMessages((current) => current.filter((item) => item.id !== message.id)); notify('Mensagem apagada.'); }
+    try { await api(`/messages/${message.id}`, { method: 'DELETE' }); setMessages((current) => current.filter((item) => item.id !== message.id)); setPinnedMessages((current) => current.filter((item) => item.id !== message.id)); notify('Mensagem apagada.'); }
     catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível apagar a mensagem.'); }
   };
   const togglePin = async (message: Message) => {
     try {
-      if (message.pinnedAt) { await api(`/messages/${message.id}/pin`, { method: 'DELETE' }); setMessages((current) => current.map((item) => item.id === message.id ? { ...item, pinnedAt: null, pinnedBy: null } : item)); notify('Mensagem desafixada.'); }
-      else { const result = await api<{ message: { pinnedAt: string; pinnedBy: string } }>(`/messages/${message.id}/pin`, { method: 'POST', body: '{}' }); setMessages((current) => current.map((item) => item.id === message.id ? { ...item, ...result.message } : item)); notify('Mensagem fixada.'); }
+      if (message.pinnedAt) { await api(`/messages/${message.id}/pin`, { method: 'DELETE' }); setMessages((current) => current.map((item) => item.id === message.id ? { ...item, pinnedAt: null, pinnedBy: null } : item)); setPinnedMessages((current) => current.filter((item) => item.id !== message.id)); notify('Mensagem desafixada.'); }
+      else { const result = await api<{ message: { id: string; pinnedAt: string; pinnedBy: string } }>(`/messages/${message.id}/pin`, { method: 'POST', body: '{}' }); const updated = { ...message, ...result.message }; setMessages((current) => current.map((item) => item.id === message.id ? { ...item, ...result.message } : item)); setPinnedMessages((current) => current.some((item) => item.id === message.id) ? current.map((item) => item.id === message.id ? { ...item, ...result.message } : item) : [...current, updated]); notify('Mensagem fixada.'); }
     } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível atualizar a mensagem.'); }
   };
   const moderateMember = async (action: 'mute' | 'unmute' | 'ban' | 'kick', member: Member, durationMinutes?: number) => {
@@ -498,7 +563,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
         {channel?.kind === 'text' && <span className="muted">Mensagens</span>}
       </header>
 
-      {!explore && channel?.kind === 'text' && messages.some((item) => item.pinnedAt) && <div className="pinned-strip"><span aria-hidden="true">◆</span><strong>Fixadas</strong><button onClick={() => setPinnedOpen(true)}>{messages.filter((item) => item.pinnedAt).length} mensagem(ns) · Ver lista</button></div>}
+      {!explore && channel?.kind === 'text' && pinnedMessages.length > 0 && <div className="pinned-strip"><span aria-hidden="true">◆</span><strong>Fixadas</strong><button onClick={() => void openPinned()}>{pinnedMessages.length} mensagem(ns) · Ver lista</button></div>}
       {explore ? <section className="explore-view">
         <h2>Encontra o teu espaço</h2><p className="muted">Explora comunidades abertas ou pesquisa por nome e categoria.</p>
         <div className="community-cards">{publicCommunities.map((item) => <article className="community-card" key={item.id}>
@@ -523,12 +588,14 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
               <div className="message-meta">{message.username}<time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time></div>
               {message.replyToId && <div className="reply-preview"><strong>{message.replyAuthor ?? 'Mensagem apagada'}</strong>{message.replyBody && <span>{message.replyBody.slice(0, 100)}</span>}</div>}
               <div className="message-body">{message.pinnedAt && <span className="pinned-label">Fixada · </span>}{message.body}</div>
+              {!!message.reactions?.length && <div className="reaction-pills">{message.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(message, reaction.emoji)} onLongPress={() => void showReactionUsers(message.id, reaction.emoji)}/>)}</div>}
+              {Array.from(pendingReactionKeys).some((key) => key.startsWith(`${message.id}:`)) && !(message.reactions ?? []).some((reaction) => pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)) && <small className="reaction-pending-label">A enviar…</small>}
               {message.delivery === 'sending' && <span className="message-delivery">A enviar…</span>}
               {!message.delivery && message.authorId === user.id && <span className="message-delivery">Enviada</span>}
               {message.delivery === 'failed' && <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span style={{ fontSize: 11, color: 'var(--danger)' }}>Falhou enviar</span><button className="text-button" onClick={() => void sendMessage(message.body, message.clientMessageId, message.replyToId)}>Tentar novamente</button></div>}
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 {!message.delivery && <button className="text-button" style={{ fontSize: 11 }} onClick={() => setReply(message)}>Responder</button>}
-                {!message.delivery && <MessageActions message={message} own={message.authorId === user.id} canModerate={['owner', 'admin', 'moderator'].includes(details?.myRole ?? '')} onDelete={() => void deleteMessage(message)} onPin={() => void togglePin(message)}/>} 
+                {!message.delivery && <MessageActions message={message} own={message.authorId === user.id} canModerate={['owner', 'admin', 'moderator'].includes(details?.myRole ?? '')} onDelete={() => void deleteMessage(message)} onPin={() => void togglePin(message)} onQuickReaction={(emoji) => void toggleReaction(message, emoji)} onMoreReactions={() => setEmojiPickerTarget({ messageId: message.id })}/>}
               </div>
             </div>
           </article>)}
@@ -537,7 +604,8 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
         <div className="composer-wrap">
           {reply && <div className="muted" style={{ maxWidth: 850, margin: '0 auto 6px', fontSize: 12 }}>A responder a {reply.username}: {reply.body.slice(0, 60)} <button className="text-button" onClick={() => setReply(null)}>Cancelar</button></div>}
           <form className="composer" onSubmit={(event) => { event.preventDefault(); const value = draft.trim(); if (!value) return; void sendMessage(value); setDraft(''); }}>
-            <input value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={2000} placeholder={`Escreve uma mensagem em #${channel.name}`} aria-label="Escrever mensagem"/>
+            <input ref={composerInputRef} value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={2000} placeholder={`Escreve uma mensagem em #${channel.name}`} aria-label="Escrever mensagem"/>
+            <button type="button" className="secondary composer-emoji-button" aria-label="Inserir emoji" title="Inserir emoji" onClick={() => setEmojiPickerTarget('composer')}>☺</button>
             <button className="primary send-button" disabled={!draft.trim()} aria-label="Enviar mensagem">Enviar</button>
           </form>
         </div>
@@ -558,7 +626,9 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
         <button className="text-button" onClick={() => { void loadExplore(); setQuickOpen(false); }}>Explorar comunidades</button>
       </div>}
     </div>
-    {pinnedOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setPinnedOpen(false); }}><section className="modal pinned-modal" role="dialog" aria-modal="true" aria-labelledby="pinned-title"><h2 id="pinned-title">Mensagens fixadas</h2><div className="pinned-list">{messages.filter((item) => item.pinnedAt).map((item) => <article className="pinned-item" key={item.id}><strong>{item.username}</strong><time className="message-time">{formatTime(item.createdAt)}</time><p>{item.body}</p></article>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setPinnedOpen(false)}>Fechar</button></div></section></div>}
+    {pinnedOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setPinnedOpen(false); }}><section className="modal pinned-modal" role="dialog" aria-modal="true" aria-labelledby="pinned-title"><h2 id="pinned-title">Mensagens fixadas</h2><div className="pinned-list">{pinnedMessages.map((item) => <article className="pinned-item" key={item.id}><strong>{item.username}</strong><time className="message-time">{formatTime(item.createdAt)}</time><p>{item.body}</p>{!!item.reactions?.length && <div className="reaction-pills">{item.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${item.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(item, reaction.emoji)} onLongPress={() => void showReactionUsers(item.id, reaction.emoji)}/>)}</div>}</article>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setPinnedOpen(false)}>Fechar</button></div></section></div>}
+    {emojiPickerTarget && <EmojiPicker onClose={() => setEmojiPickerTarget(null)} onSelect={(emoji) => { const target = emojiPickerTarget; setEmojiPickerTarget(null); if (target === 'composer') insertComposerEmoji(emoji); else { const message = messages.find((item) => item.id === target.messageId) ?? pinnedMessages.find((item) => item.id === target.messageId); if (message) void toggleReaction(message, emoji); } }}/> }
+    {reactionUsers && <ReactionUsersSheet emoji={reactionUsers.emoji} users={reactionUsers.users} loading={reactionUsers.loading} onClose={() => setReactionUsers(null)}/>}
     {modal === 'community' && <CommunityModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createCommunity(data)}/>}
     {modal === 'channel' && <ChannelModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createChannel(data)}/>}
     {modal === 'admin' && details && <AdminModal details={details} onClose={() => setModal(null)} onSaved={() => { if (activeCommunityId) void openCommunity(activeCommunityId, false); }}/>}
@@ -608,12 +678,36 @@ function ContextMenu({ label, triggerClassName, children }: { label: string; tri
     {open && createPortal(<><button className="menu-backdrop" aria-label="Fechar menu" onClick={close}/><div ref={menuRef} className="context-menu" role="menu" style={window.innerWidth > 760 ? { position: 'fixed', top: position?.top ?? -1000, left: position?.left ?? -1000, maxHeight: position?.maxHeight ?? '70dvh', overflowY: 'auto', visibility: position ? 'visible' : 'hidden' } : undefined}>{children(close)}</div></>, document.body)}
   </>;
 }
-function MessageActions({ message, own, canModerate, onDelete, onPin }: { message: Message; own: boolean; canModerate: boolean; onDelete: () => void; onPin: () => void }) {
-  if (!own && !canModerate) return null;
+function MessageActions({ message, own, canModerate, onDelete, onPin, onQuickReaction, onMoreReactions }: { message: Message; own: boolean; canModerate: boolean; onDelete: () => void; onPin: () => void; onQuickReaction: (emoji: string) => void; onMoreReactions: () => void }) {
   return <ContextMenu label="Ações da mensagem" triggerClassName="text-button context-trigger">{(close) => <>
+    <div className="quick-reactions-menu" role="group" aria-label="Reações rápidas">{['👍', '❤️', '😂', '😮', '😢', '🙏'].map((emoji) => <button key={emoji} type="button" aria-label={`Reagir com ${emoji}`} onClick={() => { close(); onQuickReaction(emoji); }}>{emoji}</button>)}<button type="button" aria-label="Mais emojis" onClick={() => { close(); onMoreReactions(); }}>＋</button></div>
     {canModerate && <button role="menuitem" onClick={() => { close(); onPin(); }}>{message.pinnedAt ? 'Desafixar' : 'Fixar'}</button>}
     {(own || canModerate) && <button role="menuitem" className="danger-text" onClick={() => { close(); onDelete(); }}>Apagar</button>}
   </>}</ContextMenu>;
+}
+function ReactionPill({ reaction, pending, onToggle, onLongPress }: { reaction: ReactionSummary; pending: boolean; onToggle: () => void; onLongPress: () => void }) {
+  const timer = useRef<number | null>(null);
+  const held = useRef(false);
+  const clear = () => { if (timer.current !== null) window.clearTimeout(timer.current); timer.current = null; };
+  return <button type="button" className={`reaction-pill ${reaction.reactedByMe ? 'reacted' : ''} ${pending ? 'pending' : ''}`} aria-label={`${reaction.emoji}, ${reaction.count}; ${reaction.reactedByMe ? 'já reagiste' : 'ainda não reagiste'}. Toca para alternar; mantém premido para ver quem reagiu.`} aria-pressed={reaction.reactedByMe} disabled={pending} onPointerDown={() => { held.current = false; clear(); timer.current = window.setTimeout(() => { held.current = true; onLongPress(); }, 520); }} onPointerUp={clear} onPointerLeave={clear} onPointerCancel={clear} onContextMenu={(event) => { event.preventDefault(); clear(); held.current = true; onLongPress(); }} onClick={() => { if (held.current) { held.current = false; return; } onToggle(); }}>{reaction.emoji}<span>{reaction.count}</span>{pending && <small>A enviar…</small>}</button>;
+}
+function EmojiPicker({ onClose, onSelect }: { onClose: () => void; onSelect: (emoji: string) => void }) {
+  const [category, setCategory] = useState<EmojiCategoryId>('recentes');
+  const [query, setQuery] = useState('');
+  const [recent, setRecent] = useState<string[]>([]);
+  useEffect(() => { try { const stored = JSON.parse(localStorage.getItem('mavuno.recent-emojis') ?? '[]'); if (Array.isArray(stored)) setRecent(stored.filter((item): item is string => typeof item === 'string' && EMOJI_INDEX.has(item)).slice(0, 24)); } catch { setRecent([]); } }, []);
+  const items = useMemo(() => {
+    const all = EMOJI_CATEGORIES.flatMap((item) => item.items);
+    const normalized = (value: string) => value.toLocaleLowerCase('pt').normalize('NFD').replace(/\p{Diacritic}/gu, '');
+    if (query.trim()) { const term = normalized(query.trim()); return all.filter((item) => normalized(item.name).includes(term)); }
+    if (category === 'recentes') return recent.map((emoji) => EMOJI_INDEX.get(emoji)).filter((item): item is NonNullable<typeof item> => Boolean(item));
+    return EMOJI_CATEGORIES.find((item) => item.id === category)?.items ?? [];
+  }, [category, query, recent]);
+  const choose = (emoji: string) => { const next = [emoji, ...recent.filter((item) => item !== emoji)].slice(0, 24); setRecent(next); try { localStorage.setItem('mavuno.recent-emojis', JSON.stringify(next)); } catch { /* recent emojis are a convenience only */ } onSelect(emoji); };
+  return <div className="modal-backdrop emoji-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="modal emoji-sheet" role="dialog" aria-modal="true" aria-labelledby="emoji-picker-title"><div className="sheet-heading"><h2 id="emoji-picker-title">Escolher emoji</h2><button className="icon-button" aria-label="Fechar seletor" onClick={onClose}>×</button></div><label className="emoji-search"><span className="sr-only">Pesquisar emoji</span><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar por nome…"/></label><div className="emoji-tabs" role="tablist" aria-label="Categorias de emoji">{EMOJI_CATEGORIES.map((item) => <button key={item.id} role="tab" aria-selected={!query && category === item.id} className={!query && category === item.id ? 'active' : ''} onClick={() => { setQuery(''); setCategory(item.id); }}>{item.label}</button>)}</div><div className="emoji-grid" role="list" aria-label={query ? 'Resultados da pesquisa' : EMOJI_CATEGORIES.find((item) => item.id === category)?.label}>{items.map((item) => <button type="button" role="listitem" key={item.emoji} title={item.name} aria-label={item.name} onClick={() => choose(item.emoji)}>{item.emoji}</button>)}</div>{items.length === 0 && <p className="empty-state">{query ? 'Não encontrámos esse emoji.' : 'Ainda não há emojis recentes.'}</p>}</section></div>;
+}
+function ReactionUsersSheet({ emoji, users, loading, onClose }: { emoji: string; users: string[]; loading: boolean; onClose: () => void }) {
+  return <div className="modal-backdrop reaction-users-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="modal reaction-users-sheet" role="dialog" aria-modal="true" aria-labelledby="reaction-users-title"><div className="sheet-heading"><h2 id="reaction-users-title">{emoji} Reações</h2><button className="icon-button" aria-label="Fechar lista" onClick={onClose}>×</button></div>{loading ? <p className="muted">A carregar…</p> : users.length ? <div className="reaction-user-list">{users.map((username, index) => <div className="reaction-user" key={`${username}-${index}`}>{username}</div>)}</div> : <p className="empty-state">Ainda ninguém reagiu com este emoji.</p>}</section></div>;
 }
 function MemberActions({ member, onAction, onCall }: { member: Member; onAction: (action: 'mute' | 'unmute' | 'ban' | 'kick', duration?: number) => void; onCall: () => void }) {
   return <ContextMenu label={`Ações de ${member.username}`} triggerClassName="member-remove">{(close) => <>
