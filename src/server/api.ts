@@ -1,5 +1,6 @@
 import { Router, type Request, type Response, type NextFunction, type RequestHandler } from 'express';
 import { and, count, desc, eq, gt, inArray, isNull, lt, or, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 import { AccessToken } from 'livekit-server-sdk';
 import { db, pool } from './db/index.js';
@@ -12,6 +13,8 @@ import { createOpaqueToken, digestToken, hashPassword, readSessionCookie, setCsr
 import { hasPermission, isMember, roleFor, roleIdFor, type Permission } from './permissions.js';
 import type { Server as SocketServer } from 'socket.io';
 
+const replyMessages = alias(messages, 'reply_messages');
+const replyAuthors = alias(users, 'reply_authors');
 interface PublicUser { id: string; username: string; email: string; avatarUrl: string | null }
 interface RoleDef { key: 'owner' | 'admin' | 'moderator' | 'member'; name: string; hierarchy: number; permissions: Permission[] }
 const permissionSet: RoleDef[] = [
@@ -55,6 +58,10 @@ async function removeCommunitySocketAccess(io: SocketServer, userId: string, com
   }
 }
 
+async function broadcastCommunityMembers(io: SocketServer, communityId: string, event: string, payload: Record<string, unknown>): Promise<void> {
+  const recipients = await db.select({ userId: communityMembers.userId }).from(communityMembers).where(eq(communityMembers.communityId, communityId));
+  for (const recipient of recipients) io.in(`user:${recipient.userId}`).emit(event, payload);
+}
 async function activeBan(communityId: string, userId: string): Promise<boolean> {
   const [ban] = await db.select({ id: communityBans.id }).from(communityBans)
     .where(and(eq(communityBans.communityId, communityId), eq(communityBans.userId, userId), isNull(communityBans.revokedAt))).limit(1);
@@ -244,6 +251,8 @@ export function createApi(io: SocketServer): Router {
       .where(and(eq(invitations.id, invite.id), or(isNull(invitations.maxUses), sql`${invitations.useCount} < ${invitations.maxUses}`), or(isNull(invitations.expiresAt), gt(invitations.expiresAt, new Date())))).returning({ id: invitations.id });
     if (!claimed) { res.status(409).json({ error: 'O convite atingiu o limite de utilizações.' }); return; }
     await db.insert(communityMembers).values({ communityId: invite.communityId, userId: currentUser(res).id, roleId: await roleIdFor(invite.communityId, 'member') }).onConflictDoNothing();
+    const joiningUser = currentUser(res);
+    await broadcastCommunityMembers(io, invite.communityId, 'community:member_joined', { communityId: invite.communityId, member: { id: joiningUser.id, username: joiningUser.username, avatarUrl: joiningUser.avatarUrl, role: 'member' } });
     res.json({ communityId: invite.communityId, alreadyMember: false });
   }));
 
@@ -285,8 +294,8 @@ export function createApi(io: SocketServer): Router {
     const pageSize = 50;
     const filters = [eq(messages.channelId, channel.id)];
     if (before && beforeId) filters.push(or(lt(messages.createdAt, before), and(eq(messages.createdAt, before), lt(messages.id, beforeId)))!);
-    const rows = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
-      .from(messages).innerJoin(users, eq(messages.authorId, users.id)).where(and(...filters)).orderBy(desc(messages.createdAt), desc(messages.id)).limit(pageSize + 1);
+    const rows = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
+      .from(messages).innerJoin(users, eq(messages.authorId, users.id)).leftJoin(replyMessages, eq(messages.replyToId, replyMessages.id)).leftJoin(replyAuthors, eq(replyMessages.authorId, replyAuthors.id)).where(and(...filters)).orderBy(desc(messages.createdAt), desc(messages.id)).limit(pageSize + 1);
     const hasMore = rows.length > pageSize;
     res.setHeader('Cache-Control', 'private, no-store');
     const selected = rows.slice(0, pageSize);
@@ -308,8 +317,8 @@ export function createApi(io: SocketServer): Router {
     }
     const author = currentUser(res);
     const [created] = await db.insert(messages).values({ channelId: channel.id, authorId: author.id, ...input.data }).onConflictDoNothing().returning();
-    const [row] = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
-      .from(messages).innerJoin(users, eq(messages.authorId, users.id))
+    const [row] = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
+      .from(messages).innerJoin(users, eq(messages.authorId, users.id)).leftJoin(replyMessages, eq(messages.replyToId, replyMessages.id)).leftJoin(replyAuthors, eq(replyMessages.authorId, replyAuthors.id))
       .where(and(eq(messages.channelId, channel.id), eq(messages.authorId, author.id), eq(messages.clientMessageId, input.data.clientMessageId))).limit(1);
     if (created && row) {
       const mentionedNames = [...new Set(Array.from(input.data.body.matchAll(/@([\p{L}\p{N}_-]{3,32})/gu), (match) => match[1].toLowerCase()))];
@@ -392,9 +401,22 @@ export function createApi(io: SocketServer): Router {
     await audit(communityId, actorId, 'member.banned', req.params.userId, input.data.reason);
     io.in(`user:${req.params.userId}`).emit('community:banned', { communityId });
     await removeCommunitySocketAccess(io, req.params.userId, communityId);
+    await broadcastCommunityMembers(io, communityId, 'community:member_left', { communityId, userId: req.params.userId });
     res.json({ ok: true });
   }));
 
+  router.get('/communities/:communityId/bans', asyncRoute(async (req, res) => {
+    const communityId = req.params.communityId;
+    if (!await hasPermission(currentUser(res).id, communityId, 'ban_members')) { res.status(403).json({ error: 'Não tens permissão para consultar banimentos.' }); return; }
+    const rows = await db.select({ userId: communityBans.userId, username: users.username, reason: communityBans.reason, createdAt: communityBans.createdAt })
+      .from(communityBans).innerJoin(users, eq(communityBans.userId, users.id))
+      .where(and(eq(communityBans.communityId, communityId), isNull(communityBans.revokedAt)))
+      .orderBy(desc(communityBans.createdAt));
+    const seen = new Set<string>();
+    const bans = rows.filter((row) => { if (seen.has(row.userId)) return false; seen.add(row.userId); return true; });
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ bans });
+  }));
   router.delete('/communities/:communityId/bans/:userId', asyncRoute(async (req, res) => {
     const communityId = req.params.communityId; const actorId = currentUser(res).id;
     if (!await hasPermission(actorId, communityId, 'ban_members')) { res.status(403).json({ error: 'Não tens permissão para revogar banimentos.' }); return; }
@@ -470,6 +492,7 @@ export function createApi(io: SocketServer): Router {
     await audit(communityId, currentUser(res).id, 'member.kicked', req.params.userId);
     io.in(`user:${req.params.userId}`).emit('community:kicked', { communityId });
     await removeCommunitySocketAccess(io, req.params.userId, communityId);
+    await broadcastCommunityMembers(io, communityId, 'community:member_left', { communityId, userId: req.params.userId });
     res.json({ ok: true });
   }));
 
