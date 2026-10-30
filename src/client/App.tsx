@@ -595,8 +595,8 @@ function ProfileModal({ user, busy, onClose, onSave }: {
       <h2 id="profile-title">O teu perfil</h2>
       <form onSubmit={(event) => { event.preventDefault(); const form = new FormData(event.currentTarget); const avatar = String(form.get('avatarUrl') ?? '').trim(); onSave({ username: String(form.get('username') ?? '').trim(), avatarUrl: avatar || null }); }}>
         <label className="field">Nome de utilizador<input name="username" minLength={3} maxLength={32} pattern="[\p{L}\p{N}_-]+" defaultValue={user.username} required/></label>
-        <label className="field">Avatar (URL HTTPS)<input name="avatarUrl" type="url" maxLength={500} defaultValue={user.avatarUrl ?? ''} placeholder="https://…"/></label>
-        <p className="muted" style={{ fontSize: 12 }}>A imagem remota é carregada apenas quando necessária.</p>
+        <label className="field">Foto de perfil (link da imagem)<input name="avatarUrl" type="url" maxLength={500} defaultValue={user.avatarUrl ?? ''} placeholder="https://…"/></label>
+        <p className="muted" style={{ fontSize: 12 }}>Cola o link de uma imagem. Se deixares vazio, usamos a inicial do teu nome.</p>
         <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar perfil'}</button></div>
       </form>
     </section>
