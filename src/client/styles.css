@@ -34,3 +34,311 @@ button{min-width:44px}
 .reaction-pills{display:flex;flex-wrap:wrap;gap:5px;max-width:100%;min-width:0;margin-top:7px;overflow-wrap:anywhere}.reaction-pill{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:30px;min-width:42px;padding:4px 9px;border:1px solid var(--line);border-radius:999px;background:var(--panel2);color:var(--text);font-size:13px;line-height:1.2;touch-action:manipulation;user-select:none}.reaction-pill span{font-size:11px;color:var(--muted)}.reaction-pill.reacted{background:#173d2d;border-color:var(--accent);color:var(--accent)}.reaction-pill.pending{opacity:.62}.reaction-pill small{font-size:9px;color:var(--muted)}.quick-reactions-menu{display:grid;grid-template-columns:repeat(7,minmax(36px,1fr));gap:2px;padding:3px}.context-menu .quick-reactions-menu button{text-align:center;min-width:36px;min-height:44px;padding:4px;font-size:19px}.composer-emoji-button{flex:0 0 44px;min-width:44px;min-height:44px;padding:6px;font-size:20px}.emoji-backdrop,.reaction-users-backdrop{place-items:end center;padding:0}.emoji-sheet,.reaction-users-sheet{width:min(100%,560px);max-height:min(82dvh,720px);border-radius:20px 20px 0 0;padding:16px 16px calc(16px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:12px}.sheet-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.sheet-heading h2{margin:0;font-size:18px}.emoji-search input{width:100%;min-height:44px;background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:10px 12px;color:var(--text)}.emoji-tabs{display:flex;gap:5px;overflow-x:auto;border-bottom:1px solid var(--line);scrollbar-width:thin}.emoji-tabs button{flex:0 0 auto;min-height:44px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);padding:7px 10px;font-size:12px;white-space:nowrap}.emoji-tabs button.active{border-bottom-color:var(--accent);color:var(--accent)}.emoji-grid{display:grid;grid-template-columns:repeat(8,minmax(44px,1fr));gap:3px;overflow:auto;min-height:0;max-height:48dvh;align-content:start}.emoji-grid button{min-width:44px;min-height:44px;border:0;border-radius:10px;background:transparent;font-size:24px}.emoji-grid button:hover{background:var(--panel2)}.emoji-sheet .empty-state{padding:12px}.reaction-user-list{display:grid;gap:7px;overflow:auto;max-height:48dvh}.reaction-user{min-height:44px;display:flex;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:11px;background:var(--panel2);font-size:14px}.reaction-users-sheet>p{margin:0}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:760px){.context-menu .quick-reactions-menu button{min-height:48px}.emoji-grid{grid-template-columns:repeat(6,minmax(44px,1fr));max-height:42dvh}.emoji-sheet,.reaction-users-sheet{max-height:80dvh}}@media(max-width:360px){.reaction-pill{padding-inline:7px}.quick-reactions-menu{grid-template-columns:repeat(7,minmax(34px,1fr))}.context-menu .quick-reactions-menu button{min-width:34px}.emoji-grid{grid-template-columns:repeat(6,minmax(44px,1fr))}}
 
 .reaction-pending-label{display:block;margin-top:3px;color:var(--subtle);font-size:10px}
+
+
+/* Zoom-safe layout: let the document grow and scroll instead of clipping it. */
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 320px;
+  max-width: none;
+  height: auto;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow-x: auto;
+}
+body {
+  margin: 0;
+  overflow-y: auto;
+}
+#root {
+  overflow-y: visible;
+}
+body,
+#root,
+.app-shell {
+  height: auto;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+.boot-screen,
+.viewport-failure {
+  height: auto;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+}
+.auth-wrap {
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  padding: clamp(12px, 4vw, 24px);
+}
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  min-width: 0;
+  margin: auto;
+}
+.app-shell {
+  position: relative;
+  inset: auto;
+  width: 100%;
+  min-width: 320px;
+  max-width: none;
+  height: auto;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow: visible;
+  align-items: stretch;
+}
+.community-rail {
+  width: auto;
+  max-width: 76px;
+  min-width: 58px;
+  flex: 0 0 76px;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+.side-panel {
+  width: auto;
+  max-width: 268px;
+  min-width: 0;
+  flex: 0 1 268px;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+.main-panel {
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  height: auto;
+  min-height: 100vh;
+  min-height: 100dvh;
+  flex: 1 1 0%;
+}
+.message-list {
+  min-width: 0;
+  min-height: 120px;
+  max-height: calc(100vh - 190px);
+  max-height: calc(100dvh - 190px);
+  overflow-x: auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.composer-wrap {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  margin-top: auto;
+  background: var(--bg);
+}
+.welcome-panel,
+.explore-view {
+  width: 100%;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.auth-card,
+.community-card,
+.modal,
+.pinned-item,
+.emoji-sheet,
+.reaction-users-sheet,
+.account-menu,
+.quick-panel,
+.call-dock {
+  min-width: 0;
+}
+.modal-backdrop {
+  display: flex;
+  align-items: safe center;
+  justify-content: safe center;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.modal {
+  width: 100%;
+  max-width: 440px;
+  min-width: 0;
+  max-height: min(88vh, 800px);
+  max-height: min(88dvh, 800px);
+  height: auto;
+  margin: auto;
+}
+.admin-modal,
+.pinned-modal {
+  max-width: 560px;
+}
+.emoji-backdrop,
+.reaction-users-backdrop {
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0;
+}
+.emoji-sheet,
+.reaction-users-sheet {
+  width: 100%;
+  max-width: 560px;
+  max-height: 80vh;
+  max-height: 80dvh;
+  margin: auto auto 0;
+}
+.account-menu {
+  width: min(230px, calc(100vw - 20px));
+  max-width: calc(100vw - 20px);
+}
+.context-menu {
+  max-width: calc(100vw - 16px);
+  max-height: 70vh;
+  max-height: 70dvh;
+  overflow-x: auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+@media (max-width: 760px) {
+  .community-rail {
+    max-width: 58px;
+    min-width: 58px;
+    flex-basis: 58px;
+  }
+  .side-panel {
+    width: calc(100vw - 58px);
+    max-width: none;
+    min-width: 0;
+    flex: 1 1 0%;
+  }
+  .app-shell.mobile-chat .side-panel {
+    display: none;
+  }
+  .app-shell.mobile-chat .main-panel {
+    display: flex;
+    width: auto;
+    min-width: 0;
+    flex: 1 1 0%;
+  }
+  .app-shell.mobile-channels .side-panel {
+    display: flex;
+    width: auto;
+    max-width: none;
+    flex: 1 1 0%;
+  }
+  .app-shell.mobile-channels .main-panel {
+    display: none;
+  }
+  .modal-backdrop {
+    padding: 12px;
+  }
+  .emoji-backdrop,
+  .reaction-users-backdrop {
+    padding: 0;
+  }
+  .message-list {
+    max-height: calc(100vh - 170px);
+    max-height: calc(100dvh - 170px);
+  }
+}
+
+@media (max-height: 420px) {
+  .auth-wrap {
+    padding-block: 12px;
+  }
+  .modal {
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - 24px);
+  }
+  .emoji-grid,
+  .reaction-user-list {
+    max-height: 35dvh;
+  }
+}
+
+
+/* Allow high-zoom CSS viewports below 320px to fit instead of relying on clipped overflow. */
+html,
+body,
+#root,
+.app-shell {
+  min-width: 0;
+}
+@media (max-width: 240px) {
+  .app-shell.mobile-chat .community-rail {
+    display: none;
+  }
+  .app-shell.mobile-chat .main-panel {
+    width: 100%;
+    min-width: 0;
+    flex: 1 1 100%;
+  }
+  .app-shell.mobile-chat .topbar {
+    gap: 4px;
+    padding-inline: 6px;
+  }
+  .app-shell.mobile-chat .topbar h1 {
+    min-width: 0;
+    flex: 1 1 0%;
+  }
+  .app-shell.mobile-chat .composer-wrap {
+    padding-inline: 5px;
+  }
+  .app-shell.mobile-chat .composer {
+    gap: 2px;
+    padding-inline: 6px;
+  }
+  .app-shell.mobile-chat .composer-emoji-button {
+    width: 36px;
+    min-width: 36px;
+    flex: 0 0 36px;
+    padding: 4px;
+  }
+  .app-shell.mobile-chat .send-button {
+    width: 40px;
+    min-width: 40px;
+    flex: 0 0 40px;
+    padding: 8px;
+    font-size: 0;
+  }
+  .app-shell.mobile-chat .send-button::after {
+    content: '↑';
+    font-size: 16px;
+  }
+  .app-shell.mobile-channels .side-header {
+    gap: 4px;
+    padding-inline: 4px;
+  }
+  .app-shell.mobile-channels .side-header > div {
+    gap: 0 !important;
+  }
+  .app-shell.mobile-channels .side-header .icon-button {
+    width: 32px;
+    min-width: 32px;
+    padding: 4px;
+  }
+  .app-shell.mobile-channels .side-footer {
+    gap: 4px;
+    padding: 6px;
+  }
+  .app-shell.mobile-channels .side-footer .avatar {
+    width: 30px;
+    height: 30px;
+  }
+  .app-shell.mobile-channels .side-footer .icon-button {
+    width: 34px;
+    min-width: 34px;
+    min-height: 38px;
+    padding: 4px;
+  }
+}
