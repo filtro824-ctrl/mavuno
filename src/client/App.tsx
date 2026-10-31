@@ -2,11 +2,11 @@ import { type FormEvent, type ReactNode, useCallback, useEffect, useLayoutEffect
 import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
-import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type Message, type PrivateCall, type PrivateCallStatus, type ReactionSummary, type User } from './api';
+import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type MemberProfile, type Message, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
 import { EMOJI_CATEGORIES, EMOJI_INDEX, type EmojiCategoryId } from './emoji-data';
 import { toggleReactionSummary } from './reaction-state';
 
-type ModalType = 'community' | 'channel' | 'profile' | 'account' | 'admin' | null;
+type ModalType = 'community' | 'channel' | 'profile' | 'memberProfile' | 'account' | 'admin' | null;
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
 
 function initials(value: string): string {
@@ -18,6 +18,12 @@ function formatTime(value: string): string {
 function mergeMessage(list: Message[], item: Message): Message[] {
   const filtered = list.filter((message) => message.id !== item.id && message.clientMessageId !== item.clientMessageId);
   return [...filtered, item].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+function refreshVisibleIdentity<T extends { username: string; avatarUrl?: string | null }>(current: T, profile: MemberProfile): T {
+  const next = { ...current, username: profile.username };
+  if (Object.hasOwn(profile, 'avatarUrl')) next.avatarUrl = profile.avatarUrl;
+  else delete next.avatarUrl;
+  return next;
 }
 async function releaseLiveKitRoom(room: Room | null): Promise<void> {
   if (!room) return;
@@ -140,6 +146,14 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
+  const [ownProfile, setOwnProfile] = useState<OwnProfileResponse | null>(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [ownProfileError, setOwnProfileError] = useState('');
+  const [memberProfile, setMemberProfile] = useState<MemberProfile | null>(null);
+  const [memberProfileLoading, setMemberProfileLoading] = useState(false);
+  const [memberProfileError, setMemberProfileError] = useState('');
+  const memberProfileIdRef = useRef<string | null>(null);
+  const profileRequestRef = useRef(0);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [callTarget, setCallTarget] = useState<Member | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -173,6 +187,48 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       notify(cause instanceof Error ? cause.message : 'Não foi possível carregar as comunidades.');
     }
   }, [notify]);
+  const openOwnProfile = useCallback(async () => {
+    setAccountMenuOpen(false);
+    memberProfileIdRef.current = null;
+    profileRequestRef.current += 1;
+    setMemberProfile(null);
+    setMemberProfileLoading(false);
+    setOwnProfile(null);
+    setModal('profile');
+    setProfileLoading(true);
+    setOwnProfileError('');
+    try { setOwnProfile(await api<OwnProfileResponse>('/profile')); }
+    catch (cause) { setOwnProfileError(cause instanceof Error ? cause.message : 'Não foi possível carregar o teu perfil.'); }
+    finally { setProfileLoading(false); }
+  }, []);
+  const loadMemberProfile = useCallback(async (targetId: string, communityId: string) => {
+    const request = ++profileRequestRef.current;
+    setMemberProfileLoading(true);
+    setMemberProfileError('');
+    try {
+      const result = await api<{ profile: MemberProfile }>(`/users/${encodeURIComponent(targetId)}/profile?communityId=${encodeURIComponent(communityId)}`);
+      if (request === profileRequestRef.current && memberProfileIdRef.current === targetId) setMemberProfile(result.profile);
+    } catch (cause) {
+      if (request === profileRequestRef.current && memberProfileIdRef.current === targetId) setMemberProfileError(cause instanceof Error ? cause.message : 'Não foi possível abrir este perfil.');
+    } finally {
+      if (request === profileRequestRef.current && memberProfileIdRef.current === targetId) setMemberProfileLoading(false);
+    }
+  }, []);
+  const openMemberProfile = useCallback((targetId: string) => {
+    if (targetId === user.id) { void openOwnProfile(); return; }
+    if (!activeCommunityId) return;
+    setAccountMenuOpen(false);
+    memberProfileIdRef.current = targetId;
+    setMemberProfile(null);
+    setModal('memberProfile');
+    void loadMemberProfile(targetId, activeCommunityId);
+  }, [activeCommunityId, loadMemberProfile, openOwnProfile, user.id]);
+  const closeMemberProfile = useCallback(() => {
+    memberProfileIdRef.current = null;
+    profileRequestRef.current += 1;
+    setMemberProfile(null);
+    setModal(null);
+  }, []);
   const openCommunity = useCallback(async (id: string, autoChannel = true) => {
     try {
       const data = await api<CommunityDetails>(`/communities/${id}`);
@@ -263,6 +319,16 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     socket.on('community:member_left', (event: { communityId: string; userId: string }) => {
       if (event.communityId === communityId) setDetails((current) => current ? { ...current, members: current.members.filter((member) => member.id !== event.userId) } : current);
     });
+    socket.on('profile:updated', (event: { userId: string; profile: MemberProfile }) => {
+      setDetails((current) => current ? { ...current, members: current.members.map((member) => member.id === event.userId ? refreshVisibleIdentity(member, event.profile) : member) } : current);
+      setMessages((current) => current.map((message) => message.authorId === event.userId ? refreshVisibleIdentity(message, event.profile) : message));
+      setPinnedMessages((current) => current.map((message) => message.authorId === event.userId ? refreshVisibleIdentity(message, event.profile) : message));
+      setCallTarget((current) => current?.id === event.userId ? refreshVisibleIdentity(current, event.profile) : current);
+      if (memberProfileIdRef.current === event.userId) setMemberProfile((current) => current?.id === event.userId ? event.profile : current);
+    });
+    socket.on('profile:presence', (event: { userId: string; online: boolean }) => {
+      setMemberProfile((current) => current?.id === event.userId && Object.hasOwn(current, 'online') ? { ...current, online: event.online } : current);
+    });
     socket.on('community:kicked', (event: { communityId: string }) => {
       if (event.communityId === communityId) { setDetails(null); setChannel(null); void loadCommunities(); notify('A tua associação à comunidade foi removida.'); }
     });
@@ -270,7 +336,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       if (event.communityId === communityId) { setDetails(null); setChannel(null); void loadCommunities(); notify('O teu acesso a esta comunidade foi removido.'); }
     });
     return () => { socket.disconnect(); };
-  }, [details?.community.id, loadCommunities, notify]);
+  }, [details?.community.id, loadCommunities, loadMemberProfile, notify]);
   useEffect(() => {
     if (!channel || channel.kind !== 'text') return;
     const socket = io({ withCredentials: true, reconnection: true, reconnectionDelay: 700, reconnectionDelayMax: 5000, transports: ['websocket', 'polling'] });
@@ -484,11 +550,17 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       else { await api(`/communities/${activeCommunityId}/members/${member.id}/mute`, { method: 'DELETE' }); setDetails((current) => current ? { ...current, members: current.members.map((item) => item.id === member.id ? { ...item, mutedUntil: null } : item) } : current); notify('Silenciamento removido.'); }
     } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível aplicar a ação de moderação.'); }
   };
-  const updateProfile = async (data: { username?: string; avatarUrl?: string | null }) => {
+  const updateProfile = async (data: { username: string; avatarUrl: string | null; aboutMe: string; visibility: ProfileVisibility }) => {
     setProfileBusy(true);
     try {
-      const result = await api<{ user: User }>('/profile', { method: 'PATCH', body: JSON.stringify(data) });
-      onUserChange(result.user); setModal(null); notify('Perfil atualizado.');
+      const result = await api<OwnProfileResponse>('/profile', { method: 'PATCH', body: JSON.stringify(data) });
+      setOwnProfile(result);
+      onUserChange(result.user);
+      setDetails((current) => current ? { ...current, members: current.members.map((member) => member.id === user.id ? { ...member, username: result.user.username, avatarUrl: result.user.avatarUrl } : member) } : current);
+      setMessages((current) => current.map((message) => message.authorId === user.id ? { ...message, username: result.user.username, avatarUrl: result.user.avatarUrl } : message));
+      setPinnedMessages((current) => current.map((message) => message.authorId === user.id ? { ...message, username: result.user.username, avatarUrl: result.user.avatarUrl } : message));
+      setModal(null);
+      notify('Perfil atualizado.');
     } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível atualizar o perfil.'); }
     finally { setProfileBusy(false); }
   };
@@ -526,8 +598,8 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
         </div>)}
         <div className="section-label">Membros · {details.members.length}</div>
         {details.members.map((member) => <div className="member-row" key={member.id} title={roleLabels[member.role] ?? member.role}>
-          <Avatar name={member.username} url={member.avatarUrl} size={27}/>
-          <span className="member-name">{member.username}</span>
+          <button className="profile-avatar-button" aria-label={`Ver perfil de ${member.username}`} onClick={() => openMemberProfile(member.id)}><Avatar name={member.username} url={member.avatarUrl} size={27}/></button>
+          <button className="member-name profile-name-link" onClick={() => openMemberProfile(member.id)}>{member.username}</button>
           {isManager && member.role !== 'owner' ? <select className="role-select" aria-label={`Cargo de ${member.username}`} value={member.role} onChange={(event) => void changeRole(member, event.target.value)}>
             <option value="admin">Admin</option><option value="moderator">Moderador</option><option value="member">Membro</option>
           </select> : <small className="member-role">{roleLabels[member.role] ?? member.role}</small>}
@@ -540,14 +612,16 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
         <button className="secondary" style={{ width: '100%' }} onClick={() => setModal('community')}>＋ Criar comunidade</button>
       </div>}
       <footer className="side-footer">
-        <Avatar name={user.username} url={user.avatarUrl}/>
-        <span style={{ minWidth: 0, flex: 1 }}><strong style={{ fontSize: 13, display: 'block', overflow: 'hidden', textOverflow: 'ellipsis' }}>{user.username}</strong><span className="muted" style={{ fontSize: 11 }}>{!online ? 'Sem ligação' : reconnecting ? 'A reconectar…' : 'Ligado'}</span></span>
-        <button className="icon-button" aria-label="Editar perfil" title="Editar perfil" onClick={() => { setAccountMenuOpen(false); setModal('profile'); }}>◎</button>
+        <button className="identity-control" aria-label={`Abrir o teu perfil, ${user.username}`} onClick={() => void openOwnProfile()}>
+          <Avatar name={user.username} url={user.avatarUrl}/>
+          <span className="identity-copy"><strong>{user.username}</strong><span className="muted">{!online ? 'Sem ligação' : reconnecting ? 'A reconectar…' : 'Ligado'}</span></span>
+        </button>
+        <button className="icon-button" aria-label="Editar perfil" title="Editar perfil" onClick={() => void openOwnProfile()}>◎</button>
         <div className="account-menu-wrap">
           <button className="icon-button" aria-label="Abrir menu da conta" title="Menu da conta" aria-haspopup="menu" aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((value) => !value)}>⋯</button>
           {accountMenuOpen && <div className="account-menu" role="menu">
             <strong className="account-menu-title">Conta</strong>
-            <button role="menuitem" className="account-menu-item" onClick={() => { setAccountMenuOpen(false); setModal('profile'); }}>Editar perfil</button>
+            <button role="menuitem" className="account-menu-item" onClick={() => void openOwnProfile()}>Editar perfil</button>
             <button role="menuitem" className="account-menu-item" onClick={() => { setAccountMenuOpen(false); setModal('account'); }}>Definições da conta</button>
             <button role="menuitem" className="account-menu-item danger-text" onClick={() => { setAccountMenuOpen(false); void logout(); }}>Terminar sessão</button>
           </div>}
@@ -583,9 +657,9 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
           }}>{loadingMessages ? 'A carregar…' : 'Carregar mensagens anteriores'}</button>}
           {messages.length === 0 && !loadingMessages && <div className="empty-state">Ainda não há mensagens. Começa a conversa.</div>}
           {messages.map((message, index) => <article className={`message ${index > 0 && messages[index - 1]?.authorId === message.authorId ? 'message-grouped' : ''}`} key={message.id}>
-            <Avatar name={message.username} url={message.avatarUrl}/>
+            <button className="profile-avatar-button message-avatar-button" aria-label={`Ver perfil de ${message.username}`} onClick={() => openMemberProfile(message.authorId)}><Avatar name={message.username} url={message.avatarUrl}/></button>
             <div style={{ minWidth: 0, flex: 1 }}>
-              <div className="message-meta">{message.username}<time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time></div>
+              <div className="message-meta"><button className="profile-name-link" onClick={() => openMemberProfile(message.authorId)}>{message.username}</button><time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time></div>
               {message.replyToId && <div className="reply-preview"><strong>{message.replyAuthor ?? 'Mensagem apagada'}</strong>{message.replyBody && <span>{message.replyBody.slice(0, 100)}</span>}</div>}
               <div className="message-body">{message.pinnedAt && <span className="pinned-label">Fixada · </span>}{message.body}</div>
               {!!message.reactions?.length && <div className="reaction-pills">{message.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(message, reaction.emoji)} onLongPress={() => void showReactionUsers(message.id, reaction.emoji)}/>)}</div>}
@@ -632,7 +706,8 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     {modal === 'community' && <CommunityModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createCommunity(data)}/>}
     {modal === 'channel' && <ChannelModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createChannel(data)}/>}
     {modal === 'admin' && details && <AdminModal details={details} onClose={() => setModal(null)} onSaved={() => { if (activeCommunityId) void openCommunity(activeCommunityId, false); }}/>}
-    {modal === 'profile' && <ProfileModal user={user} busy={profileBusy} onClose={() => setModal(null)} onSave={(data) => void updateProfile(data)}/>}
+    {modal === 'profile' && <ProfileModal data={ownProfile} loading={profileLoading} error={ownProfileError} online={online && !reconnecting} busy={profileBusy} onClose={() => setModal(null)} onReload={() => void openOwnProfile()} onSave={(data) => void updateProfile(data)}/>}
+    {modal === 'memberProfile' && <MemberProfileSheet profile={memberProfile} loading={memberProfileLoading} error={memberProfileError} onClose={closeMemberProfile}/>}
     {modal === 'account' && <AccountModal user={user} onClose={() => setModal(null)} onEditProfile={() => setModal('profile')}/>}
     <PrivateCallDock target={callTarget} onClearTarget={() => setCallTarget(null)} notify={notify}/>
     {toast && <div className="toast" role="status">{toast}</div>}
@@ -720,7 +795,14 @@ function PrivateCallDock({ target, onClearTarget, notify }: { target: Member | n
   const statusLabels: Record<PrivateCallStatus, string> = { initiated: 'A chamar…', ringing: 'A tocar', accepted: 'Aceite', connecting: 'A ligar', in_progress: 'Em curso', rejected: 'Recusada', timeout: 'Sem resposta', failed: 'Falhada', ended: 'Terminada' };
   useEffect(() => {
     const socket = io({ withCredentials: true, transports: ['websocket', 'polling'] });
-    socket.on('call:incoming', (event: { callId: string; caller: { id: string; username: string; avatarUrl: string | null }; status: PrivateCallStatus }) => setCall({ id: event.callId, status: event.status, peer: event.caller }));
+    socket.on('call:incoming', (event: { callId: string; caller: { id: string; username: string; avatarUrl?: string | null }; status: PrivateCallStatus }) => setCall({ id: event.callId, status: event.status, peer: event.caller }));
+    socket.on('profile:updated', (event: { userId: string; profile: MemberProfile }) => setCall((current) => {
+      if (!current?.peer || current.peer.id !== event.userId) return current;
+      const peer: NonNullable<PrivateCall['peer']> = { ...current.peer, username: event.profile.username };
+      if (Object.hasOwn(event.profile, 'avatarUrl')) peer.avatarUrl = event.profile.avatarUrl;
+      else delete peer.avatarUrl;
+      return { ...current, peer };
+    }));
     socket.on('call:status', (event: { callId: string; status: PrivateCallStatus }) => {
       if (['ended', 'rejected', 'timeout', 'failed'].includes(event.status)) { const activeRoom = roomRef.current; roomRef.current = null; void releaseLiveKitRoom(activeRoom); for (const element of document.querySelectorAll('audio[data-mavuno="voice"]')) element.remove(); }
       setCall((current) => current?.id === event.callId ? { ...current, status: event.status } : current);
@@ -853,18 +935,100 @@ function ChannelModal({ busy, onClose, onCreate }: {
   </div>;
 }
 
-function ProfileModal({ user, busy, onClose, onSave }: {
-  user: User; busy: boolean; onClose: () => void; onSave: (data: { username?: string; avatarUrl?: string | null }) => void;
+function profileDate(value: string): string {
+  return new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'long' }).format(new Date(value));
+}
+
+const profileVisibilityOptions: Array<{ key: keyof ProfileVisibility; title: string; help: string }> = [
+  { key: 'avatar', title: 'Foto de perfil', help: 'Outros membros veem a tua foto.' },
+  { key: 'about', title: 'Sobre mim', help: 'Outros membros veem o texto que escreveste.' },
+  { key: 'status', title: 'Estado «Ligado»', help: 'Outros membros veem se estás ligado.' },
+  { key: 'joinDate', title: 'Data de entrada no Mavuno', help: 'Outros membros veem quando criaste a conta.' },
+  { key: 'commonCommunities', title: 'Comunidades em comum', help: 'Cada pessoa vê apenas as comunidades onde ambos participam.' },
+  { key: 'email', title: 'Email', help: 'Só proprietários e administradores podem ver, se ativares.' },
+];
+
+function ProfileModal({ data, loading, error, online, busy, onClose, onReload, onSave }: {
+  data: OwnProfileResponse | null;
+  loading: boolean;
+  error: string;
+  online: boolean;
+  busy: boolean;
+  onClose: () => void;
+  onReload: () => void;
+  onSave: (data: { username: string; avatarUrl: string | null; aboutMe: string; visibility: ProfileVisibility }) => void;
 }) {
-  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className="modal" role="dialog" aria-modal="true" aria-labelledby="profile-title">
-      <h2 id="profile-title">O teu perfil</h2>
-      <form onSubmit={(event) => { event.preventDefault(); const form = new FormData(event.currentTarget); const avatar = String(form.get('avatarUrl') ?? '').trim(); onSave({ username: String(form.get('username') ?? '').trim(), avatarUrl: avatar || null }); }}>
-        <label className="field">Nome de utilizador<input name="username" minLength={3} maxLength={32} pattern="[\p{L}\p{N}_-]+" defaultValue={user.username} required/></label>
-        <label className="field">Foto de perfil (link da imagem)<input name="avatarUrl" type="url" maxLength={500} defaultValue={user.avatarUrl ?? ''} placeholder="Ligação da imagem"/></label>
-        <p className="muted" style={{ fontSize: 12 }}>Cola o link de uma imagem. Se deixares vazio, usamos a inicial do teu nome.</p>
-        <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar perfil'}</button></div>
-      </form>
+  const [username, setUsername] = useState('');
+  const [avatarUrl, setAvatarUrl] = useState('');
+  const [aboutMe, setAboutMe] = useState('');
+  const [visibility, setVisibility] = useState<ProfileVisibility>({ avatar: true, about: true, status: true, joinDate: true, commonCommunities: true, email: false });
+  const [preview, setPreview] = useState(false);
+  useEffect(() => {
+    if (!data) return;
+    setUsername(data.user.username);
+    setAvatarUrl(data.user.avatarUrl ?? '');
+    setAboutMe(data.user.aboutMe);
+    setVisibility(data.user.visibility);
+  }, [data]);
+  const safeAvatarUrl = (() => { try { const value = avatarUrl.trim(); return new URL(value).protocol === 'https:' ? value : null; } catch { return null; } })();
+  const save = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    onSave({ username: username.trim(), avatarUrl: avatarUrl.trim() || null, aboutMe: aboutMe.trim(), visibility });
+  };
+
+  return <div className="modal-backdrop own-profile-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="modal own-profile-modal" role="dialog" aria-modal="true" aria-labelledby="profile-title">
+      <header className="profile-page-header"><button className="icon-button profile-back" onClick={onClose} aria-label="Voltar">←</button><div><h2 id="profile-title">O teu perfil</h2><p className="muted">Vê e escolhe o que partilhas.</p></div></header>
+      {loading && <p className="muted" role="status">A carregar o teu perfil…</p>}
+      {error && <div className="error-banner" role="alert">{error}<button className="text-button" onClick={onReload}>Tentar novamente</button></div>}
+      {!loading && data && <form onSubmit={save}>
+        <section className="profile-hero">
+          <Avatar name={username || data.user.username} url={safeAvatarUrl} size={72}/>
+          <div><strong className="profile-hero-name">{username || data.user.username}</strong><span className="profile-online"><span className={`online-dot ${online ? '' : 'offline'}`}/>{online ? 'Ligado' : 'A reconectar…'}</span></div>
+        </section>
+        <section className="profile-section"><h3>Editar perfil</h3>
+          <label className="field">Nome de utilizador<input value={username} onChange={(event) => setUsername(event.target.value)} minLength={3} maxLength={32} pattern="[\p{L}\p{N}_-]+" required/><small>O nome de utilizador é sempre público.</small></label>
+          <label className="field">Foto de perfil (link da imagem)<input value={avatarUrl} onChange={(event) => setAvatarUrl(event.target.value)} type="url" maxLength={500} placeholder="https://…"/><small>Usa uma ligação HTTPS. Se deixares vazio, aparece a inicial do teu nome.</small></label>
+          <label className="field">Sobre mim<textarea value={aboutMe} onChange={(event) => setAboutMe(event.target.value.slice(0, 160))} maxLength={160} rows={3} placeholder="Escreve algo curto sobre ti."/><small className="profile-counter">{aboutMe.length}/160</small></label>
+        </section>
+        <section className="profile-section"><h3>Informações da conta</h3>
+          <div className="profile-account-info"><div><strong>Email</strong><span>{data.user.email}</span></div><div><strong>Data de entrada no Mavuno</strong><span>{profileDate(data.user.createdAt)}</span></div><div><strong>Comunidades em que participas</strong>{data.communities.length ? <ul>{data.communities.map((community) => <li key={community.id}>{community.name}</li>)}</ul> : <span>Ainda não participas em comunidades.</span>}</div></div>
+        </section>
+        <section className="profile-section"><h3>O que os outros podem ver</h3>
+          <div className="privacy-list">{profileVisibilityOptions.map((option) => <label className="privacy-row" key={option.key}>
+            <span><strong>{option.title}</strong><small>{option.help}</small></span>
+            <input type="checkbox" checked={visibility[option.key]} onChange={(event) => setVisibility((current) => ({ ...current, [option.key]: event.target.checked }))} aria-label={`${option.title}: ${option.help}`}/>
+          </label>)}</div>
+        </section>
+        <section className="profile-preview-section"><button type="button" className="secondary" onClick={() => setPreview((value) => !value)}>{preview ? 'Fechar pré-visualização' : 'Ver como os outros me veem'}</button>
+          {preview && <div className="profile-preview"><div className="profile-preview-heading"><Avatar name={username || data.user.username} url={visibility.avatar ? safeAvatarUrl : null} size={48}/><div><strong>{username || data.user.username}</strong>{visibility.status && <span>{online ? 'Ligado' : 'A reconectar…'}</span>}</div></div>
+            {visibility.about && aboutMe.trim() && <p>{aboutMe.trim()}</p>}
+            {visibility.joinDate && <p><strong>Data de entrada:</strong> {profileDate(data.user.createdAt)}</p>}
+            {visibility.commonCommunities && <p className="muted">As comunidades em comum aparecem apenas a quem também participa nelas.</p>}
+            {visibility.email && <p className="muted">O email só é mostrado a proprietários e administradores.</p>}
+            {!visibility.about && !visibility.status && !visibility.joinDate && !visibility.commonCommunities && <p className="muted">Só o teu nome de utilizador será mostrado.</p>}
+          </div>}
+        </section>
+        <div className="modal-actions profile-actions"><button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar'}</button></div>
+      </form>}
+    </section>
+  </div>;
+}
+
+function MemberProfileSheet({ profile, loading, error, onClose }: { profile: MemberProfile | null; loading: boolean; error: string; onClose: () => void }) {
+  const visibleItems = Boolean(profile && (profile.aboutMe || Object.hasOwn(profile, 'online') || profile.createdAt || profile.commonCommunities?.length || profile.email));
+  return <div className="modal-backdrop member-profile-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="modal member-profile-sheet" role="dialog" aria-modal="true" aria-labelledby="member-profile-title">
+      <header className="member-profile-heading"><Avatar name={profile?.username ?? '?'} url={profile?.avatarUrl} size={62}/><div><h2 id="member-profile-title">{profile?.username ?? (loading ? 'Perfil' : 'Perfil do membro')}</h2>{profile && Object.hasOwn(profile, 'online') && <span className="profile-online"><span className={`online-dot ${profile.online ? '' : 'offline'}`}/>{profile.online ? 'Ligado' : 'Desligado'}</span>}</div><button className="icon-button" onClick={onClose} aria-label="Fechar perfil">×</button></header>
+      {loading && <p className="muted" role="status">A carregar o perfil…</p>}
+      {error && <p className="error-banner" role="alert">{error}</p>}
+      {profile && <div className="member-profile-content">
+        {profile.aboutMe && <section className="member-profile-item"><h3>Sobre mim</h3><p>{profile.aboutMe}</p></section>}
+        {profile.createdAt && <section className="member-profile-item"><h3>Data de entrada no Mavuno</h3><p>{profileDate(profile.createdAt)}</p></section>}
+        {!!profile.commonCommunities?.length && <section className="member-profile-item"><h3>Comunidades em comum</h3><ul>{profile.commonCommunities.map((community) => <li key={community.id}>{community.name}</li>)}</ul></section>}
+        {profile.email && <section className="member-profile-item"><h3>Email</h3><p>{profile.email}</p></section>}
+        {!loading && !visibleItems && <p className="muted">Este membro ainda não partilhou mais informações.</p>}
+      </div>}
     </section>
   </div>;
 }

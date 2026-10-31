@@ -8,6 +8,7 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { and, eq, gt, isNull } from 'drizzle-orm';
 import { authenticateCookie, createApi } from './api.js';
+import { broadcastProfilePresence } from './profile-realtime.js';
 import { db, pool } from './db/index.js';
 import { channels, communityBans, communityMembers, communityMutes, sessions } from './db/schema.js';
 import { readCookieValue, readSessionCookie, requireCsrf } from './security.js';
@@ -73,7 +74,12 @@ io.use((socket, next) => {
 });
 io.on('connection', (socket) => {
   const user = socket.data.user as { id: string };
-  socket.join(`user:${user.id}`);
+  const userRoom = `user:${user.id}`;
+  void (async () => {
+    const existing = await io.in(userRoom).fetchSockets();
+    await socket.join(userRoom);
+    if (existing.length === 0) await broadcastProfilePresence(io, user.id, true);
+  })().catch(() => undefined);
   let lastJoin = 0;
   socket.on('channel:join', (payload: unknown) => {
     const channelId = typeof payload === 'object' && payload !== null && 'channelId' in payload ? (payload as { channelId?: unknown }).channelId : null;
@@ -95,7 +101,11 @@ io.on('connection', (socket) => {
       }
     })().catch(() => socket.emit('room:error', { error: 'Não foi possível abrir o canal em tempo real.' }));
   });
-  socket.on('disconnect', () => undefined);
+  socket.on('disconnect', () => {
+    void io.in(userRoom).fetchSockets().then((remaining) => {
+      if (remaining.length === 0) return broadcastProfilePresence(io, user.id, false);
+    }).catch(() => undefined);
+  });
 });
 
 const publicDir = resolve(root, 'public');

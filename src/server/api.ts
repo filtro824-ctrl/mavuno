@@ -12,6 +12,8 @@ import {
 import { createOpaqueToken, digestToken, hashPassword, readSessionCookie, setCsrfCookie, setSessionCookie, clearSessionCookie, verifyPassword } from './security.js';
 import { hasPermission, isMember, roleFor, roleIdFor, type Permission } from './permissions.js';
 import { groupReactionAggregates, isUnicodeEmoji } from './reaction-utils.js';
+import { profileUpdateSchema, profileVisibilityFromRecord, visibleMemberIdentity, visibleMemberProfile, type CommonCommunity, type ProfileRecord } from './profile-utils.js';
+import { broadcastProfileUpdate } from './profile-realtime.js';
 import type { Server as SocketServer } from 'socket.io';
 
 const replyMessages = alias(messages, 'reply_messages');
@@ -32,6 +34,60 @@ const requireAuth: RequestHandler = (_req, res, next) => {
 };
 const currentUser = (res: Response): PublicUser => res.locals.user as PublicUser;
 const uuid = z.string().uuid();
+function withoutHiddenAvatar<T extends { avatarUrl: string | null; showAvatar: boolean }>(row: T): Omit<T, 'avatarUrl' | 'showAvatar'> & { avatarUrl?: string | null } {
+  const { avatarUrl, showAvatar, ...safe } = row;
+  return { ...safe, ...(showAvatar ? { avatarUrl } : {}) };
+}
+const profileColumns = {
+  id: users.id,
+  username: users.username,
+  email: users.email,
+  avatarUrl: users.avatarUrl,
+  aboutMe: users.aboutMe,
+  createdAt: users.createdAt,
+  showAvatar: users.showAvatar,
+  showAbout: users.showAbout,
+  showStatus: users.showStatus,
+  showJoinDate: users.showJoinDate,
+  showCommonCommunities: users.showCommonCommunities,
+  showEmail: users.showEmail,
+};
+
+async function loadOwnProfile(userId: string) {
+  const [profile] = await db.select(profileColumns).from(users).where(eq(users.id, userId)).limit(1);
+  if (!profile) return null;
+  const memberships = await db.select({
+    id: communities.id,
+    name: communities.name,
+    role: communityRoles.key,
+    joinedAt: communityMembers.joinedAt,
+  }).from(communityMembers).innerJoin(communities, eq(communityMembers.communityId, communities.id))
+    .innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
+    .where(eq(communityMembers.userId, userId)).orderBy(desc(communityMembers.joinedAt));
+  const record = profile as ProfileRecord;
+  return {
+    user: {
+      id: profile.id,
+      username: profile.username,
+      email: profile.email,
+      avatarUrl: profile.avatarUrl,
+      aboutMe: profile.aboutMe,
+      createdAt: profile.createdAt.toISOString(),
+      visibility: profileVisibilityFromRecord(record),
+    },
+    communities: memberships.map((community) => ({ ...community, joinedAt: community.joinedAt.toISOString() })),
+  };
+}
+
+async function commonCommunitiesFor(viewerId: string, targetId: string): Promise<CommonCommunity[]> {
+  const mine = await db.select({ id: communityMembers.communityId }).from(communityMembers).where(eq(communityMembers.userId, viewerId));
+  if (!mine.length) return [];
+  const mineIds = new Set(mine.map((row) => row.id));
+  const target = await db.select({ id: communities.id, name: communities.name })
+    .from(communityMembers).innerJoin(communities, eq(communityMembers.communityId, communities.id))
+    .where(eq(communityMembers.userId, targetId));
+  return target.filter((community) => mineIds.has(community.id));
+}
 
 async function issueSession(userId: string, res: Response): Promise<void> {
   const token = createOpaqueToken();
@@ -156,16 +212,63 @@ export function createApi(io: SocketServer): Router {
 
   router.use(requireAuth);
   router.get('/auth/me', (_req, res) => res.json({ user: currentUser(res) }));
+  router.get('/profile', asyncRoute(async (_req, res) => {
+    const profile = await loadOwnProfile(currentUser(res).id);
+    if (!profile) { res.status(404).json({ error: 'Não foi possível encontrar o teu perfil.' }); return; }
+    res.json(profile);
+  }));
   router.patch('/profile', asyncRoute(async (req, res) => {
-    const input = z.object({ username: z.string().trim().min(3).max(32).regex(/^[\p{L}\p{N}_-]+$/u).optional(), avatarUrl: z.string().url().max(500).startsWith('https://').nullable().optional() }).safeParse(req.body);
-    if (!input.success || Object.keys(input.data).length === 0) { res.status(400).json({ error: 'Dados de perfil inválidos.' }); return; }
+    const input = profileUpdateSchema.safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: 'Confirma o nome, a ligação HTTPS da foto e o texto (máximo 160 caracteres).' }); return; }
+    const changes: {
+      username?: string;
+      avatarUrl?: string | null;
+      aboutMe?: string;
+      showAvatar?: boolean;
+      showAbout?: boolean;
+      showStatus?: boolean;
+      showJoinDate?: boolean;
+      showCommonCommunities?: boolean;
+      showEmail?: boolean;
+    } = {};
+    const { visibility, ...profileFields } = input.data;
+    Object.assign(changes, profileFields);
+    if (visibility) Object.assign(changes, {
+      showAvatar: visibility.avatar,
+      showAbout: visibility.about,
+      showStatus: visibility.status,
+      showJoinDate: visibility.joinDate,
+      showCommonCommunities: visibility.commonCommunities,
+      showEmail: visibility.email,
+    });
     try {
-      const [user] = await db.update(users).set(input.data).where(eq(users.id, currentUser(res).id)).returning({ id: users.id, username: users.username, email: users.email, avatarUrl: users.avatarUrl });
-      res.json({ user });
+      const userId = currentUser(res).id;
+      await db.update(users).set(changes).where(eq(users.id, userId));
+      const profile = await loadOwnProfile(userId);
+      if (!profile) { res.status(404).json({ error: 'Não foi possível encontrar o teu perfil.' }); return; }
+      void broadcastProfileUpdate(io, userId).catch(() => undefined);
+      res.json(profile);
     } catch (error) {
       if ((error as { code?: string }).code === '23505') { res.status(409).json({ error: 'Esse nome de utilizador já está em uso.' }); return; }
       throw error;
     }
+  }));
+  router.get('/users/:userId/profile', asyncRoute(async (req, res) => {
+    const userId = uuid.safeParse(req.params.userId);
+    const communityId = uuid.safeParse(req.query.communityId);
+    if (!userId.success || !communityId.success || userId.data === currentUser(res).id) { res.status(404).json({ error: 'Perfil não encontrado.' }); return; }
+    const viewerId = currentUser(res).id;
+    const [viewerMembership] = await db.select({ id: communityMembers.id })
+      .from(communityMembers).where(and(eq(communityMembers.communityId, communityId.data), eq(communityMembers.userId, viewerId))).limit(1);
+    const [targetMembership] = await db.select({ id: communityMembers.id })
+      .from(communityMembers).where(and(eq(communityMembers.communityId, communityId.data), eq(communityMembers.userId, userId.data))).limit(1);
+    if (!viewerMembership || !targetMembership) { res.status(404).json({ error: 'Perfil não encontrado.' }); return; }
+    const [target] = await db.select(profileColumns).from(users).where(eq(users.id, userId.data)).limit(1);
+    if (!target) { res.status(404).json({ error: 'Perfil não encontrado.' }); return; }
+    const commonCommunities = await commonCommunitiesFor(viewerId, userId.data);
+    const canViewEmail = await hasPermission(viewerId, communityId.data, 'manage_community');
+    const online = (await io.in(`user:${userId.data}`).fetchSockets()).length > 0;
+    res.json({ profile: visibleMemberProfile(target as ProfileRecord, { online, commonCommunities, canViewEmail }) });
   }));
 
   router.get('/communities/mine', asyncRoute(async (_req, res) => {
@@ -215,12 +318,13 @@ export function createApi(io: SocketServer): Router {
     if (!community || (community.isPrivate && !(await isMember(currentUser(res).id, community.id)))) { res.status(404).json({ error: 'Comunidade não encontrada.' }); return; }
     const mine = await db.select({ role: communityRoles.key }).from(communityMembers).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
       .where(and(eq(communityMembers.userId, currentUser(res).id), eq(communityMembers.communityId, community.id))).limit(1);
-    const memberRows = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl, role: communityRoles.key })
+    const memberRows = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar, role: communityRoles.key })
       .from(communityMembers).innerJoin(users, eq(communityMembers.userId, users.id)).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
       .where(eq(communityMembers.communityId, community.id)).orderBy(users.username).limit(100);
     const channelRows = await db.select({ id: channels.id, name: channels.name, topic: channels.topic, kind: channels.kind })
       .from(channels).where(eq(channels.communityId, community.id)).orderBy(channels.createdAt);
-    res.json({ community, myRole: mine[0]?.role ?? null, members: memberRows, channels: channelRows });
+    const members = memberRows.map(({ role, ...member }) => ({ ...visibleMemberIdentity(member), role }));
+    res.json({ community, myRole: mine[0]?.role ?? null, members, channels: channelRows });
   }));
 
   router.patch('/communities/:communityId', asyncRoute(async (req, res) => {
@@ -265,8 +369,8 @@ export function createApi(io: SocketServer): Router {
       .where(and(eq(invitations.id, invite.id), or(isNull(invitations.maxUses), sql`${invitations.useCount} < ${invitations.maxUses}`), or(isNull(invitations.expiresAt), gt(invitations.expiresAt, new Date())))).returning({ id: invitations.id });
     if (!claimed) { res.status(409).json({ error: 'O convite atingiu o limite de utilizações.' }); return; }
     await db.insert(communityMembers).values({ communityId: invite.communityId, userId: currentUser(res).id, roleId: await roleIdFor(invite.communityId, 'member') }).onConflictDoNothing();
-    const joiningUser = currentUser(res);
-    await broadcastCommunityMembers(io, invite.communityId, 'community:member_joined', { communityId: invite.communityId, member: { id: joiningUser.id, username: joiningUser.username, avatarUrl: joiningUser.avatarUrl, role: 'member' } });
+    const [joiningUser] = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar }).from(users).where(eq(users.id, currentUser(res).id)).limit(1);
+    if (joiningUser) await broadcastCommunityMembers(io, invite.communityId, 'community:member_joined', { communityId: invite.communityId, member: { ...visibleMemberIdentity(joiningUser), role: 'member' } });
     res.json({ communityId: invite.communityId, alreadyMember: false });
   }));
 
@@ -308,7 +412,7 @@ export function createApi(io: SocketServer): Router {
     const pageSize = 50;
     const filters = [eq(messages.channelId, channel.id)];
     if (before && beforeId) filters.push(or(lt(messages.createdAt, before), and(eq(messages.createdAt, before), lt(messages.id, beforeId)))!);
-    const rows = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
+    const rows = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar })
       .from(messages).innerJoin(users, eq(messages.authorId, users.id)).leftJoin(replyMessages, eq(messages.replyToId, replyMessages.id)).leftJoin(replyAuthors, eq(replyMessages.authorId, replyAuthors.id)).where(and(...filters)).orderBy(desc(messages.createdAt), desc(messages.id)).limit(pageSize + 1);
     const hasMore = rows.length > pageSize;
     res.setHeader('Cache-Control', 'private, no-store');
@@ -316,20 +420,20 @@ export function createApi(io: SocketServer): Router {
     const oldest = selected[selected.length - 1];
     const ordered = selected.reverse();
     const reactions = await reactionSummariesFor(ordered.map((message) => message.id), currentUser(res).id);
-    res.json({ messages: ordered.map((message) => ({ ...message, reactions: reactions[message.id] ?? [] })), hasMore, nextCursor: oldest ? `${oldest.createdAt.toISOString()}~${oldest.id}` : null });
+    res.json({ messages: ordered.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [] })), hasMore, nextCursor: oldest ? `${oldest.createdAt.toISOString()}~${oldest.id}` : null });
   }));
 
   router.get('/channels/:channelId/pinned', asyncRoute(async (req, res) => {
     const [channel] = await db.select({ id: channels.id, communityId: channels.communityId }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
     const userId = currentUser(res).id;
     if (!channel || !await isMember(userId, channel.communityId) || await activeBan(channel.communityId, userId)) { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
-    const rows = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
+    const rows = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar })
       .from(messages).innerJoin(users, eq(messages.authorId, users.id)).innerJoin(channels, eq(messages.channelId, channels.id))
       .leftJoin(replyMessages, eq(messages.replyToId, replyMessages.id)).leftJoin(replyAuthors, eq(replyMessages.authorId, replyAuthors.id))
       .where(and(eq(messages.channelId, channel.id), isNotNull(messages.pinnedAt))).orderBy(desc(messages.pinnedAt), desc(messages.id));
     const reactions = await reactionSummariesFor(rows.map((message) => message.id), userId);
     res.setHeader('Cache-Control', 'private, no-store');
-    res.json({ messages: rows.map((message) => ({ ...message, reactions: reactions[message.id] ?? [] })) });
+    res.json({ messages: rows.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [] })) });
   }));
 
   router.post('/channels/:channelId/messages', asyncRoute(async (req, res) => {
@@ -346,7 +450,7 @@ export function createApi(io: SocketServer): Router {
     }
     const author = currentUser(res);
     const [created] = await db.insert(messages).values({ channelId: channel.id, authorId: author.id, ...input.data }).onConflictDoNothing().returning();
-    const [row] = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl })
+    const [row] = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar })
       .from(messages).innerJoin(users, eq(messages.authorId, users.id)).leftJoin(replyMessages, eq(messages.replyToId, replyMessages.id)).leftJoin(replyAuthors, eq(replyMessages.authorId, replyAuthors.id))
       .where(and(eq(messages.channelId, channel.id), eq(messages.authorId, author.id), eq(messages.clientMessageId, input.data.clientMessageId))).limit(1);
     if (created && row) {
@@ -361,9 +465,9 @@ export function createApi(io: SocketServer): Router {
           for (const person of recipients) io.to(`user:${person.id}`).emit('mention:new', { username: author.username, channelId: channel.id, messageId: row.id });
         }
       }
-      io.to(`channel:${channel.id}`).emit('message:new', row);
+      io.to(`channel:${channel.id}`).emit('message:new', withoutHiddenAvatar(row));
     }
-    res.status(created ? 201 : 200).json({ message: row });
+    res.status(created ? 201 : 200).json({ message: row ? withoutHiddenAvatar(row) : null });
   }));
 
   router.post('/messages/:messageId/reactions', asyncRoute(async (req, res) => {
@@ -512,14 +616,17 @@ export function createApi(io: SocketServer): Router {
     const caller = currentUser(res);
     const input = z.object({ calleeId: uuid }).safeParse(req.body);
     if (!input.success || input.data.calleeId === caller.id) { res.status(400).json({ error: 'Destinatário de chamada inválido.' }); return; }
-    const [callee] = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl }).from(users).where(eq(users.id, input.data.calleeId)).limit(1);
+    const [callee] = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar }).from(users).where(eq(users.id, input.data.calleeId)).limit(1);
     if (!callee) { res.status(404).json({ error: 'Utilizador não encontrado.' }); return; }
+    const [callerRecord] = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar }).from(users).where(eq(users.id, caller.id)).limit(1);
+    const callerProfile = callerRecord ? visibleMemberIdentity(callerRecord) : { id: caller.id, username: caller.username };
+    const calleeProfile = visibleMemberIdentity(callee);
     const [busy] = await db.select({ id: privateCalls.id }).from(privateCalls).where(and(or(eq(privateCalls.callerId, caller.id), eq(privateCalls.calleeId, caller.id)), or(eq(privateCalls.callerId, input.data.calleeId), eq(privateCalls.calleeId, input.data.calleeId)), or(eq(privateCalls.status, 'initiated'), eq(privateCalls.status, 'ringing'), eq(privateCalls.status, 'accepted'), eq(privateCalls.status, 'connecting'), eq(privateCalls.status, 'in_progress')))).limit(1);
     if (busy) { res.status(409).json({ error: 'Já existe uma chamada ativa entre estes utilizadores.' }); return; }
     const [call] = await db.insert(privateCalls).values({ callerId: caller.id, calleeId: callee.id, status: 'ringing', livekitRoom: `mavuno-call-${crypto.randomUUID()}` }).returning();
-    io.in(`user:${callee.id}`).emit('call:incoming', { callId: call.id, caller: { id: caller.id, username: caller.username, avatarUrl: caller.avatarUrl }, status: 'ringing' });
-    io.in(`user:${caller.id}`).emit('call:status', { callId: call.id, status: 'ringing', peer: callee });
-    res.status(201).json({ call: { id: call.id, status: call.status, peer: callee } });
+    io.in(`user:${callee.id}`).emit('call:incoming', { callId: call.id, caller: callerProfile, status: 'ringing' });
+    io.in(`user:${caller.id}`).emit('call:status', { callId: call.id, status: 'ringing', peer: calleeProfile });
+    res.status(201).json({ call: { id: call.id, status: call.status, peer: calleeProfile } });
   }));
 
   router.patch('/calls/:callId', asyncRoute(async (req, res) => {

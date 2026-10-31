@@ -14,6 +14,13 @@ export const users = pgTable('users', {
   passwordHash: text('password_hash').notNull(),
   avatarUrl: text('avatar_url'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  aboutMe: varchar('about_me', { length: 160 }).notNull().default(''),
+  showAvatar: boolean('show_avatar').notNull().default(true),
+  showAbout: boolean('show_about').notNull().default(true),
+  showStatus: boolean('show_status').notNull().default(true),
+  showJoinDate: boolean('show_join_date').notNull().default(true),
+  showCommonCommunities: boolean('show_common_communities').notNull().default(true),
+  showEmail: boolean('show_email').notNull().default(false),
 });
 
 export const sessions = pgTable('sessions', {
