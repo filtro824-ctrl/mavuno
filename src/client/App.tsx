@@ -1,12 +1,14 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
 import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type MemberProfile, type Message, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
 import { EMOJI_CATEGORIES, EMOJI_INDEX, type EmojiCategoryId } from './emoji-data';
 import { toggleReactionSummary } from './reaction-state';
+import { applyDeafenState, audioOutputVolume, DEFAULT_AUDIO_PREFERENCES, microphoneConstraints, readAudioPreferences, writeAudioPreferences, type AudioPreferences, type VoiceProfile } from './audio-preferences';
 import { ActionMenuOverlay, MessageRow, ModerationPrompt, rectFor, type ActionMenuTarget, type DurationChoice, type MenuRect } from './message-actions';
 
-type ModalType = 'community' | 'channel' | 'profile' | 'memberProfile' | 'account' | 'admin' | null;
+type ModalType = 'community' | 'channel' | 'profile' | 'memberProfile' | 'account' | 'settings' | 'admin' | null;
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
 function durationLabel(duration: DurationChoice): string {
   if (!duration) return 'permanentemente';
@@ -53,6 +55,17 @@ function Avatar({ name, url, size }: { name: string; url?: string | null; size?:
 }
 function Brand() {
   return <div className="brand-lockup"><span className="brand-mark">m</span><span>Mavuno</span></div>;
+}
+function Glyph({ name }: { name: 'mic' | 'headphones' | 'settings' | 'chevron' | 'close' | 'back' }) {
+  const paths = {
+    mic: <><rect x="8" y="3" width="8" height="12" rx="4"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M8 21h8"/></>,
+    headphones: <><path d="M4 14v-2a8 8 0 0 1 16 0v2"/><path d="M4 14h3v6H5a1 1 0 0 1-1-1zM20 14h-3v6h2a1 1 0 0 0 1-1z"/></>,
+    settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.7 1.7-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-2.4v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L8 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H6v-2.4h.8a1.7 1.7 0 0 0 1.6-1A1.7 1.7 0 0 0 8.1 8L8 7.9l1.7-1.7.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6v-.2h2.4V5a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 8l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v2.4H21a1.7 1.7 0 0 0-1.6 1z"/></>,
+    chevron: <path d="m8 10 4 4 4-4"/>,
+    close: <path d="m6 6 12 12M18 6 6 18"/>,
+    back: <path d="m15 5-7 7 7 7M8 12h12"/>,
+  };
+  return <svg className="inline-glyph" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
 export default function App() {
@@ -174,7 +187,12 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const [memberProfileError, setMemberProfileError] = useState('');
   const memberProfileIdRef = useRef<string | null>(null);
   const profileRequestRef = useRef(0);
-  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [audioPreferences, setAudioPreferences] = useState<AudioPreferences>(() => readAudioPreferences());
+  const [audioMenu, setAudioMenu] = useState<'input' | 'output' | null>(null);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [audioError, setAudioError] = useState('');
+  const [settingsSection, setSettingsSection] = useState<'account' | 'voice'>('account');
+  const [previousMicMuted, setPreviousMicMuted] = useState<boolean | null>(null);
   const [callTarget, setCallTarget] = useState<Member | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const knownMessageIds = useRef(new Set<string>());
@@ -216,6 +234,39 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     setToast(text);
     window.setTimeout(() => setToast(''), 3200);
   }, []);
+  const saveAudio = useCallback((patch: Partial<AudioPreferences>) => {
+    setAudioPreferences((current) => {
+      const next = { ...current, ...patch };
+      writeAudioPreferences(next);
+      return next;
+    });
+  }, []);
+  const refreshAudioDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      setAudioDevices(devices.filter((device) => device.kind === 'audioinput' || device.kind === 'audiooutput'));
+    } catch { setAudioDevices([]); }
+  }, []);
+  useEffect(() => { void refreshAudioDevices(); navigator.mediaDevices?.addEventListener?.('devicechange', refreshAudioDevices); return () => navigator.mediaDevices?.removeEventListener?.('devicechange', refreshAudioDevices); }, [refreshAudioDevices]);
+  const requestMicrophone = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) { setAudioError('Este navegador não permite testar o microfone.'); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(microphoneConstraints(audioPreferences.voiceProfile, audioPreferences.inputDeviceId));
+      stream.getTracks().forEach((track) => track.stop());
+      setAudioError(''); await refreshAudioDevices(); notify('Microfone autorizado.');
+    } catch { setAudioError('Permite o acesso ao microfone nas definições do navegador e tenta novamente.'); }
+  };
+  const toggleMute = () => {
+    if (audioPreferences.deafened) return;
+    saveAudio({ micMuted: !audioPreferences.micMuted });
+  };
+  const toggleDeafen = () => {
+    const next = applyDeafenState(audioPreferences.micMuted, audioPreferences.deafened, !audioPreferences.deafened);
+    const restoredMic = audioPreferences.deafened && previousMicMuted !== null ? previousMicMuted : next.micMuted;
+    setPreviousMicMuted(next.deafened ? audioPreferences.micMuted : null);
+    saveAudio({ micMuted: restoredMic, deafened: next.deafened });
+  };
   const loadCommunities = useCallback(async () => {
     try {
       const result = await api<{ communities: Community[] }>('/communities/mine');
@@ -225,7 +276,6 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     }
   }, [notify]);
   const openOwnProfile = useCallback(async () => {
-    setAccountMenuOpen(false);
     memberProfileIdRef.current = null;
     profileRequestRef.current += 1;
     setMemberProfile(null);
@@ -254,7 +304,6 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const openMemberProfile = useCallback((targetId: string) => {
     if (targetId === user.id) { void openOwnProfile(); return; }
     if (!activeCommunityId) return;
-    setAccountMenuOpen(false);
     memberProfileIdRef.current = targetId;
     setMemberProfile(null);
     setModal('memberProfile');
@@ -680,19 +729,18 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       </div>}
       <footer className="side-footer">
         <button className="identity-control" aria-label={`Abrir o teu perfil, ${user.username}`} onClick={() => void openOwnProfile()}>
-          <Avatar name={user.username} url={user.avatarUrl}/>
+          <Avatar name={user.username} url={user.avatarUrl} size={36}/>
           <span className="identity-copy"><strong>{user.username}</strong><span className="muted">{!online ? 'Sem ligação' : reconnecting ? 'A reconectar…' : 'Ligado'}</span></span>
         </button>
-        <button className="icon-button" aria-label="Editar perfil" title="Editar perfil" onClick={() => void openOwnProfile()}>◎</button>
-        <div className="account-menu-wrap">
-          <button className="icon-button" aria-label="Abrir menu da conta" title="Menu da conta" aria-haspopup="menu" aria-expanded={accountMenuOpen} onClick={() => setAccountMenuOpen((value) => !value)}>⋯</button>
-          {accountMenuOpen && <div className="account-menu" role="menu">
-            <strong className="account-menu-title">Conta</strong>
-            <button role="menuitem" className="account-menu-item" onClick={() => void openOwnProfile()}>Editar perfil</button>
-            <button role="menuitem" className="account-menu-item" onClick={() => { setAccountMenuOpen(false); setModal('account'); }}>Definições da conta</button>
-            <button role="menuitem" className="account-menu-item danger-text" onClick={() => { setAccountMenuOpen(false); void logout(); }}>Terminar sessão</button>
-          </div>}
+        <div className="audio-control-group">
+          <button className={`audio-button ${audioPreferences.micMuted ? 'audio-off' : ''}`} aria-label={audioPreferences.micMuted ? 'Ativar microfone' : 'Silenciar microfone'} title={audioPreferences.micMuted ? 'Ativar microfone' : 'Silenciar microfone'} onClick={toggleMute}><Glyph name="mic"/>{audioPreferences.micMuted && <span className="audio-slash"/>}</button>
+          <button className="audio-chevron" aria-label="Opções do microfone" title="Opções do microfone" onClick={() => setAudioMenu(audioMenu === 'input' ? null : 'input')}><Glyph name="chevron"/></button>
         </div>
+        <div className="audio-control-group">
+          <button className={`audio-button ${audioPreferences.deafened ? 'audio-off' : ''}`} aria-label={audioPreferences.deafened ? 'Ativar som' : 'Ensurdecer'} title={audioPreferences.deafened ? 'Ativar som' : 'Ensurdecer'} onClick={toggleDeafen}><Glyph name="headphones"/>{audioPreferences.deafened && <span className="audio-slash"/>}</button>
+          <button className="audio-chevron" aria-label="Opções dos auscultadores" title="Opções dos auscultadores" onClick={() => setAudioMenu(audioMenu === 'output' ? null : 'output')}><Glyph name="chevron"/></button>
+        </div>
+        <button className="audio-button settings-button" aria-label="Abrir Definições" title="Definições" onClick={() => { setSettingsSection('account'); setModal('settings'); }}><Glyph name="settings"/></button>
       </footer>
     </aside>
 
@@ -712,7 +760,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
           <button className="secondary" onClick={() => void joinPublic(item)}>Ver comunidade</button>
         </article>)}</div>
         {publicCommunities.length === 0 && <div className="empty-state">Ainda não encontrámos comunidades públicas com esse termo.</div>}
-      </section> : channel?.kind === 'voice' ? <VoicePanel channel={channel} notify={notify}/> : channel ? <>
+      </section> : channel?.kind === 'voice' ? <VoicePanel channel={channel} notify={notify} preferences={audioPreferences} onAudioChange={saveAudio}/> : channel ? <>
         <div className="message-list" ref={listRef} aria-live="polite" onScroll={(event) => {
           const element = event.currentTarget;
           nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
@@ -766,7 +814,9 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     {modal === 'profile' && <ProfileModal data={ownProfile} loading={profileLoading} error={ownProfileError} online={online && !reconnecting} busy={profileBusy} onClose={() => setModal(null)} onReload={() => void openOwnProfile()} onSave={(data) => void updateProfile(data)}/>}
     {modal === 'memberProfile' && <MemberProfileSheet profile={memberProfile} loading={memberProfileLoading} error={memberProfileError} onClose={closeMemberProfile}/>}
     {modal === 'account' && <AccountModal user={user} onClose={() => setModal(null)} onEditProfile={() => setModal('profile')}/>}
-    <PrivateCallDock target={callTarget} onClearTarget={() => setCallTarget(null)} notify={notify}/>
+    {modal === 'settings' && <SettingsModal user={user} section={settingsSection} preferences={audioPreferences} devices={audioDevices} audioError={audioError} onSection={setSettingsSection} onChange={saveAudio} onRequestMic={() => void requestMicrophone()} onOpenProfile={() => { setModal('profile'); void openOwnProfile(); }} onLogout={logout} onClose={() => setModal(null)}/>}
+    <PrivateCallDock target={callTarget} onClearTarget={() => setCallTarget(null)} notify={notify} preferences={audioPreferences} onAudioChange={saveAudio}/>
+    {audioMenu && createPortal(<div className="audio-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) setAudioMenu(null); }}><AudioMenu kind={audioMenu} preferences={audioPreferences} devices={audioDevices} error={audioError} onClose={() => setAudioMenu(null)} onToggleMute={toggleMute} onToggleDeafen={toggleDeafen} onChange={saveAudio} onRequestMic={() => void requestMicrophone()} onSettings={() => { setAudioMenu(null); setSettingsSection('voice'); setModal('settings'); }}/></div>, document.body)}
     {toast && <div className="toast" role="status">{toast}</div>}
   </div>;
 }
@@ -795,7 +845,7 @@ function EmojiPicker({ onClose, onSelect }: { onClose: () => void; onSelect: (em
 function ReactionUsersSheet({ emoji, users, loading, onClose }: { emoji: string; users: string[]; loading: boolean; onClose: () => void }) {
   return <div className="modal-backdrop reaction-users-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="modal reaction-users-sheet" role="dialog" aria-modal="true" aria-labelledby="reaction-users-title"><div className="sheet-heading"><h2 id="reaction-users-title">{emoji} Reações</h2><button className="icon-button" aria-label="Fechar lista" onClick={onClose}>×</button></div>{loading ? <p className="muted">A carregar…</p> : users.length ? <div className="reaction-user-list">{users.map((username, index) => <div className="reaction-user" key={`${username}-${index}`}>{username}</div>)}</div> : <p className="empty-state">Ainda ninguém reagiu com este emoji.</p>}</section></div>;
 }
-function PrivateCallDock({ target, onClearTarget, notify }: { target: Member | null; onClearTarget: () => void; notify: (text: string) => void }) {
+function PrivateCallDock({ target, onClearTarget, notify, preferences, onAudioChange }: { target: Member | null; onClearTarget: () => void; notify: (text: string) => void; preferences: AudioPreferences; onAudioChange: (patch: Partial<AudioPreferences>) => void }) {
   const [call, setCall] = useState<PrivateCall | null>(null); const [error, setError] = useState(''); const [connecting, setConnecting] = useState(false); const [micOn, setMicOn] = useState(true); const roomRef = useRef<Room | null>(null); const connectedCall = useRef<string | null>(null);
   const statusLabels: Record<PrivateCallStatus, string> = { initiated: 'A chamar…', ringing: 'A tocar', accepted: 'Aceite', connecting: 'A ligar', in_progress: 'Em curso', rejected: 'Recusada', timeout: 'Sem resposta', failed: 'Falhada', ended: 'Terminada' };
   useEffect(() => {
@@ -828,10 +878,11 @@ function PrivateCallDock({ target, onClearTarget, notify }: { target: Member | n
   useEffect(() => {
     if (!call || call.status !== 'accepted' || connectedCall.current === call.id) return;
     connectedCall.current = call.id; setConnecting(true); setError(''); setCall((current) => current ? { ...current, status: 'connecting' } : current);
-    void api<{ token: string; serverUrl: string }>(`/calls/${call.id}/token`, { method: 'POST', body: '{}' }).then(async (credentials) => { const { Room: LiveKitRoom, RoomEvent } = await import('livekit-client'); const room = new LiveKitRoom({ adaptiveStream: true, dynacast: true }); roomRef.current = room; room.on(RoomEvent.TrackSubscribed, (track) => { const audio = track.attach(); audio.dataset.mavuno = 'voice'; document.body.appendChild(audio); void audio.play().catch(() => setError('O navegador bloqueou o áudio. Ativa o som e tenta novamente.')); }); room.on(RoomEvent.TrackUnsubscribed, (track) => track.detach().forEach((element) => element.remove())); room.on(RoomEvent.Disconnected, () => { roomRef.current = null; setCall((current) => current ? { ...current, status: 'ended' } : current); }); await room.connect(credentials.serverUrl, credentials.token); await room.localParticipant.setMicrophoneEnabled(true); setMicOn(true); setCall((current) => current ? { ...current, status: 'in_progress' } : current); }).catch((cause) => { connectedCall.current = null; if (call.id) void api(`/calls/${call.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'ended' }) }).catch(() => undefined); void releaseLiveKitRoom(roomRef.current); roomRef.current = null; setCall((current) => current ? { ...current, status: 'failed' } : current); const name = cause instanceof Error ? cause.name : ''; setError(name === 'NotAllowedError' || name === 'PermissionDeniedError' ? 'Permite o acesso ao microfone nas definições do navegador e tenta novamente.' : 'A voz ainda não está disponível. Tenta mais tarde.'); }).finally(() => setConnecting(false));
-  }, [call]);
+    void api<{ token: string; serverUrl: string }>(`/calls/${call.id}/token`, { method: 'POST', body: '{}' }).then(async (credentials) => { const { Room: LiveKitRoom, RoomEvent } = await import('livekit-client'); const room = new LiveKitRoom({ adaptiveStream: true, dynacast: true }); roomRef.current = room; room.on(RoomEvent.TrackSubscribed, (track) => { const audio = track.attach(); audio.dataset.mavuno = 'voice'; audio.volume = audioOutputVolume(preferences); document.body.appendChild(audio); void audio.play().catch(() => setError('O navegador bloqueou o áudio. Ativa o som e tenta novamente.')); }); room.on(RoomEvent.TrackUnsubscribed, (track) => track.detach().forEach((element) => element.remove())); room.on(RoomEvent.Disconnected, () => { roomRef.current = null; setCall((current) => current ? { ...current, status: 'ended' } : current); }); await room.connect(credentials.serverUrl, credentials.token); await room.localParticipant.setMicrophoneEnabled(!preferences.micMuted && !preferences.deafened); setMicOn(!preferences.micMuted && !preferences.deafened); setCall((current) => current ? { ...current, status: 'in_progress' } : current); }).catch((cause) => { connectedCall.current = null; if (call.id) void api(`/calls/${call.id}`, { method: 'PATCH', body: JSON.stringify({ status: 'ended' }) }).catch(() => undefined); void releaseLiveKitRoom(roomRef.current); roomRef.current = null; setCall((current) => current ? { ...current, status: 'failed' } : current); const name = cause instanceof Error ? cause.name : ''; setError(name === 'NotAllowedError' || name === 'PermissionDeniedError' ? 'Permite o acesso ao microfone nas definições do navegador e tenta novamente.' : 'A voz ainda não está disponível. Tenta mais tarde.'); }).finally(() => setConnecting(false));
+  }, [call, preferences]);
+  useEffect(() => { const room = roomRef.current; if (room) void room.localParticipant.setMicrophoneEnabled(!preferences.micMuted && !preferences.deafened).then(() => setMicOn(!preferences.micMuted && !preferences.deafened)).catch(() => undefined); for (const audio of document.querySelectorAll<HTMLAudioElement>('audio[data-mavuno="voice"]')) audio.volume = audioOutputVolume(preferences); }, [preferences]);
   if (!call) return null;
-  const toggleMicrophone = async () => { const room = roomRef.current; if (!room) return; try { await room.localParticipant.setMicrophoneEnabled(!micOn); setMicOn((value) => !value); } catch { setError('Não foi possível alterar o microfone. Verifica a permissão do microfone.'); } };
+  const toggleMicrophone = async () => { const room = roomRef.current; if (!room) { onAudioChange({ micMuted: !preferences.micMuted }); return; } try { const next = !micOn; await room.localParticipant.setMicrophoneEnabled(next); setMicOn(next); onAudioChange({ micMuted: !next }); } catch { setError('Não foi possível alterar o microfone. Verifica a permissão do microfone.'); } };
   const close = async () => { await releaseLiveKitRoom(roomRef.current); roomRef.current = null; if (call.id && !['ended', 'rejected', 'timeout', 'failed'].includes(call.status)) await update('ended'); else setCall(null); };
   return <aside className="call-dock" role="dialog" aria-label="Chamada privada"><div className="call-dock-header"><Avatar name={call.peer?.username ?? 'Utilizador'} url={call.peer?.avatarUrl} size={38}/><div><strong>Chamada com {call.peer?.username ?? 'utilizador'}</strong><span className="muted">{statusLabels[call.status]}{connecting ? '…' : ''}</span></div></div>{error && <p className="error-banner">{error}</p>}{call.status === 'ringing' && <div className="call-actions"><button className="primary" onClick={() => void update('accepted')}>Aceitar</button><button className="secondary" onClick={() => void update('rejected')}>Recusar</button></div>}{call.status === 'in_progress' && <div className="call-actions"><button className="secondary" onClick={() => void toggleMicrophone()}>{micOn ? 'Silenciar' : 'Ativar microfone'}</button><button className="danger-button" onClick={() => void close()}>Terminar</button></div>}{['failed', 'ended', 'rejected', 'timeout'].includes(call.status) && <button className="secondary" onClick={() => setCall(null)}>Fechar</button>}</aside>;
 }
@@ -1048,7 +1099,54 @@ function AccountModal({ user, onClose, onEditProfile }: { user: User; onClose: (
   </div>;
 }
 
-function VoicePanel({ channel, notify }: { channel: Channel; notify: (text: string) => void }) {
+function AudioMenu({ kind, preferences, devices, error, onClose, onToggleMute, onToggleDeafen, onChange, onSettings, onRequestMic }: { kind: 'input' | 'output'; preferences: AudioPreferences; devices: MediaDeviceInfo[]; error: string; onClose: () => void; onToggleMute: () => void; onToggleDeafen: () => void; onChange: (patch: Partial<AudioPreferences>) => void; onSettings: () => void; onRequestMic: () => void }) {
+  const inputs = devices.filter((device) => device.kind === 'audioinput');
+  const outputs = devices.filter((device) => device.kind === 'audiooutput');
+  const outputSupported = typeof HTMLMediaElement !== 'undefined' && 'setSinkId' in HTMLMediaElement.prototype;
+  const selectOutput = (deviceId: string) => {
+    onChange({ outputDeviceId: deviceId });
+    if (outputSupported) void Promise.all(Array.from(document.querySelectorAll<HTMLAudioElement>('audio[data-mavuno="voice"]')).map((audio) => (audio as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> }).setSinkId?.(deviceId) ?? Promise.resolve()));
+  };
+  return <div className={`audio-menu ${kind === 'output' ? 'audio-menu-output' : ''}`} role="dialog" aria-label={kind === 'input' ? 'Opções do microfone' : 'Opções dos auscultadores'}>
+    <div className="audio-menu-handle"/>
+    <div className="audio-menu-heading"><strong>{kind === 'input' ? 'Microfone' : 'Auscultadores'}</strong><button className="icon-button" onClick={onClose} aria-label="Fechar"><Glyph name="close"/></button></div>
+    {kind === 'input' ? <>
+      <label className="audio-setting-row">Dispositivo de entrada<select value={preferences.inputDeviceId} onChange={(event) => onChange({ inputDeviceId: event.target.value })}><option value="">Predefinido do sistema</option>{inputs.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Microfone ${index + 1}`}</option>)}</select></label>
+      {!inputs.some((device) => device.label) && <button className="audio-menu-link" onClick={onRequestMic}>Permitir acesso para mostrar os nomes dos microfones</button>}
+      <label className="audio-setting-row">Perfil de voz<select value={preferences.voiceProfile} onChange={(event) => onChange({ voiceProfile: event.target.value as VoiceProfile })}><option value="default">Padrão</option><option value="noise-reduction">Redução de ruído</option><option value="studio">Estúdio</option></select><small>Aplica-se na próxima entrada na voz.</small></label>
+      <button className="audio-menu-action" onClick={onToggleMute}><Glyph name="mic"/>{preferences.micMuted ? 'Ativar microfone' : 'Silenciar microfone'}</button>
+    </> : <>
+      {outputSupported ? <label className="audio-setting-row">Dispositivo de saída<select value={preferences.outputDeviceId} onChange={(event) => selectOutput(event.target.value)}><option value="">Predefinido do sistema</option>{outputs.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Saída ${index + 1}`}</option>)}</select></label> : <p className="audio-note">Este navegador usa a saída do sistema.</p>}
+      <label className="audio-setting-row">Volume de saída <output>{preferences.outputVolume}%</output><input type="range" min="0" max="100" value={preferences.outputVolume} onChange={(event) => onChange({ outputVolume: Number(event.target.value) })}/></label>
+      <button className="audio-menu-action" onClick={onToggleDeafen}><Glyph name="headphones"/>{preferences.deafened ? 'Ativar som' : 'Ensurdecer'}</button>
+    </>}
+    {error && <p className="audio-note audio-error">{error}</p>}
+    <button className="audio-menu-action" onClick={onSettings}>Configurações de voz</button>
+  </div>;
+}
+
+function SettingsModal({ user, section, preferences, devices, audioError, onSection, onChange, onRequestMic, onOpenProfile, onLogout, onClose }: { user: User; section: 'account' | 'voice'; preferences: AudioPreferences; devices: MediaDeviceInfo[]; audioError: string; onSection: (section: 'account' | 'voice') => void; onChange: (patch: Partial<AudioPreferences>) => void; onRequestMic: () => void; onOpenProfile: () => void; onLogout: () => void; onClose: () => void }) {
+  const [testing, setTesting] = useState(false);
+  const [level, setLevel] = useState(0);
+  const testMic = async () => {
+    if (testing) return;
+    if (!navigator.mediaDevices?.getUserMedia) return;
+    setTesting(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(microphoneConstraints(preferences.voiceProfile, preferences.inputDeviceId));
+      const context = new AudioContext(); const source = context.createMediaStreamSource(stream); const analyser = context.createAnalyser(); analyser.fftSize = 256; source.connect(analyser);
+      const values = new Uint8Array(analyser.frequencyBinCount); const started = Date.now();
+      const tick = () => { analyser.getByteTimeDomainData(values); setLevel(Math.min(100, Math.round(values.reduce((sum, value) => sum + Math.abs(value - 128), 0) / values.length * 2))); if (Date.now() - started < 1800) requestAnimationFrame(tick); else { stream.getTracks().forEach((track) => track.stop()); void context.close(); setTesting(false); setLevel(0); } }; tick();
+    } catch { setTesting(false); }
+  };
+  return <div className="settings-backdrop" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <section className="settings-screen"><header className="settings-header"><button className="icon-button" onClick={onClose} aria-label="Voltar"><Glyph name="back"/></button><h2 id="settings-title">Definições</h2></header>
+      <div className="settings-body"><nav className="settings-nav"><button className={section === 'account' ? 'active' : ''} onClick={() => onSection('account')}>Conta</button><button className={section === 'voice' ? 'active' : ''} onClick={() => onSection('voice')}>Voz e áudio</button></nav>
+        <div className="settings-content">{section === 'account' ? <><section className="settings-section"><h3>Conta</h3><p className="muted">O teu perfil e as informações que escolhes partilhar.</p><button className="secondary" onClick={onOpenProfile}><Avatar name={user.username} url={user.avatarUrl} size={28}/> O meu perfil</button></section><section className="settings-section danger-section"><h3>Terminar sessão</h3><p className="muted">Sair deste aparelho.</p><button className="danger-button" onClick={() => { if (window.confirm('Queres terminar sessão?')) onLogout(); }}>Terminar sessão</button></section></> : <><section className="settings-section"><h3>Voz e áudio</h3><label className="audio-setting-row">Dispositivo de entrada<select value={preferences.inputDeviceId} onChange={(event) => onChange({ inputDeviceId: event.target.value })}><option value="">Predefinido do sistema</option>{devices.filter((device) => device.kind === 'audioinput').map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Microfone ${index + 1}`}</option>)}</select></label><button className="audio-menu-link" onClick={onRequestMic}>Permitir / testar microfone</button><label className="audio-setting-row">Perfil de voz<select value={preferences.voiceProfile} onChange={(event) => onChange({ voiceProfile: event.target.value as VoiceProfile })}><option value="default">Padrão</option><option value="noise-reduction">Redução de ruído</option><option value="studio">Estúdio</option></select></label><div className="mic-test"><button className="secondary" onClick={() => void testMic()}>{testing ? 'A ouvir…' : 'Testar microfone'}</button><div className="level-track"><span style={{ width: `${level}%` }}/></div></div>{audioError && <p className="error-banner">{audioError}</p>}</section><section className="settings-section"><h3>Saída</h3><p className="audio-note">{devices.some((device) => device.kind === 'audiooutput') && 'setSinkId' in HTMLMediaElement.prototype ? 'Escolhe a saída no menu dos auscultadores.' : 'Este navegador usa a saída do sistema.'}</p><label className="audio-setting-row">Volume de saída <output>{preferences.outputVolume}%</output><input type="range" min="0" max="100" value={preferences.outputVolume} onChange={(event) => onChange({ outputVolume: Number(event.target.value) })}/></label></section></>}</div></div>
+    </section></div>;
+}
+
+function VoicePanel({ channel, notify, preferences, onAudioChange }: { channel: Channel; notify: (text: string) => void; preferences: AudioPreferences; onAudioChange: (patch: Partial<AudioPreferences>) => void }) {
   const [room, setRoom] = useState<Room | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [participants, setParticipants] = useState<string[]>([]);
@@ -1069,6 +1167,7 @@ function VoicePanel({ channel, notify }: { channel: Channel; notify: (text: stri
     setRoom(null); setParticipants([]); setSpeakers([]); setMicOn(true);
   }, []);
   useEffect(() => () => { void disconnect(); }, [channel.id, disconnect]);
+  useEffect(() => { if (room) void room.localParticipant.setMicrophoneEnabled(!preferences.micMuted && !preferences.deafened).then(() => setMicOn(!preferences.micMuted && !preferences.deafened)).catch(() => undefined); for (const audio of document.querySelectorAll<HTMLAudioElement>('audio[data-mavuno="voice"]')) audio.volume = audioOutputVolume(preferences); }, [preferences, room]);
 
   const join = async () => {
     setError(''); setConnecting(true);
@@ -1082,7 +1181,7 @@ function VoicePanel({ channel, notify }: { channel: Channel; notify: (text: stri
       next.on(RoomEvent.ActiveSpeakersChanged, () => refresh(next!));
       next.on(RoomEvent.TrackSubscribed, (track) => {
         if (track.kind === Track.Kind.Audio) {
-          const element = track.attach(); element.dataset.mavuno = 'voice'; document.body.appendChild(element);
+          const element = track.attach(); element.dataset.mavuno = 'voice'; element.volume = audioOutputVolume(preferences); document.body.appendChild(element);
         }
       });
       next.on(RoomEvent.TrackUnsubscribed, (track) => track.detach().forEach((element) => element.remove()));
@@ -1090,8 +1189,8 @@ function VoicePanel({ channel, notify }: { channel: Channel; notify: (text: stri
       await next.connect(credentials.serverUrl, credentials.token);
       active.current = next;
       setRoom(next);
-      await next.localParticipant.setMicrophoneEnabled(true);
-      setMicOn(true);
+      await next.localParticipant.setMicrophoneEnabled(!preferences.micMuted && !preferences.deafened);
+      setMicOn(!preferences.micMuted && !preferences.deafened);
       refresh(next);
     } catch (cause) {
       if (next) await releaseLiveKitRoom(next);
@@ -1103,7 +1202,7 @@ function VoicePanel({ channel, notify }: { channel: Channel; notify: (text: stri
   };
   const toggleMic = async () => {
     if (!room) return;
-    try { await room.localParticipant.setMicrophoneEnabled(!micOn); setMicOn((value) => !value); }
+    try { const next = !micOn; await room.localParticipant.setMicrophoneEnabled(next); setMicOn(next); onAudioChange({ micMuted: !next }); }
     catch { setError('Não foi possível alterar o microfone. Verifica a permissão do microfone.'); }
   };
 
