@@ -13,8 +13,10 @@ import { db, pool } from './db/index.js';
 import { channels, communityBans, communityMembers, communityMutes, sessions } from './db/schema.js';
 import { readCookieValue, readSessionCookie, requireCsrf } from './security.js';
 import { isMember } from './permissions.js';
+import { storageCspOrigin } from './storage.js';
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
+const storageOrigin = storageCspOrigin();
 const app = express();
 const server = createServer(app);
 const io = new Server(server, {
@@ -40,9 +42,9 @@ app.use(helmet({
     defaultSrc: ["'self'"],
     scriptSrc: ["'self'"],
     styleSrc: process.env.NODE_ENV === 'production' ? ["'self'"] : ["'self'", "'unsafe-inline'"],
-    imgSrc: ["'self'", 'data:', 'https:'],
-    connectSrc: ["'self'", 'ws:', 'wss:'],
-    mediaSrc: ["'self'", 'blob:'],
+    imgSrc: ["'self'", 'data:', ...(storageOrigin ? [storageOrigin] : [])],
+    connectSrc: ["'self'", ...(storageOrigin ? [storageOrigin] : [])],
+    mediaSrc: ["'self'", 'blob:', ...(storageOrigin ? [storageOrigin] : [])],
     workerSrc: ["'self'", 'blob:'],
     objectSrc: ["'none'"],
     baseUri: ["'self'"],

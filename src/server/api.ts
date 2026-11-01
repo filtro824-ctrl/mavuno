@@ -7,7 +7,7 @@ import { db, pool } from './db/index.js';
 import {
   channels, communities, communityMembers, communityRoles, invitations, messages,
   messageMentions, rolePermissions, sessions, users, voiceRooms, communityBans, communityMutes,
-  moderationAuditLogs, privateCalls, messageReactions,
+  moderationAuditLogs, privateCalls, messageReactions, messageAttachments,
 } from './db/schema.js';
 import { createOpaqueToken, digestToken, hashPassword, readSessionCookie, setCsrfCookie, setSessionCookie, clearSessionCookie, verifyPassword } from './security.js';
 import { hasPermission, isMember, roleFor, roleIdFor, type Permission } from './permissions.js';
@@ -16,6 +16,8 @@ import { profileUpdateSchema, profileVisibilityFromRecord, visibleMemberIdentity
 import { broadcastProfileUpdate } from './profile-realtime.js';
 import { canActOnHierarchy, durationInRange, durationSeconds } from './moderation-utils.js';
 import type { Server as SocketServer } from 'socket.io';
+import { attachmentsForMessages, createAttachmentsRouter, deleteChannelWithAttachments, removeMessageAttachments } from './attachments-api.js';
+import { MAX_ATTACHMENTS_PER_MESSAGE } from './attachment-utils.js';
 
 const replyMessages = alias(messages, 'reply_messages');
 const replyAuthors = alias(users, 'reply_authors');
@@ -222,6 +224,7 @@ export function createApi(io: SocketServer): Router {
   }));
 
   router.use(requireAuth);
+  router.use(createAttachmentsRouter(io));
   router.get('/auth/me', (_req, res) => res.json({ user: currentUser(res) }));
   router.get('/profile', asyncRoute(async (_req, res) => {
     const profile = await loadOwnProfile(currentUser(res).id);
@@ -415,11 +418,10 @@ export function createApi(io: SocketServer): Router {
       .from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
     if (!channel) { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
     if (!await hasPermission(currentUser(res).id, channel.communityId, 'manage_channels')) { res.status(403).json({ error: 'Não tens permissão para gerir canais.' }); return; }
-    if (channel.kind === 'text') {
-      const [total] = await db.select({ value: count() }).from(channels).where(and(eq(channels.communityId, channel.communityId), eq(channels.kind, 'text')));
-      if (total.value <= 1) { res.status(409).json({ error: 'A comunidade precisa de pelo menos um canal de texto.' }); return; }
-    }
-    await db.delete(channels).where(eq(channels.id, channel.id));
+    const outcome = await deleteChannelWithAttachments(channel.id);
+    if (outcome === 'not-found') { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
+    if (outcome === 'last-text-channel') { res.status(409).json({ error: 'A comunidade precisa de pelo menos um canal de texto.' }); return; }
+    if (outcome === 'storage-failed') { res.status(503).json({ error: 'Não foi possível apagar os anexos agora. Tenta novamente mais tarde.' }); return; }
     io.to(`channel:${channel.id}`).emit('channel:deleted', { id: channel.id });
     res.json({ ok: true });
   }));
@@ -443,7 +445,8 @@ export function createApi(io: SocketServer): Router {
     const oldest = selected[selected.length - 1];
     const ordered = selected.reverse();
     const reactions = await reactionSummariesFor(ordered.map((message) => message.id), currentUser(res).id);
-    res.json({ messages: ordered.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [] })), hasMore, nextCursor: oldest ? `${oldest.createdAt.toISOString()}~${oldest.id}` : null });
+    const attachments = await attachmentsForMessages(ordered.map((message) => message.id));
+    res.json({ messages: ordered.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [], attachments: attachments[message.id] ?? [] })), hasMore, nextCursor: oldest ? `${oldest.createdAt.toISOString()}~${oldest.id}` : null });
   }));
 
   router.get('/channels/:channelId/pinned', asyncRoute(async (req, res) => {
@@ -455,8 +458,9 @@ export function createApi(io: SocketServer): Router {
       .leftJoin(replyMessages, eq(messages.replyToId, replyMessages.id)).leftJoin(replyAuthors, eq(replyMessages.authorId, replyAuthors.id))
       .where(and(eq(messages.channelId, channel.id), isNotNull(messages.pinnedAt))).orderBy(desc(messages.pinnedAt), desc(messages.id));
     const reactions = await reactionSummariesFor(rows.map((message) => message.id), userId);
+    const attachments = await attachmentsForMessages(rows.map((message) => message.id));
     res.setHeader('Cache-Control', 'private, no-store');
-    res.json({ messages: rows.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [] })) });
+    res.json({ messages: rows.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [], attachments: attachments[message.id] ?? [] })) });
   }));
 
   router.post('/channels/:channelId/messages', asyncRoute(async (req, res) => {
@@ -465,14 +469,60 @@ export function createApi(io: SocketServer): Router {
     if (await activeBan(channel.communityId, currentUser(res).id)) { res.status(403).json({ error: 'O teu acesso a esta comunidade está banido.' }); return; }
     const mute = await activeMute(channel.communityId, currentUser(res).id);
     if (mute) { res.status(403).json({ error: `Foste silenciado até às ${new Intl.DateTimeFormat('pt-MZ', { hour: '2-digit', minute: '2-digit' }).format(mute.expiresAt)}.` }); return; }
-    const input = z.object({ clientMessageId: uuid, body: z.string().trim().min(1).max(2000), replyToId: uuid.nullable().optional() }).safeParse(req.body);
-    if (!input.success) { res.status(400).json({ error: 'Mensagem inválida (máximo 2000 caracteres).' }); return; }
+    const input = z.object({
+      clientMessageId: uuid,
+      body: z.string().trim().max(2000).default(''),
+      replyToId: uuid.nullable().optional(),
+      attachmentIds: z.array(uuid).max(MAX_ATTACHMENTS_PER_MESSAGE).default([]).refine((ids) => new Set(ids).size === ids.length),
+    }).safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: 'Mensagem inválida. Podes enviar até 5 anexos e 2000 caracteres.' }); return; }
+    if (!input.data.body && input.data.attachmentIds.length === 0) { res.status(400).json({ error: 'Escreve uma mensagem ou escolhe pelo menos um anexo.' }); return; }
     if (input.data.replyToId) {
       const [parent] = await db.select({ id: messages.id }).from(messages).where(and(eq(messages.id, input.data.replyToId), eq(messages.channelId, channel.id))).limit(1);
       if (!parent) { res.status(400).json({ error: 'A resposta deve referir uma mensagem deste canal.' }); return; }
     }
     const author = currentUser(res);
-    const [created] = await db.insert(messages).values({ channelId: channel.id, authorId: author.id, ...input.data }).onConflictDoNothing().returning();
+    const outcome = await db.transaction(async (tx) => {
+      const [lockedChannel] = await tx.select({ id: channels.id }).from(channels).where(eq(channels.id, channel.id)).for('share');
+      if (!lockedChannel) return { type: 'channel-missing' as const };
+      const findExisting = () => tx.select({ id: messages.id }).from(messages)
+        .where(and(eq(messages.channelId, channel.id), eq(messages.authorId, author.id), eq(messages.clientMessageId, input.data.clientMessageId))).limit(1);
+      const [existing] = await findExisting();
+      if (existing) return { type: 'existing' as const, id: existing.id };
+
+      if (input.data.attachmentIds.length) {
+        const ready = await tx.select({ id: messageAttachments.id }).from(messageAttachments)
+          .where(and(inArray(messageAttachments.id, input.data.attachmentIds), eq(messageAttachments.userId, author.id), eq(messageAttachments.communityId, channel.communityId), eq(messageAttachments.channelId, channel.id), eq(messageAttachments.status, 'ready'), isNull(messageAttachments.messageId)))
+          .for('update');
+        if (ready.length !== input.data.attachmentIds.length) {
+          const [duplicate] = await findExisting();
+          if (duplicate) return { type: 'existing' as const, id: duplicate.id };
+          return { type: 'attachments-unavailable' as const };
+        }
+      }
+
+      const [created] = await tx.insert(messages).values({
+        channelId: channel.id,
+        authorId: author.id,
+        clientMessageId: input.data.clientMessageId,
+        body: input.data.body,
+        replyToId: input.data.replyToId ?? null,
+      }).onConflictDoNothing().returning({ id: messages.id });
+      if (!created) {
+        const [duplicate] = await findExisting();
+        return duplicate ? { type: 'existing' as const, id: duplicate.id } : { type: 'attachments-unavailable' as const };
+      }
+      if (input.data.attachmentIds.length) {
+        const linked = await tx.update(messageAttachments).set({ messageId: created.id })
+          .where(and(inArray(messageAttachments.id, input.data.attachmentIds), eq(messageAttachments.userId, author.id), eq(messageAttachments.channelId, channel.id), eq(messageAttachments.status, 'ready'), isNull(messageAttachments.messageId)))
+          .returning({ id: messageAttachments.id });
+        if (linked.length !== input.data.attachmentIds.length) throw new Error('Attachment link changed during message transaction');
+      }
+      return { type: 'created' as const, id: created.id };
+    });
+    if (outcome.type === 'channel-missing') { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
+    if (outcome.type === 'attachments-unavailable') { res.status(400).json({ error: 'Um ou mais anexos já não estão disponíveis. Escolhe-os novamente.' }); return; }
+    const created = outcome.type === 'created';
     const [row] = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar })
       .from(messages).innerJoin(users, eq(messages.authorId, users.id)).leftJoin(replyMessages, eq(messages.replyToId, replyMessages.id)).leftJoin(replyAuthors, eq(replyMessages.authorId, replyAuthors.id))
       .where(and(eq(messages.channelId, channel.id), eq(messages.authorId, author.id), eq(messages.clientMessageId, input.data.clientMessageId))).limit(1);
@@ -488,9 +538,15 @@ export function createApi(io: SocketServer): Router {
           for (const person of recipients) io.to(`user:${person.id}`).emit('mention:new', { username: author.username, channelId: channel.id, messageId: row.id });
         }
       }
-      io.to(`channel:${channel.id}`).emit('message:new', withoutHiddenAvatar(row));
     }
-    res.status(created ? 201 : 200).json({ message: row ? withoutHiddenAvatar(row) : null });
+    if (row) {
+      const attachments = await attachmentsForMessages([row.id]);
+      const message = { ...withoutHiddenAvatar(row), attachments: attachments[row.id] ?? [] };
+      if (created) io.to(`channel:${channel.id}`).emit('message:new', message);
+      res.status(created ? 201 : 200).json({ message });
+      return;
+    }
+    res.status(500).json({ error: 'Não foi possível guardar a mensagem.' });
   }));
 
   router.post('/messages/:messageId/reactions', asyncRoute(async (req, res) => {
@@ -546,6 +602,7 @@ export function createApi(io: SocketServer): Router {
     const actorId = currentUser(res).id;
     if (!await isMember(actorId, message.communityId)) { res.status(404).json({ error: 'Mensagem não encontrada.' }); return; }
     if (message.authorId !== actorId && !await hasPermission(actorId, message.communityId, 'delete_messages')) { res.status(403).json({ error: 'Não tens permissão para apagar esta mensagem.' }); return; }
+    await removeMessageAttachments(message.id);
     await db.delete(messages).where(eq(messages.id, message.id));
     io.to(`channel:${message.channelId}`).emit('message:deleted', { id: message.id });
     res.json({ ok: true });

@@ -71,6 +71,13 @@
       "when": 1793533078712,
       "tag": "0009_material_xorn",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1793551192026,
+      "tag": "0010_lively_winter_soldier",
+      "breakpoints": true
     }
   ]
 }

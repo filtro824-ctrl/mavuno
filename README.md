@@ -73,6 +73,26 @@ O servidor verifica a associação/permissão e emite tokens LiveKit; a chave se
 
 A recuperação de conta precisa de um fornecedor de email/transporte de mensagens — ainda não configurado — e por isso está desativada.
 
+## Armazenamento privado de anexos
+
+Os anexos são enviados diretamente do navegador para um bucket S3 compatível privado; o servidor não grava ficheiros no disco nem guarda o conteúdo na base de dados. Cria um bucket privado no Supabase Storage, Cloudflare R2 ou fornecedor compatível e cria credenciais S3 com acesso apenas a esse bucket. Não ativa acesso público nem partilhes as chaves.
+
+No fornecedor, configura CORS para permitir apenas a origem `https://mavuno-qfed.onrender.com`, os métodos `PUT` e `GET`, e o cabeçalho `Content-Type`. Exemplo de regras CORS para fornecedores que aceitam JSON:
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://mavuno-qfed.onrender.com"],
+    "AllowedMethods": ["PUT", "GET"],
+    "AllowedHeaders": ["Content-Type"],
+    "ExposeHeaders": [],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+No runtime do servidor, configura as cinco variáveis secretas `STORAGE_ENDPOINT`, `STORAGE_BUCKET`, `STORAGE_REGION`, `STORAGE_ACCESS_KEY_ID` e `STORAGE_SECRET_ACCESS_KEY`. O endpoint deve ser o endpoint S3 do fornecedor; o cliente usa endereçamento compatível com buckets privados. Se alguma variável estiver em falta, o resto da aplicação continua disponível e o envio mostra uma mensagem simples de indisponibilidade. Nunca coloques estas credenciais no bundle do cliente, no Git ou nos logs.
+
 ## Planos Free/Pro e pagamentos
 
 O estado entregue nesta versão não contém um modelo de subscrição Free/Pro, regras de limites pagas, cobrança, renovação ou ativação de funcionalidades Pro. Não há qualquer endpoint ou ecrã que apresente uma subscrição como ativa; estes pontos permanecem pendentes e devem ser implementados no backend antes de serem expostos na interface.

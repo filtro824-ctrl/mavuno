@@ -4,6 +4,7 @@
 - Um pedido de cada vez. Cada etapa termina com commit no GitHub (e o link do commit), e o deploy é feito pelo dono do projeto.
 - NUNCA uses nem ligues o Render. O serviço chama-se mavuno-qfed (mavuno-qfed.onrender.com). O deploy é do dono.
 - A base de dados é PostgreSQL no Supabase e tu NÃO tens acesso. Nunca peças nem uses o POSTGRES_URL. Nunca corras pnpm db:migrate nem pnpm test:integration: o histórico do Drizzle não está aplicado no Supabase e o teste de integração cria e apaga contas.
+- Nunca apagar, repor ou recriar dados existentes. Se uma alteração parecer mexer em contas, comunidades, canais ou mensagens, parar e avisar o dono antes de continuar.
 - Fluxo de cada alteração à base de dados: gerar a migração com pnpm db:generate; retirar instruções antigas que apareçam por causa dos snapshots; mostrar o SQL completo em texto; PARAR; o dono cola o SQL no SQL Editor do Supabase e diz "Apliquei o SQL"; só então fazes commit. Só alterações ADITIVAS (colunas novas com valor por defeito, tabelas novas, índices novos). Toda a tabela nova leva no SQL a linha ALTER TABLE ... ENABLE ROW LEVEL SECURITY.
 - Antes de cada commit mostra git status e git diff --stat. Se aparecer algo fora do âmbito (ícones, .env, Dockerfile, package.json sem motivo, ficheiros temporários), pára e avisa.
 - Nunca imprimas nem copies o .env nem segredos. Sem segredos no repositório.
@@ -15,15 +16,15 @@
 
 ## 2. Onde está cada coisa
 - Código: GitHub filtro824-ctrl/mavuno, branch main (público). É a fonte de verdade.
-- Alojamento: Render, Web Service mavuno-qfed. Variáveis de ambiente (só os nomes): POSTGRES_URL, COOKIE_SECURE, COOKIE_SAME_SITE, NODE_ENV, PG_POOL_SIZE; de voz: LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET (ainda por configurar).
+- Alojamento: Render, Web Service mavuno-qfed. Variáveis de ambiente (só os nomes): POSTGRES_URL, COOKIE_SECURE, COOKIE_SAME_SITE, NODE_ENV, PG_POOL_SIZE; de voz: LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET (ainda por configurar); de anexos: STORAGE_ENDPOINT, STORAGE_BUCKET, STORAGE_REGION, STORAGE_ACCESS_KEY_ID, STORAGE_SECRET_ACCESS_KEY.
 - Base de dados: PostgreSQL no Supabase, ligada pelo Session pooler. Row Level Security ativo nas tabelas.
 
 ## 3. Stack e estrutura (verifica no código)
 React/Vite, TypeScript, Express, Socket.IO, PostgreSQL com Drizzle, LiveKit para voz, PWA. Ficheiros principais: src/client/App.tsx, api.ts, styles.css, emoji-data.ts; src/server/index.ts, api.ts, security.ts, permissions.ts, profile-utils.ts, profile-realtime.ts, db/schema.ts; public/service-worker.js; drizzle/; tests/. Comandos: pnpm typecheck, pnpm test, pnpm build.
 
 ## 4. Estado atual
-Feito no código: registo, login, sessões, comunidades públicas e privadas, convites básicos, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono. Etapa 5 concluída: barra do utilizador com microfone, auscultadores, definições e menus responsivos; preferências de áudio locais, teste de microfone, integração com voz/chamadas e correção da altura da lista de mensagens. Etapa 6 concluída: cartão de perfil compacto e expansível para o próprio e outros membros, banner por link ou cor de fallback, texto e preferência de presença, presença invisível tratada como offline no servidor, privacidade de banner/estado, editor por separadores, pré-visualização, validação HTTPS e testes unitários; aguarda deploy do dono.
-Ainda NÃO existe: anexos, emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
+Feito no código: registo, login, sessões, comunidades públicas e privadas, convites básicos, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono. Etapa 5 concluída: barra do utilizador com microfone, auscultadores, definições e menus responsivos; preferências de áudio locais, teste de microfone, integração com voz/chamadas e correção da altura da lista de mensagens. Etapa 6 concluída: cartão de perfil compacto e expansível para o próprio e outros membros, banner por link ou cor de fallback, texto e preferência de presença, presença invisível tratada como offline no servidor, privacidade de banner/estado, editor por separadores, pré-visualização, validação HTTPS e testes unitários; aguarda deploy do dono. Etapa 7, PARTE A concluída: dependências S3 fixas, armazenamento privado, rotas protegidas, validação/quotas, integração no ciclo de mensagens e limpeza de anexos; PARTE B (interface) pendente até ao commit da PARTE A. O dono aplicou a migração 0010.
+Ainda NÃO existe como função completa: anexos na interface (Etapa 7 PARTE B pendente), emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
 
 ## 5. SQL já aplicado no Supabase (por ordem)
 1. Migrações 0000 a 0006 coladas juntas, sem as linhas "--> statement-breakpoint" (18 tabelas, incluindo message_reactions).
@@ -31,12 +32,13 @@ Ainda NÃO existe: anexos, emojis personalizados e stickers, mensagens privadas 
 3. Migração 0007: 7 colunas na tabela users (about_me, show_avatar, show_about, show_status, show_join_date, show_common_communities, show_email).
 4. Migração 0008, aplicada pelo dono: coluna nullable community_bans.expires_at (timestamp with time zone).
 5. Migração 0009, aplicada pelo dono: banner_url, banner_color, status_text, presence_preference e show_banner na tabela users.
+6. Migração 0010, aplicada pelo dono: nova tabela message_attachments, índices message_id/user_id e RLS ativo.
 
 ## 6. Fila de etapas (o dono envia o pedido de cada uma, por esta ordem)
 4 Menu das mensagens ao premir (sem os três pontos), silenciar e banir por tempo. SQL (1 coluna: community_bans.expires_at).
 5 Barra do utilizador (microfone, auscultadores, engrenagem, Definições) e correção da lista de mensagens no modo PC. Sem SQL — concluída nesta etapa.
 6 Cartão de perfil expansível, imagem de fundo por link, estado e texto de estado. SQL — concluída nesta etapa.
-7 Anexos (imagens, GIFs, vídeos, documentos) com armazenamento S3 compatível. SQL. Exige bucket privado criado pelo dono.
+7 Anexos (imagens, GIFs, vídeos, documentos) com armazenamento S3 compatível. PARTE A concluída; PARTE B da interface segue após o commit do servidor. Exige bucket privado criado e configurado pelo dono.
 8 Emojis personalizados e stickers. SQL.
 9 Foto de perfil e imagem de fundo enviadas do telemóvel.
 10 Convites, boas-vindas com regras e pedidos de entrada. SQL.
@@ -48,7 +50,7 @@ Ainda NÃO existe: anexos, emojis personalizados e stickers, mensagens privadas 
 16 Voz real testada com dois telemóveis (configuração do dono com LiveKit).
 17 AutoMod. SQL.
 18 Notificações com o Mavuno fechado. SQL.
-Prioridade: 4, 5, 6, 7 e 10; depois 8, 9, 11 e 13. Próxima etapa: 7. Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
+Prioridade: 4, 5, 6, 7 e 10; depois 8, 9, 11 e 13. Etapa atual: 7 (PARTE A concluída; PARTE B pendente). Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
 
 ## 7. Limitações conhecidas
 Voz sem LiveKit configurado e sem teste com dois aparelhos; sem upload de ficheiros; sem recuperação de conta por email; sem planos nem pagamentos; sem notificações push.

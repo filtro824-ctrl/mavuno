@@ -185,3 +185,21 @@ export const passwordResetTokens = pgTable('password_reset_tokens', {
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+export const messageAttachments = pgTable('message_attachments', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  messageId: uuid('message_id').references(() => messages.id, { onDelete: 'set null' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'restrict' }),
+  channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'restrict' }),
+  storageKey: varchar('storage_key', { length: 255 }).notNull().unique(),
+  originalName: varchar('original_name', { length: 255 }).notNull(),
+  mimeType: varchar('mime_type', { length: 120 }).notNull(),
+  sizeBytes: integer('size_bytes').notNull(),
+  width: integer('width'),
+  height: integer('height'),
+  status: varchar('status', { length: 10 }).notNull().default('pending'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index('message_attachments_message_idx').on(table.messageId),
+  index('message_attachments_user_idx').on(table.userId),
+]);
