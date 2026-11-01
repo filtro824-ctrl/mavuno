@@ -1040,7 +1040,7 @@ function ProfileCompactCard({ profile, own, onExpand, onClose, onEdit, onStatus 
   </div>;
 }
 
-function ProfileModal({ data, loading, error, online, busy, onClose, onReload, onSave }: {
+function ProfileModal({ data, loading, error, online, busy, onClose, onReload, onLogout, onSave }: {
   data: OwnProfileResponse | null; loading: boolean; error: string; online: boolean; busy: boolean; onClose: () => void; onReload: () => void; onLogout: () => void;
   onSave: (data: { username: string; avatarUrl: string | null; aboutMe: string; bannerUrl: string | null; bannerColor: string | null; statusText: string; presencePreference: 'online' | 'away' | 'dnd' | 'invisible'; visibility: ProfileVisibility }) => void;
 }) {
