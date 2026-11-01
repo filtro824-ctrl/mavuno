@@ -71,6 +71,7 @@ function Icon({ name }: { name: string }) {
     react: <><circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></>,
     reply: <><path d="m9 17-5-5 5-5"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></>,
     copy: <><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></>,
+    download: <><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></>,
     speak: <><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15 9a5 5 0 0 1 0 6M18 6a9 9 0 0 1 0 12"/></>,
     pin: <><path d="m16 3 5 5-4 1-4 4-1 4-2-2-4 4"/><path d="m8 8 8 8"/></>,
     user: <><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></>,
@@ -87,9 +88,9 @@ function MenuRow({ icon, children, danger, onClick }: { icon: string; children: 
   return <button type="button" className={`action-menu-row ${danger ? 'danger-text' : ''}`} onClick={onClick}><Icon name={icon}/><span>{children}</span></button>;
 }
 
-export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions, targetMember, onClose, onReply, onDelete, onPin, onQuickReaction, onMoreReactions, onProfile, onCall, onModerate, onUnmute, onKick, notify }: {
+export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions, targetMember, onClose, onReply, onDelete, onDownload, onPin, onQuickReaction, onMoreReactions, onProfile, onCall, onModerate, onUnmute, onKick, notify }: {
   target: ActionMenuTarget; actorId: string; actorRole: string | null; actorPermissions: string[]; targetMember?: Member;
-  onClose: () => void; onReply: (message: Message) => void; onDelete: (message: Message) => Promise<void> | void; onPin: (message: Message) => Promise<void> | void;
+  onClose: () => void; onReply: (message: Message) => void; onDelete: (message: Message) => Promise<void> | void; onDownload: (message: Message) => Promise<void> | void; onPin: (message: Message) => Promise<void> | void;
   onQuickReaction: (message: Message, emoji: string) => void; onMoreReactions: (message: Message) => void; onProfile: (userId: string) => void; onCall: (member: Member) => void;
   onModerate: (action: 'mute' | 'ban', member: Member) => void; onUnmute: (member: Member) => void; onKick: (member: Member) => Promise<void> | void; notify: (text: string) => void;
 }) {
@@ -176,8 +177,9 @@ export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions
       </div>}
       {message && <div className="action-menu-group"><h3>Mensagem</h3>
         {!message.delivery && <MenuRow icon="reply" onClick={() => run(() => onReply(message))}>Responder</MenuRow>}
-        <MenuRow icon="copy" onClick={() => copyText(message.body)}>Copiar texto</MenuRow>
-        {'speechSynthesis' in window && <MenuRow icon="speak" onClick={() => { if (speaking) { window.speechSynthesis.cancel(); setSpeaking(false); } else { toggleSpeech(message.body); } }}>{speaking ? 'Parar de falar' : 'Falar mensagem'}</MenuRow>}
+        {message.attachments?.length ? <MenuRow icon="download" onClick={() => run(() => { void onDownload(message); })}>Descarregar</MenuRow> : null}
+        {message.body && <MenuRow icon="copy" onClick={() => copyText(message.body)}>Copiar texto</MenuRow>}
+        {message.body && 'speechSynthesis' in window && <MenuRow icon="speak" onClick={() => { if (speaking) { window.speechSynthesis.cancel(); setSpeaking(false); } else { toggleSpeech(message.body); } }}>{speaking ? 'Parar de falar' : 'Falar mensagem'}</MenuRow>}
         {mayPin && <MenuRow icon="pin" onClick={() => run(() => { void onPin(message); })}>{message.pinnedAt ? 'Desafixar' : 'Fixar'}</MenuRow>}
       </div>}
       {member && member.id !== actorId && <div className="action-menu-group"><h3>Membro</h3>

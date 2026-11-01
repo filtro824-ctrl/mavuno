@@ -23,8 +23,8 @@
 React/Vite, TypeScript, Express, Socket.IO, PostgreSQL com Drizzle, LiveKit para voz, PWA. Ficheiros principais: src/client/App.tsx, api.ts, styles.css, emoji-data.ts; src/server/index.ts, api.ts, security.ts, permissions.ts, profile-utils.ts, profile-realtime.ts, db/schema.ts; public/service-worker.js; drizzle/; tests/. Comandos: pnpm typecheck, pnpm test, pnpm build.
 
 ## 4. Estado atual
-Feito no código: registo, login, sessões, comunidades públicas e privadas, convites básicos, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono. Etapa 5 concluída: barra do utilizador com microfone, auscultadores, definições e menus responsivos; preferências de áudio locais, teste de microfone, integração com voz/chamadas e correção da altura da lista de mensagens. Etapa 6 concluída: cartão de perfil compacto e expansível para o próprio e outros membros, banner por link ou cor de fallback, texto e preferência de presença, presença invisível tratada como offline no servidor, privacidade de banner/estado, editor por separadores, pré-visualização, validação HTTPS e testes unitários; aguarda deploy do dono. Etapa 7, PARTE A concluída: dependências S3 fixas, armazenamento privado, rotas protegidas, validação/quotas, integração no ciclo de mensagens e limpeza de anexos; PARTE B (interface) pendente até ao commit da PARTE A. O dono aplicou a migração 0010.
-Ainda NÃO existe como função completa: anexos na interface (Etapa 7 PARTE B pendente), emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
+Feito no código: registo, login, sessões, comunidades públicas e privadas, convites básicos, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono. Etapa 5 concluída: barra do utilizador com microfone, auscultadores, definições e menus responsivos; preferências de áudio locais, teste de microfone, integração com voz/chamadas e correção da altura da lista de mensagens. Etapa 6 concluída: cartão de perfil compacto e expansível para o próprio e outros membros, banner por link ou cor de fallback, texto e preferência de presença, presença invisível tratada como offline no servidor, privacidade de banner/estado, editor por separadores, pré-visualização, validação HTTPS e testes unitários; aguarda deploy do dono. Etapa 7 concluída no código: armazenamento S3 privado, rotas protegidas, validação/quotas, envio, visualização, descarregamento, renovação de URLs, limpeza de anexos, pré-visualizações, compressão local de imagens e testes; migração 0010 aplicada pelo dono. Aguarda configuração do bucket privado e deploy pelo dono.
+Ainda NÃO existe: emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
 
 ## 5. SQL já aplicado no Supabase (por ordem)
 1. Migrações 0000 a 0006 coladas juntas, sem as linhas "--> statement-breakpoint" (18 tabelas, incluindo message_reactions).
@@ -38,7 +38,7 @@ Ainda NÃO existe como função completa: anexos na interface (Etapa 7 PARTE B p
 4 Menu das mensagens ao premir (sem os três pontos), silenciar e banir por tempo. SQL (1 coluna: community_bans.expires_at).
 5 Barra do utilizador (microfone, auscultadores, engrenagem, Definições) e correção da lista de mensagens no modo PC. Sem SQL — concluída nesta etapa.
 6 Cartão de perfil expansível, imagem de fundo por link, estado e texto de estado. SQL — concluída nesta etapa.
-7 Anexos (imagens, GIFs, vídeos, documentos) com armazenamento S3 compatível. PARTE A concluída; PARTE B da interface segue após o commit do servidor. Exige bucket privado criado e configurado pelo dono.
+7 Anexos (imagens, GIFs, vídeos, documentos) com armazenamento S3 compatível — concluída no código; exige bucket privado criado e configurado pelo dono.
 8 Emojis personalizados e stickers. SQL.
 9 Foto de perfil e imagem de fundo enviadas do telemóvel.
 10 Convites, boas-vindas com regras e pedidos de entrada. SQL.
@@ -50,7 +50,7 @@ Ainda NÃO existe como função completa: anexos na interface (Etapa 7 PARTE B p
 16 Voz real testada com dois telemóveis (configuração do dono com LiveKit).
 17 AutoMod. SQL.
 18 Notificações com o Mavuno fechado. SQL.
-Prioridade: 4, 5, 6, 7 e 10; depois 8, 9, 11 e 13. Etapa atual: 7 (PARTE A concluída; PARTE B pendente). Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
+Prioridade: 4, 5, 6, 7 e 10; depois 8, 9, 11 e 13. Próxima etapa: 8. Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
 
 ## 7. Limitações conhecidas
-Voz sem LiveKit configurado e sem teste com dois aparelhos; sem upload de ficheiros; sem recuperação de conta por email; sem planos nem pagamentos; sem notificações push.
+Voz sem LiveKit configurado e sem teste com dois aparelhos; anexos dependem da configuração do bucket privado no Render; sem recuperação de conta por email; sem planos nem pagamentos; sem notificações push.

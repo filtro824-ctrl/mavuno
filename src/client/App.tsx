@@ -2,14 +2,64 @@ import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef
 import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
-import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type MemberProfile, type Message, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
+import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type MemberProfile, type Message, type MessageAttachment, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
 import { EMOJI_CATEGORIES, EMOJI_INDEX, type EmojiCategoryId } from './emoji-data';
 import { toggleReactionSummary } from './reaction-state';
 import { applyDeafenState, audioOutputVolume, DEFAULT_AUDIO_PREFERENCES, microphoneConstraints, readAudioPreferences, writeAudioPreferences, type AudioPreferences, type VoiceProfile } from './audio-preferences';
 import { ActionMenuOverlay, MessageRow, ModerationPrompt, rectFor, type ActionMenuTarget, type DurationChoice, type MenuRect } from './message-actions';
+import { ATTACHMENT_TYPES, validateAttachmentMetadata, type AttachmentKind } from '../server/attachment-utils';
 
 type ModalType = 'community' | 'channel' | 'profile' | 'memberProfile' | 'account' | 'settings' | 'admin' | null;
+type PendingAttachment = { key: string; file: File; previewUrl: string; mimeType: string; kind: AttachmentKind; width: number | null; height: number | null; attachmentId?: string; progress: number; status: 'queued' | 'uploading' | 'ready' | 'failed'; error?: string };
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
+
+function inferredMimeType(file: File): string {
+  if (file.type) return file.type.toLowerCase();
+  const extension = file.name.split('.').pop()?.toLowerCase();
+  return Object.entries(ATTACHMENT_TYPES).find(([, rule]) => rule.extensions.includes(extension ?? ''))?.[0] ?? '';
+}
+
+async function prepareAttachmentFile(file: File, mimeType: string): Promise<{ file: File; width: number | null; height: number | null }> {
+  const typedFile = file.type.toLowerCase() === mimeType ? file : new File([file], file.name, { type: mimeType, lastModified: file.lastModified });
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) return { file: typedFile, width: null, height: null };
+  try {
+    const bitmap = await createImageBitmap(typedFile);
+    const width = bitmap.width;
+    const height = bitmap.height;
+    const largestSide = Math.max(width, height);
+    if (largestSide <= 1600) { bitmap.close(); return { file: typedFile, width, height }; }
+    const scale = 1600 / largestSide;
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    const context = canvas.getContext('2d');
+    if (!context) { bitmap.close(); return { file: typedFile, width, height }; }
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close();
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, mimeType, 0.85));
+    if (!blob || blob.type !== mimeType) return { file: typedFile, width, height };
+    return { file: new File([blob], file.name, { type: mimeType, lastModified: file.lastModified }), width: canvas.width, height: canvas.height };
+  } catch { return { file: typedFile, width: null, height: null }; }
+}
+
+function uploadWithProgress(url: string, file: File, mimeType: string, onProgress: (percent: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open('PUT', url);
+    request.setRequestHeader('Content-Type', mimeType);
+    request.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100)); };
+    request.onload = () => request.status >= 200 && request.status < 300 ? resolve() : reject(new Error('Não foi possível enviar este ficheiro. Tenta novamente.'));
+    request.onerror = () => reject(new Error('Não foi possível enviar este ficheiro. Tenta novamente.'));
+    request.onabort = () => reject(new Error('O envio foi interrompido. Tenta novamente.'));
+    request.send(file);
+  });
+}
+
+function formatFileSize(sizeBytes: number): string {
+  if (sizeBytes < 1024) return `${sizeBytes} B`;
+  if (sizeBytes < 1024 * 1024) return `${(sizeBytes / 1024).toFixed(0)} KB`;
+  return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 function durationLabel(duration: DurationChoice): string {
   if (!duration) return 'permanentemente';
   const unit = duration.unit === 'minutes' ? (duration.amount === 1 ? 'minuto' : 'minutos') : duration.unit === 'hours' ? (duration.amount === 1 ? 'hora' : 'horas') : (duration.amount === 1 ? 'dia' : 'dias');
@@ -57,6 +107,45 @@ function Avatar({ name, url, size }: { name: string; url?: string | null; size?:
   return <span className="avatar" style={size ? { width: size, height: size, fontSize: Math.max(10, size * .36) } : undefined}>
     {url ? <img src={url} alt="" referrerPolicy="no-referrer" loading="lazy"/> : initials(name)}
   </span>;
+}
+function AttachmentGallery({ attachments, onDownload, notify }: { attachments: MessageAttachment[]; onDownload: (attachment: MessageAttachment) => Promise<void> | void; notify: (text: string) => void }) {
+  const signature = attachments.map((item) => `${item.id}:${item.url}`).join('|');
+  const [urls, setUrls] = useState<Record<string, string>>(() => Object.fromEntries(attachments.map((item) => [item.id, item.url])));
+  const [viewerId, setViewerId] = useState<string | null>(null);
+  const retriedIds = useRef(new Set<string>());
+  useEffect(() => {
+    setUrls(Object.fromEntries(attachments.map((item) => [item.id, item.url])));
+    retriedIds.current.clear();
+  }, [signature]);
+  useEffect(() => {
+    if (!viewerId) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setViewerId(null); };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [viewerId]);
+  const renew = async (attachment: MessageAttachment) => {
+    if (retriedIds.current.has(attachment.id)) return;
+    retriedIds.current.add(attachment.id);
+    try {
+      const result = await api<{ url: string }>(`/attachments/${attachment.id}/url`);
+      setUrls((current) => ({ ...current, [attachment.id]: result.url }));
+    } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível abrir este anexo.'); }
+  };
+  const viewer = attachments.find((item) => item.id === viewerId);
+  if (!attachments.length) return null;
+  return <>
+    <div className="attachment-gallery">
+      {attachments.map((item) => {
+        const url = urls[item.id] ?? item.url;
+        const ratio = item.width && item.height ? `${item.width} / ${item.height}` : '16 / 9';
+        if (item.mimeType.startsWith('image/')) return <button key={item.id} type="button" className="attachment-image-button" style={{ aspectRatio: ratio }} aria-label={`Abrir imagem ${item.originalName}`} onClick={() => setViewerId(item.id)}><img src={url} alt={item.originalName} loading="lazy" onError={() => void renew(item)}/></button>;
+        if (item.mimeType.startsWith('video/')) return <video key={item.id} className="attachment-video" style={{ aspectRatio: ratio }} src={url} controls playsInline preload="none" aria-label={item.originalName} onError={() => void renew(item)}/>;
+        const extension = item.originalName.split('.').pop()?.toUpperCase().slice(0, 5) || 'FILE';
+        return <div className="attachment-document" key={item.id}><span className="attachment-document-icon" aria-hidden="true">{extension}</span><span className="attachment-document-meta"><strong title={item.originalName}>{item.originalName}</strong><small>{formatFileSize(item.sizeBytes)}</small></span><button type="button" className="secondary attachment-download-button" onClick={() => void onDownload(item)}>Descarregar</button></div>;
+      })}
+    </div>
+    {viewer && createPortal(<div className="attachment-viewer" role="dialog" aria-modal="true" aria-label={`Imagem ${viewer.originalName}`} onMouseDown={(event) => { if (event.target === event.currentTarget) setViewerId(null); }}><button type="button" className="attachment-viewer-close" aria-label="Fechar imagem" onClick={() => setViewerId(null)}>×</button><img src={urls[viewer.id] ?? viewer.url} alt={viewer.originalName} onError={() => void renew(viewer)}/></div>, document.body)}
+  </>;
 }
 function Brand() {
   return <div className="brand-lockup"><span className="brand-mark">m</span><span>Mavuno</span></div>;
@@ -182,6 +271,14 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const pendingReactionKeysRef = useRef(new Set<string>());
   const composerInputRef = useRef<HTMLInputElement | null>(null);
   const [draft, setDraft] = useState('');
+  const photoInputRef = useRef<HTMLInputElement | null>(null);
+  const documentInputRef = useRef<HTMLInputElement | null>(null);
+  const [attachmentDrafts, setAttachmentDrafts] = useState<PendingAttachment[]>([]);
+  const attachmentDraftsRef = useRef<PendingAttachment[]>([]);
+  attachmentDraftsRef.current = attachmentDrafts;
+  const previousAttachmentChannelRef = useRef<string | null>(channel?.id ?? null);
+  const [attachmentPickerOpen, setAttachmentPickerOpen] = useState(false);
+  const [attachmentBusy, setAttachmentBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
   const [ownProfile, setOwnProfile] = useState<OwnProfileResponse | null>(null);
@@ -206,6 +303,17 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const tuckTimer = useRef<number | undefined>(undefined);
   const hintShownRef = useRef(false);
   useEffect(() => { actionMenuRef.current = actionMenu; }, [actionMenu]);
+  useEffect(() => () => { attachmentDraftsRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl)); }, []);
+  useEffect(() => {
+    const nextChannelId = channel?.id ?? null;
+    if (previousAttachmentChannelRef.current !== nextChannelId) {
+      attachmentDraftsRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+      attachmentDraftsRef.current = [];
+      setAttachmentDrafts([]);
+      setAttachmentPickerOpen(false);
+      previousAttachmentChannelRef.current = nextChannelId;
+    }
+  }, [channel?.id]);
   useEffect(() => {
     const onPopState = () => {
       if (menuHistoryRef.current || actionMenuRef.current) { menuHistoryRef.current = false; setActionMenu(null); return; }
@@ -539,25 +647,131 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     window.requestAnimationFrame(() => { input?.focus(); input?.setSelectionRange(start + emoji.length, start + emoji.length); });
   };
 
-  const sendMessage = async (body: string, clientMessageId: string = crypto.randomUUID(), replyToId: string | null = reply?.id ?? null) => {
+  const openAttachmentPicker = async () => {
     if (!channel || channel.kind !== 'text') return;
-    nearBottom.current = true; setNewMessages(0);
-    const message: Message = {
-      id: `optimistic:${clientMessageId}`, clientMessageId, body, replyToId, replyAuthor: replyToId ? reply?.username ?? null : null, replyBody: replyToId ? reply?.body ?? null : null,
-      createdAt: new Date().toISOString(), authorId: user.id, username: user.username,
-      avatarUrl: user.avatarUrl, delivery: 'sending',
-    };
-    setMessages((current) => mergeMessage(current, message));
     try {
-      const result = await api<{ message: Message }>(`/channels/${channel.id}/messages`, {
-        method: 'POST', body: JSON.stringify({ clientMessageId, body, replyToId }),
+      const result = await api<{ available: boolean }>(`/channels/${channel.id}/attachments/availability`);
+      if (!result.available) { notify('Os anexos ainda não estão disponíveis. Tenta mais tarde.'); return; }
+      setAttachmentPickerOpen(true);
+    } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível abrir os anexos.'); }
+  };
+  const addSelectedFiles = async (selection: FileList | File[] | null) => {
+    if (!selection?.length) return;
+    const available = Math.max(0, 5 - attachmentDrafts.length);
+    if (available === 0) { notify('Podes enviar até 5 anexos por mensagem.'); return; }
+    const files = Array.from(selection);
+    if (files.length > available) notify('Podes enviar até 5 anexos por mensagem.');
+    setAttachmentBusy(true);
+    try {
+      for (const originalFile of files.slice(0, available)) {
+        const mimeType = inferredMimeType(originalFile);
+        const preliminary = validateAttachmentMetadata(originalFile.name, mimeType, 1);
+        if (!preliminary.ok && preliminary.reason === 'type') { notify('Este tipo de ficheiro não é permitido.'); continue; }
+        const prepared = await prepareAttachmentFile(originalFile, mimeType);
+        const valid = validateAttachmentMetadata(prepared.file.name, mimeType, prepared.file.size);
+        if (!valid.ok) {
+          if (valid.reason === 'size' && mimeType.startsWith('video/')) notify('Este ficheiro é demasiado grande. O máximo para vídeos é 25 MB.');
+          else if (valid.reason === 'size') notify(`Este ficheiro é demasiado grande. O máximo permitido é ${Math.ceil((valid.maxBytes ?? 0) / (1024 * 1024))} MB.`);
+          else notify('Este tipo de ficheiro não é permitido.');
+          continue;
+        }
+        const pending: PendingAttachment = {
+          key: crypto.randomUUID(), file: prepared.file, previewUrl: URL.createObjectURL(prepared.file), mimeType: valid.mimeType,
+          kind: valid.kind, width: prepared.width, height: prepared.height, progress: 0, status: 'queued',
+        };
+        setAttachmentDrafts((current) => current.length < 5 ? [...current, pending] : current);
+      }
+    } finally { setAttachmentBusy(false); }
+  };
+  const removeAttachmentDraft = (key: string) => {
+    const item = attachmentDrafts.find((entry) => entry.key === key);
+    if (item) URL.revokeObjectURL(item.previewUrl);
+    setAttachmentDrafts((current) => current.filter((entry) => entry.key !== key));
+  };
+  const updateAttachmentDraft = (key: string, patch: Partial<PendingAttachment>) => {
+    setAttachmentDrafts((current) => current.map((item) => item.key === key ? { ...item, ...patch } : item));
+  };
+  const downloadAttachment = async (attachment: MessageAttachment) => {
+    try {
+      const result = await api<{ url: string }>(`/attachments/${attachment.id}/url`);
+      if (!attachment.mimeType.startsWith('image/') && !attachment.mimeType.startsWith('video/')) { window.location.assign(result.url); return; }
+      const response = await fetch(result.url, { cache: 'no-store', credentials: 'omit' });
+      if (!response.ok) throw new Error('Não foi possível descarregar este anexo. Tenta novamente.');
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = objectUrl; link.download = attachment.originalName; link.rel = 'noopener';
+      document.body.appendChild(link); link.click(); link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
+    } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível descarregar este anexo.'); }
+  };
+  const downloadMessageAttachments = async (message: Message) => {
+    for (const attachment of message.attachments ?? []) await downloadAttachment(attachment);
+  };
+
+  const sendMessage = async (body: string, clientMessageId: string = crypto.randomUUID(), replyToId: string | null = reply?.id ?? null, selectedAttachments: PendingAttachment[] = attachmentDrafts): Promise<boolean> => {
+    if (!channel || channel.kind !== 'text' || attachmentBusy || (!body.trim() && selectedAttachments.length === 0)) return false;
+    const destination = channel;
+    nearBottom.current = true; setNewMessages(0);
+    setAttachmentBusy(true);
+    let currentUploadKey: string | null = null;
+    let optimisticAdded = false;
+    try {
+      const attachmentIds: string[] = [];
+      for (const item of selectedAttachments) {
+        currentUploadKey = item.key;
+        if (item.attachmentId && item.status === 'ready') { attachmentIds.push(item.attachmentId); continue; }
+        let attachmentId = item.attachmentId;
+        let uploadUrl: string | null = null;
+        if (attachmentId) {
+          try {
+            await api(`/attachments/${attachmentId}/confirm`, { method: 'POST', body: JSON.stringify({ width: item.width, height: item.height }) });
+            updateAttachmentDraft(item.key, { status: 'ready', progress: 100 });
+            attachmentIds.push(attachmentId);
+            continue;
+          } catch { /* An unconfirmed upload gets a refreshed PUT URL below. */ }
+          const refreshed = await api<{ uploadUrl: string }>(`/attachments/${attachmentId}/upload-url`, { method: 'POST', body: '{}' });
+          uploadUrl = refreshed.uploadUrl;
+        } else {
+          const started = await api<{ attachmentId: string; uploadUrl: string }>(`/channels/${destination.id}/attachments`, {
+            method: 'POST', body: JSON.stringify({ originalName: item.file.name, mimeType: item.mimeType, sizeBytes: item.file.size, width: item.width, height: item.height }),
+          });
+          attachmentId = started.attachmentId;
+          uploadUrl = started.uploadUrl;
+          updateAttachmentDraft(item.key, { attachmentId, status: 'uploading', progress: 0, error: undefined });
+        }
+        if (!attachmentId || !uploadUrl) throw new Error('Não foi possível preparar este ficheiro. Tenta novamente.');
+        updateAttachmentDraft(item.key, { attachmentId, status: 'uploading', progress: 0, error: undefined });
+        try {
+          await uploadWithProgress(uploadUrl, item.file, item.mimeType, (progress) => updateAttachmentDraft(item.key, { progress }));
+        } catch {
+          const refreshed = await api<{ uploadUrl: string }>(`/attachments/${attachmentId}/upload-url`, { method: 'POST', body: '{}' });
+          await uploadWithProgress(refreshed.uploadUrl, item.file, item.mimeType, (progress) => updateAttachmentDraft(item.key, { progress }));
+        }
+        await api(`/attachments/${attachmentId}/confirm`, { method: 'POST', body: JSON.stringify({ width: item.width, height: item.height }) });
+        updateAttachmentDraft(item.key, { status: 'ready', progress: 100 });
+        attachmentIds.push(attachmentId);
+      }
+      const message: Message = {
+        id: `optimistic:${clientMessageId}`, clientMessageId, body: body.trim(), replyToId, replyAuthor: replyToId ? reply?.username ?? null : null, replyBody: replyToId ? reply?.body ?? null : null,
+        createdAt: new Date().toISOString(), authorId: user.id, username: user.username,
+        avatarUrl: user.avatarUrl, delivery: 'sending',
+      };
+      setMessages((current) => mergeMessage(current, message));
+      optimisticAdded = true;
+      const result = await api<{ message: Message }>(`/channels/${destination.id}/messages`, {
+        method: 'POST', body: JSON.stringify({ clientMessageId, body: body.trim(), replyToId, attachmentIds }),
       });
       setMessages((current) => mergeMessage(current, result.message));
       setReply(null);
+      selectedAttachments.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+      setAttachmentDrafts((current) => current.filter((item) => !selectedAttachments.some((sent) => sent.key === item.key)));
+      return true;
     } catch (cause) {
-      setMessages((current) => current.map((item) => item.clientMessageId === clientMessageId ? { ...item, delivery: 'failed' } : item));
-      notify(cause instanceof Error ? cause.message : 'A mensagem falhou. Toca em “Tentar novamente”.');
-    }
+      if (currentUploadKey) updateAttachmentDraft(currentUploadKey, { status: 'failed', error: cause instanceof Error ? cause.message : 'Tenta novamente.' });
+      if (optimisticAdded) setMessages((current) => current.map((item) => item.clientMessageId === clientMessageId ? { ...item, delivery: 'failed' } : item));
+      notify(cause instanceof Error ? cause.message : 'Não foi possível enviar. Tenta novamente.');
+      return false;
+    } finally { setAttachmentBusy(false); }
   };
   const createCommunity = async (data: { name: string; description: string; category: string; isPrivate: boolean }) => {
     setBusy(true);
@@ -777,6 +991,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
           }}>{loadingMessages ? 'A carregar…' : 'Carregar mensagens anteriores'}</button>}
           {messages.length === 0 && !loadingMessages && <div className="empty-state">Ainda não há mensagens. Começa a conversa.</div>}
           {messages.map((message, index) => <MessageRow key={message.id} message={message} grouped={index > 0 && messages[index - 1]?.authorId === message.authorId} own={message.authorId === user.id} onOpenMenu={(rect) => openMessageMenu(message, rect)} onProfile={() => openMemberProfile(message.authorId)} onReply={() => setReply(message)} onRetry={() => void sendMessage(message.body, message.clientMessageId, message.replyToId)} onQuickReaction={(emoji) => void toggleReaction(message, emoji)}>
+            <AttachmentGallery attachments={message.attachments ?? []} onDownload={downloadAttachment} notify={notify}/>
             {!!message.reactions?.length && <div className="reaction-pills">{message.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(message, reaction.emoji)} onLongPress={() => void showReactionUsers(message.id, reaction.emoji)}/>)}</div>}
             {Array.from(pendingReactionKeys).some((key) => key.startsWith(`${message.id}:`)) && !(message.reactions ?? []).some((reaction) => pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)) && <small className="reaction-pending-label">A enviar…</small>}
           </MessageRow>)}
@@ -784,11 +999,24 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
         </div>
         <div className="composer-wrap">
           {reply && <div className="muted" style={{ maxWidth: 850, margin: '0 auto 6px', fontSize: 12 }}>A responder a {reply.username}: {reply.body.slice(0, 60)} <button className="text-button" onClick={() => setReply(null)}>Cancelar</button></div>}
-          <form className="composer" onSubmit={(event) => { event.preventDefault(); const value = draft.trim(); if (!value) return; void sendMessage(value); setDraft(''); }}>
-            <input ref={composerInputRef} value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={2000} placeholder={`Escreve uma mensagem em #${channel.name}`} aria-label="Escrever mensagem"/>
-            <button type="button" className="secondary composer-emoji-button" aria-label="Inserir emoji" title="Inserir emoji" onClick={() => setEmojiPickerTarget('composer')}>☺</button>
-            <button className="primary send-button" disabled={!draft.trim()} aria-label="Enviar mensagem">Enviar</button>
+          {attachmentDrafts.length > 0 && <div className="attachment-draft-list" aria-live="polite">
+            {attachmentDrafts.map((item) => <div className="attachment-draft-card" key={item.key}>
+              {item.kind === 'image' || item.kind === 'gif' ? <img className="attachment-draft-preview" src={item.previewUrl} alt=""/> : item.kind === 'video' ? <video className="attachment-draft-preview" src={item.previewUrl} muted preload="none"/> : <span className="attachment-draft-file-icon" aria-hidden="true">▤</span>}
+              <div className="attachment-draft-details"><strong title={item.file.name}>{item.file.name}</strong><small>{item.status === 'uploading' ? `A enviar · ${item.progress}%` : item.status === 'failed' ? 'Falhou' : item.status === 'ready' ? 'Pronto para enviar' : 'Pronto'} · {formatFileSize(item.file.size)}</small>
+                {item.status === 'uploading' && <progress max={100} value={item.progress} aria-label={`Envio de ${item.file.name}`}/>}
+                {item.status === 'failed' && <button type="button" className="text-button" disabled={attachmentBusy} onClick={() => void sendMessage(draft.trim(), crypto.randomUUID(), reply?.id ?? null)}>Tentar de novo</button>}
+              </div>
+              <button type="button" className="attachment-remove-button" disabled={attachmentBusy} aria-label={`Remover ${item.file.name}`} title="Remover anexo" onClick={() => removeAttachmentDraft(item.key)}>×</button>
+            </div>)}
+          </div>}
+          <form className="composer" onSubmit={(event) => { event.preventDefault(); const value = draft.trim(); if (!value && attachmentDrafts.length === 0) return; void sendMessage(value).then((sent) => { if (sent) setDraft(''); }); }}>
+            <input ref={composerInputRef} value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={2000} disabled={attachmentBusy} placeholder={`Escreve uma mensagem em #${channel.name}`} aria-label="Escrever mensagem"/>
+            <button type="button" className="secondary composer-attach-button" aria-label="Anexar ficheiro" title="Anexar ficheiro" disabled={attachmentBusy} onClick={() => void openAttachmentPicker()}><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="m21.4 11.1-8.9 8.9a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg></button>
+            <button type="button" className="secondary composer-emoji-button" aria-label="Inserir emoji" title="Inserir emoji" disabled={attachmentBusy} onClick={() => setEmojiPickerTarget('composer')}>☺</button>
+            <button className="primary send-button" disabled={attachmentBusy || (!draft.trim() && attachmentDrafts.length === 0)} aria-label="Enviar mensagem">Enviar</button>
           </form>
+          <input ref={photoInputRef} className="attachment-file-input" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm" aria-label="Escolher foto ou vídeo" onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; setAttachmentPickerOpen(false); void addSelectedFiles(files); }}/>
+          <input ref={documentInputRef} className="attachment-file-input" type="file" multiple accept=".pdf,.txt,.docx,.xlsx,.pptx,.zip,application/pdf,text/plain,application/zip" aria-label="Escolher ficheiro" onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; setAttachmentPickerOpen(false); void addSelectedFiles(files); }}/>
         </div>
       </> : <section className="welcome-panel">
         <span className="brand-mark">m</span>
@@ -807,10 +1035,11 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
         <button className="text-button" onClick={() => { void loadExplore(); setQuickOpen(false); }}>Explorar comunidades</button>
       </div>}
     </div>
-    {pinnedOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setPinnedOpen(false); }}><section className="modal pinned-modal" role="dialog" aria-modal="true" aria-labelledby="pinned-title"><h2 id="pinned-title">Mensagens fixadas</h2><div className="pinned-list">{pinnedMessages.map((item) => <article className="pinned-item" key={item.id}><strong>{item.username}</strong><time className="message-time">{formatTime(item.createdAt)}</time><p>{item.body}</p>{!!item.reactions?.length && <div className="reaction-pills">{item.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${item.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(item, reaction.emoji)} onLongPress={() => void showReactionUsers(item.id, reaction.emoji)}/>)}</div>}</article>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setPinnedOpen(false)}>Fechar</button></div></section></div>}
+    {pinnedOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setPinnedOpen(false); }}><section className="modal pinned-modal" role="dialog" aria-modal="true" aria-labelledby="pinned-title"><h2 id="pinned-title">Mensagens fixadas</h2><div className="pinned-list">{pinnedMessages.map((item) => <article className="pinned-item" key={item.id}><strong>{item.username}</strong><time className="message-time">{formatTime(item.createdAt)}</time><p>{item.body}</p><AttachmentGallery attachments={item.attachments ?? []} onDownload={downloadAttachment} notify={notify}/>{!!item.reactions?.length && <div className="reaction-pills">{item.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${item.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(item, reaction.emoji)} onLongPress={() => void showReactionUsers(item.id, reaction.emoji)}/>)}</div>}</article>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setPinnedOpen(false)}>Fechar</button></div></section></div>}
+    {attachmentPickerOpen && createPortal(<div className="attachment-picker-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAttachmentPickerOpen(false); }}><section className="attachment-picker-sheet" role="dialog" aria-modal="true" aria-labelledby="attachment-picker-title" onMouseDown={(event) => event.stopPropagation()}><div className="attachment-picker-handle"/><h2 id="attachment-picker-title">Adicionar anexo</h2><button type="button" className="attachment-picker-option" onClick={() => photoInputRef.current?.click()}><span aria-hidden="true">▧</span><span><strong>Foto ou vídeo</strong><small>JPEG, PNG, WebP, GIF, MP4 ou WebM</small></span></button><button type="button" className="attachment-picker-option" onClick={() => documentInputRef.current?.click()}><span aria-hidden="true">▤</span><span><strong>Ficheiro</strong><small>PDF, TXT, DOCX, XLSX, PPTX ou ZIP</small></span></button><button type="button" className="secondary attachment-picker-cancel" onClick={() => setAttachmentPickerOpen(false)}>Cancelar</button></section></div>, document.body)}
     {emojiPickerTarget && <EmojiPicker onClose={() => setEmojiPickerTarget(null)} onSelect={(emoji) => { const target = emojiPickerTarget; setEmojiPickerTarget(null); if (target === 'composer') insertComposerEmoji(emoji); else { const message = messages.find((item) => item.id === target.messageId) ?? pinnedMessages.find((item) => item.id === target.messageId); if (message) void toggleReaction(message, emoji); } }}/> }
     {reactionUsers && <ReactionUsersSheet emoji={reactionUsers.emoji} users={reactionUsers.users} loading={reactionUsers.loading} onClose={() => setReactionUsers(null)}/>}
-    {actionMenu && details && <ActionMenuOverlay target={actionMenu} actorId={user.id} actorRole={details.myRole} actorPermissions={details.myPermissions} targetMember={actionMenu.kind === 'member' ? actionMenu.member : details.members.find((member) => member.id === actionMenu.message.authorId) ?? (actionMenu.message.authorId === user.id ? undefined : { id: actionMenu.message.authorId, username: actionMenu.message.username, avatarUrl: actionMenu.message.avatarUrl, role: 'unknown' })} onClose={closeActionMenu} onReply={(message) => setReply(message)} onDelete={deleteMessage} onPin={togglePin} onQuickReaction={(message, emoji) => void toggleReaction(message, emoji)} onMoreReactions={(message) => setEmojiPickerTarget({ messageId: message.id })} onProfile={openMemberProfile} onCall={(member) => setCallTarget(member)} onModerate={(action, member) => setModerationPrompt({ action, member })} onUnmute={(member) => void removeMemberMute(member)} onKick={kickMember} notify={notify}/>}
+    {actionMenu && details && <ActionMenuOverlay target={actionMenu} actorId={user.id} actorRole={details.myRole} actorPermissions={details.myPermissions} targetMember={actionMenu.kind === 'member' ? actionMenu.member : details.members.find((member) => member.id === actionMenu.message.authorId) ?? (actionMenu.message.authorId === user.id ? undefined : { id: actionMenu.message.authorId, username: actionMenu.message.username, avatarUrl: actionMenu.message.avatarUrl, role: 'unknown' })} onClose={closeActionMenu} onReply={(message) => setReply(message)} onDelete={deleteMessage} onDownload={downloadMessageAttachments} onPin={togglePin} onQuickReaction={(message, emoji) => void toggleReaction(message, emoji)} onMoreReactions={(message) => setEmojiPickerTarget({ messageId: message.id })} onProfile={openMemberProfile} onCall={(member) => setCallTarget(member)} onModerate={(action, member) => setModerationPrompt({ action, member })} onUnmute={(member) => void removeMemberMute(member)} onKick={kickMember} notify={notify}/>}
     {moderationPrompt && <ModerationPrompt action={moderationPrompt.action} member={moderationPrompt.member} onClose={() => setModerationPrompt(null)} onConfirm={async (duration, reason) => { await applyModeration(moderationPrompt.action, moderationPrompt.member, duration, reason); setModerationPrompt(null); }}/>
     }
     {modal === 'community' && <CommunityModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createCommunity(data)}/>}
