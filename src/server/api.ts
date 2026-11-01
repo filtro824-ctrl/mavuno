@@ -52,6 +52,11 @@ const profileColumns = {
   showJoinDate: users.showJoinDate,
   showCommonCommunities: users.showCommonCommunities,
   showEmail: users.showEmail,
+  bannerUrl: users.bannerUrl,
+  bannerColor: users.bannerColor,
+  statusText: users.statusText,
+  presencePreference: users.presencePreference,
+  showBanner: users.showBanner,
 };
 
 async function loadOwnProfile(userId: string) {
@@ -73,6 +78,10 @@ async function loadOwnProfile(userId: string) {
       email: profile.email,
       avatarUrl: profile.avatarUrl,
       aboutMe: profile.aboutMe,
+      bannerUrl: profile.bannerUrl,
+      bannerColor: profile.bannerColor,
+      statusText: profile.statusText,
+      presencePreference: profile.presencePreference,
       createdAt: profile.createdAt.toISOString(),
       visibility: profileVisibilityFromRecord(record),
     },
@@ -221,7 +230,7 @@ export function createApi(io: SocketServer): Router {
   }));
   router.patch('/profile', asyncRoute(async (req, res) => {
     const input = profileUpdateSchema.safeParse(req.body);
-    if (!input.success) { res.status(400).json({ error: 'Confirma o nome, a ligação HTTPS da foto e o texto (máximo 160 caracteres).' }); return; }
+    if (!input.success) { res.status(400).json({ error: 'Confirma os links HTTPS, as cores e os textos (máximo 160 caracteres).' }); return; }
     const changes: {
       username?: string;
       avatarUrl?: string | null;
@@ -232,6 +241,11 @@ export function createApi(io: SocketServer): Router {
       showJoinDate?: boolean;
       showCommonCommunities?: boolean;
       showEmail?: boolean;
+      bannerUrl?: string | null;
+      bannerColor?: string | null;
+      statusText?: string;
+      presencePreference?: 'online' | 'away' | 'dnd' | 'invisible';
+      showBanner?: boolean;
     } = {};
     const { visibility, ...profileFields } = input.data;
     Object.assign(changes, profileFields);
@@ -242,6 +256,7 @@ export function createApi(io: SocketServer): Router {
       showJoinDate: visibility.joinDate,
       showCommonCommunities: visibility.commonCommunities,
       showEmail: visibility.email,
+      showBanner: visibility.banner,
     });
     try {
       const userId = currentUser(res).id;
@@ -263,15 +278,16 @@ export function createApi(io: SocketServer): Router {
     if (await activeBan(communityId.data, viewerId)) { res.status(404).json({ error: 'Perfil não encontrado.' }); return; }
     const [viewerMembership] = await db.select({ id: communityMembers.id })
       .from(communityMembers).where(and(eq(communityMembers.communityId, communityId.data), eq(communityMembers.userId, viewerId))).limit(1);
-    const [targetMembership] = await db.select({ id: communityMembers.id })
-      .from(communityMembers).where(and(eq(communityMembers.communityId, communityId.data), eq(communityMembers.userId, userId.data))).limit(1);
+    const [targetMembership] = await db.select({ id: communityMembers.id, role: communityRoles.key })
+      .from(communityMembers).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
+      .where(and(eq(communityMembers.communityId, communityId.data), eq(communityMembers.userId, userId.data))).limit(1);
     if (!viewerMembership || !targetMembership) { res.status(404).json({ error: 'Perfil não encontrado.' }); return; }
     const [target] = await db.select(profileColumns).from(users).where(eq(users.id, userId.data)).limit(1);
     if (!target) { res.status(404).json({ error: 'Perfil não encontrado.' }); return; }
     const commonCommunities = await commonCommunitiesFor(viewerId, userId.data);
     const canViewEmail = await hasPermission(viewerId, communityId.data, 'manage_community');
     const online = (await io.in(`user:${userId.data}`).fetchSockets()).length > 0;
-    res.json({ profile: visibleMemberProfile(target as ProfileRecord, { online, commonCommunities, canViewEmail }) });
+    res.json({ profile: visibleMemberProfile(target as ProfileRecord, { online, commonCommunities, canViewEmail, role: targetMembership.role }) });
   }));
 
   router.get('/communities/mine', asyncRoute(async (_req, res) => {

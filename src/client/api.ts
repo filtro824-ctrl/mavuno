@@ -1,8 +1,9 @@
-export interface ProfileVisibility { avatar: boolean; about: boolean; status: boolean; joinDate: boolean; commonCommunities: boolean; email: boolean }
+export type PresencePreference = 'online' | 'away' | 'dnd' | 'invisible';
+export interface ProfileVisibility { avatar: boolean; about: boolean; status: boolean; joinDate: boolean; commonCommunities: boolean; email: boolean; banner: boolean }
 export interface User { id: string; username: string; email: string; avatarUrl: string | null; aboutMe?: string; createdAt?: string; visibility?: ProfileVisibility }
-export interface OwnProfile extends User { aboutMe: string; createdAt: string; visibility: ProfileVisibility }
+export interface OwnProfile extends User { aboutMe: string; bannerUrl: string | null; bannerColor: string | null; statusText: string; presencePreference: PresencePreference; createdAt: string; visibility: ProfileVisibility }
 export interface OwnProfileResponse { user: OwnProfile; communities: Array<{ id: string; name: string; role: string; joinedAt: string }> }
-export interface MemberProfile { id: string; username: string; avatarUrl?: string | null; aboutMe?: string; online?: boolean; createdAt?: string; commonCommunities?: Array<{ id: string; name: string }>; email?: string }
+export interface MemberProfile { id: string; username: string; avatarUrl?: string | null; aboutMe?: string; online?: boolean; presence?: PresencePreference; statusText?: string; bannerUrl?: string | null; bannerColor?: string | null; createdAt?: string; commonCommunities?: Array<{ id: string; name: string }>; email?: string; role?: string }
 export interface Community { id: string; name: string; slug: string; description: string; category: string; imageUrl?: string | null; rules?: string; isPrivate: boolean; role?: string | null }
 export interface Channel { id: string; name: string; topic: string; kind: 'text' | 'voice' }
 export interface Member { id: string; username: string; avatarUrl?: string | null; role: string; mutedUntil?: string | null; banned?: boolean }

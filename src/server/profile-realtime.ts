@@ -17,6 +17,11 @@ const profileColumns = {
   showJoinDate: users.showJoinDate,
   showCommonCommunities: users.showCommonCommunities,
   showEmail: users.showEmail,
+  bannerUrl: users.bannerUrl,
+  bannerColor: users.bannerColor,
+  statusText: users.statusText,
+  presencePreference: users.presencePreference,
+  showBanner: users.showBanner,
 };
 
 export async function broadcastProfileUpdate(io: SocketServer, userId: string): Promise<void> {
@@ -58,7 +63,7 @@ export async function broadcastProfileUpdate(io: SocketServer, userId: string): 
 }
 
 export async function broadcastProfilePresence(io: SocketServer, userId: string, online: boolean): Promise<void> {
-  const [target] = await db.select({ showStatus: users.showStatus }).from(users).where(eq(users.id, userId)).limit(1);
+  const [target] = await db.select({ showStatus: users.showStatus, presencePreference: users.presencePreference }).from(users).where(eq(users.id, userId)).limit(1);
   if (!target?.showStatus) return;
   const memberships = await db.select({ communityId: communityMembers.communityId })
     .from(communityMembers).where(eq(communityMembers.userId, userId));
@@ -66,5 +71,6 @@ export async function broadcastProfilePresence(io: SocketServer, userId: string,
   if (!communityIds.length) return;
   const recipients = await db.selectDistinct({ userId: communityMembers.userId }).from(communityMembers)
     .where(and(inArray(communityMembers.communityId, communityIds), ne(communityMembers.userId, userId)));
-  for (const recipient of recipients) io.in(`user:${recipient.userId}`).emit('profile:presence', { userId, online });
+  const visibleOnline = target.presencePreference === 'invisible' ? false : online;
+  for (const recipient of recipients) io.in(`user:${recipient.userId}`).emit('profile:presence', { userId, online: visibleOnline, presence: target.presencePreference });
 }

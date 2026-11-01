@@ -22,19 +22,20 @@
 React/Vite, TypeScript, Express, Socket.IO, PostgreSQL com Drizzle, LiveKit para voz, PWA. Ficheiros principais: src/client/App.tsx, api.ts, styles.css, emoji-data.ts; src/server/index.ts, api.ts, security.ts, permissions.ts, profile-utils.ts, profile-realtime.ts, db/schema.ts; public/service-worker.js; drizzle/; tests/. Comandos: pnpm typecheck, pnpm test, pnpm build.
 
 ## 4. Estado atual
-Feito no código: registo, login, sessões, comunidades públicas e privadas, convites básicos, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono. Etapa 5 concluída: barra do utilizador com microfone, auscultadores, definições e menus responsivos; preferências de áudio locais, teste de microfone, integração com voz/chamadas e correção da altura da lista de mensagens.
-Ainda NÃO existe: cartão de perfil expansível, anexos, emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
+Feito no código: registo, login, sessões, comunidades públicas e privadas, convites básicos, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono. Etapa 5 concluída: barra do utilizador com microfone, auscultadores, definições e menus responsivos; preferências de áudio locais, teste de microfone, integração com voz/chamadas e correção da altura da lista de mensagens. Etapa 6 concluída: cartão de perfil compacto e expansível para o próprio e outros membros, banner por link ou cor de fallback, texto e preferência de presença, presença invisível tratada como offline no servidor, privacidade de banner/estado, editor por separadores, pré-visualização, validação HTTPS e testes unitários; aguarda deploy do dono.
+Ainda NÃO existe: anexos, emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
 
 ## 5. SQL já aplicado no Supabase (por ordem)
 1. Migrações 0000 a 0006 coladas juntas, sem as linhas "--> statement-breakpoint" (18 tabelas, incluindo message_reactions).
 2. ALTER TABLE ... ENABLE ROW LEVEL SECURITY nas 18 tabelas.
 3. Migração 0007: 7 colunas na tabela users (about_me, show_avatar, show_about, show_status, show_join_date, show_common_communities, show_email).
 4. Migração 0008, aplicada pelo dono: coluna nullable community_bans.expires_at (timestamp with time zone).
+5. Migração 0009, aplicada pelo dono: banner_url, banner_color, status_text, presence_preference e show_banner na tabela users.
 
 ## 6. Fila de etapas (o dono envia o pedido de cada uma, por esta ordem)
 4 Menu das mensagens ao premir (sem os três pontos), silenciar e banir por tempo. SQL (1 coluna: community_bans.expires_at).
 5 Barra do utilizador (microfone, auscultadores, engrenagem, Definições) e correção da lista de mensagens no modo PC. Sem SQL — concluída nesta etapa.
-6 Cartão de perfil expansível, imagem de fundo por link, estado e texto de estado. SQL — próxima etapa.
+6 Cartão de perfil expansível, imagem de fundo por link, estado e texto de estado. SQL — concluída nesta etapa.
 7 Anexos (imagens, GIFs, vídeos, documentos) com armazenamento S3 compatível. SQL. Exige bucket privado criado pelo dono.
 8 Emojis personalizados e stickers. SQL.
 9 Foto de perfil e imagem de fundo enviadas do telemóvel.
@@ -47,7 +48,7 @@ Ainda NÃO existe: cartão de perfil expansível, anexos, emojis personalizados 
 16 Voz real testada com dois telemóveis (configuração do dono com LiveKit).
 17 AutoMod. SQL.
 18 Notificações com o Mavuno fechado. SQL.
-Prioridade: 4, 5, 6, 7 e 10; depois 8, 9, 11 e 13. Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
+Prioridade: 4, 5, 6, 7 e 10; depois 8, 9, 11 e 13. Próxima etapa: 7. Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
 
 ## 7. Limitações conhecidas
 Voz sem LiveKit configurado e sem teste com dois aparelhos; sem upload de ficheiros; sem recuperação de conta por email; sem planos nem pagamentos; sem notificações push.

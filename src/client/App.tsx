@@ -1,4 +1,4 @@
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
@@ -29,6 +29,11 @@ function banExpiryLabel(expiresAt: string | null): string {
 
 function initials(value: string): string {
   return value.trim().slice(0, 1).toUpperCase() || '?';
+}
+function fallbackBannerColor(name: string): string {
+  let hash = 0;
+  for (const character of name.trim().toLowerCase()) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  return `hsl(${hash % 360} 28% 28%)`;
 }
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat('pt-MZ', { hour: '2-digit', minute: '2-digit' }).format(new Date(value));
@@ -666,7 +671,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       notify('Silenciamento removido.');
     } catch { notify('Não foi possível remover o silêncio. Tenta de novo.'); }
   };
-  const updateProfile = async (data: { username: string; avatarUrl: string | null; aboutMe: string; visibility: ProfileVisibility }) => {
+  const updateProfile = async (data: { username: string; avatarUrl: string | null; aboutMe: string; bannerUrl: string | null; bannerColor: string | null; statusText: string; presencePreference: 'online' | 'away' | 'dnd' | 'invisible'; visibility: ProfileVisibility }) => {
     setProfileBusy(true);
     try {
       const result = await api<OwnProfileResponse>('/profile', { method: 'PATCH', body: JSON.stringify(data) });
@@ -714,8 +719,8 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
         </div>)}
         <div className="section-label">Membros · {details.members.length}</div>
         {details.members.map((member) => <div className="member-row member-action-row" key={member.id} title={roleLabels[member.role] ?? member.role} tabIndex={0} aria-label={`Ações de ${member.username}`} onClick={(event) => { if ((event.target as HTMLElement).closest('select')) return; openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect(), navigator.maxTouchPoints > 0)); }} onContextMenu={(event) => { event.preventDefault(); openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect())); }} onKeyDown={(event) => { if ((event.target === event.currentTarget) && (event.key === 'Enter' || event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) { event.preventDefault(); openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect())); } }}>
-          <span className="profile-avatar-button"><Avatar name={member.username} url={member.avatarUrl} size={27}/></span>
-          <span className="member-name profile-name-link">{member.username}</span>
+          <button className="profile-avatar-button" aria-label={`Abrir o perfil de ${member.username}`} onClick={(event) => { event.stopPropagation(); openMemberProfile(member.id); }}><Avatar name={member.username} url={member.avatarUrl} size={27}/></button>
+          <button className="member-name profile-name-link" onClick={(event) => { event.stopPropagation(); openMemberProfile(member.id); }}>{member.username}</button>
           {isManager && member.role !== 'owner' ? <select className="role-select" aria-label={`Cargo de ${member.username}`} value={member.role} onClick={(event) => event.stopPropagation()} onChange={(event) => void changeRole(member, event.target.value)}>
             <option value="admin">Admin</option><option value="moderator">Moderador</option><option value="member">Membro</option>
           </select> : <small className="member-role">{roleLabels[member.role] ?? member.role}</small>}
@@ -998,95 +1003,74 @@ function profileDate(value: string): string {
 const profileVisibilityOptions: Array<{ key: keyof ProfileVisibility; title: string; help: string }> = [
   { key: 'avatar', title: 'Foto de perfil', help: 'Outros membros veem a tua foto.' },
   { key: 'about', title: 'Sobre mim', help: 'Outros membros veem o texto que escreveste.' },
-  { key: 'status', title: 'Estado «Ligado»', help: 'Outros membros veem se estás ligado.' },
+  { key: 'status', title: 'Estado', help: 'Outros membros veem o teu estado.' },
   { key: 'joinDate', title: 'Data de entrada no Mavuno', help: 'Outros membros veem quando criaste a conta.' },
   { key: 'commonCommunities', title: 'Comunidades em comum', help: 'Cada pessoa vê apenas as comunidades onde ambos participam.' },
   { key: 'email', title: 'Email', help: 'Só proprietários e administradores podem ver, se ativares.' },
+  { key: 'banner', title: 'Imagem de fundo', help: 'Outros membros veem a imagem ou cor escolhida.' },
 ];
-
-function ProfileModal({ data, loading, error, online, busy, onClose, onReload, onSave }: {
-  data: OwnProfileResponse | null;
-  loading: boolean;
-  error: string;
-  online: boolean;
-  busy: boolean;
-  onClose: () => void;
-  onReload: () => void;
-  onSave: (data: { username: string; avatarUrl: string | null; aboutMe: string; visibility: ProfileVisibility }) => void;
-}) {
-  const [username, setUsername] = useState('');
-  const [avatarUrl, setAvatarUrl] = useState('');
-  const [aboutMe, setAboutMe] = useState('');
-  const [visibility, setVisibility] = useState<ProfileVisibility>({ avatar: true, about: true, status: true, joinDate: true, commonCommunities: true, email: false });
-  const [preview, setPreview] = useState(false);
-  useEffect(() => {
-    if (!data) return;
-    setUsername(data.user.username);
-    setAvatarUrl(data.user.avatarUrl ?? '');
-    setAboutMe(data.user.aboutMe);
-    setVisibility(data.user.visibility);
-  }, [data]);
-  const safeAvatarUrl = (() => { try { const value = avatarUrl.trim(); return new URL(value).protocol === 'https:' ? value : null; } catch { return null; } })();
-  const save = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    onSave({ username: username.trim(), avatarUrl: avatarUrl.trim() || null, aboutMe: aboutMe.trim(), visibility });
-  };
-
-  return <div className="modal-backdrop own-profile-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className="modal own-profile-modal" role="dialog" aria-modal="true" aria-labelledby="profile-title">
-      <header className="profile-page-header"><button className="icon-button profile-back" onClick={onClose} aria-label="Voltar">←</button><div><h2 id="profile-title">O teu perfil</h2><p className="muted">Vê e escolhe o que partilhas.</p></div></header>
-      {loading && <p className="muted" role="status">A carregar o teu perfil…</p>}
-      {error && <div className="error-banner" role="alert">{error}<button className="text-button" onClick={onReload}>Tentar novamente</button></div>}
-      {!loading && data && <form onSubmit={save}>
-        <section className="profile-hero">
-          <Avatar name={username || data.user.username} url={safeAvatarUrl} size={72}/>
-          <div><strong className="profile-hero-name">{username || data.user.username}</strong><span className="profile-online"><span className={`online-dot ${online ? '' : 'offline'}`}/>{online ? 'Ligado' : 'A reconectar…'}</span></div>
-        </section>
-        <section className="profile-section"><h3>Editar perfil</h3>
-          <label className="field">Nome de utilizador<input value={username} onChange={(event) => setUsername(event.target.value)} minLength={3} maxLength={32} pattern="[\p{L}\p{N}_-]+" required/><small>O nome de utilizador é sempre público.</small></label>
-          <label className="field">Foto de perfil (link da imagem)<input value={avatarUrl} onChange={(event) => setAvatarUrl(event.target.value)} type="url" maxLength={500} placeholder="https://…"/><small>Usa uma ligação HTTPS. Se deixares vazio, aparece a inicial do teu nome.</small></label>
-          <label className="field">Sobre mim<textarea value={aboutMe} onChange={(event) => setAboutMe(event.target.value.slice(0, 160))} maxLength={160} rows={3} placeholder="Escreve algo curto sobre ti."/><small className="profile-counter">{aboutMe.length}/160</small></label>
-        </section>
-        <section className="profile-section"><h3>Informações da conta</h3>
-          <div className="profile-account-info"><div><strong>Email</strong><span>{data.user.email}</span></div><div><strong>Data de entrada no Mavuno</strong><span>{profileDate(data.user.createdAt)}</span></div><div><strong>Comunidades em que participas</strong>{data.communities.length ? <ul>{data.communities.map((community) => <li key={community.id}>{community.name}</li>)}</ul> : <span>Ainda não participas em comunidades.</span>}</div></div>
-        </section>
-        <section className="profile-section"><h3>O que os outros podem ver</h3>
-          <div className="privacy-list">{profileVisibilityOptions.map((option) => <label className="privacy-row" key={option.key}>
-            <span><strong>{option.title}</strong><small>{option.help}</small></span>
-            <input type="checkbox" checked={visibility[option.key]} onChange={(event) => setVisibility((current) => ({ ...current, [option.key]: event.target.checked }))} aria-label={`${option.title}: ${option.help}`}/>
-          </label>)}</div>
-        </section>
-        <section className="profile-preview-section"><button type="button" className="secondary" onClick={() => setPreview((value) => !value)}>{preview ? 'Fechar pré-visualização' : 'Ver como os outros me veem'}</button>
-          {preview && <div className="profile-preview"><div className="profile-preview-heading"><Avatar name={username || data.user.username} url={visibility.avatar ? safeAvatarUrl : null} size={48}/><div><strong>{username || data.user.username}</strong>{visibility.status && <span>{online ? 'Ligado' : 'A reconectar…'}</span>}</div></div>
-            {visibility.about && aboutMe.trim() && <p>{aboutMe.trim()}</p>}
-            {visibility.joinDate && <p><strong>Data de entrada:</strong> {profileDate(data.user.createdAt)}</p>}
-            {visibility.commonCommunities && <p className="muted">As comunidades em comum aparecem apenas a quem também participa nelas.</p>}
-            {visibility.email && <p className="muted">O email só é mostrado a proprietários e administradores.</p>}
-            {!visibility.about && !visibility.status && !visibility.joinDate && !visibility.commonCommunities && <p className="muted">Só o teu nome de utilizador será mostrado.</p>}
-          </div>}
-        </section>
-        <div className="modal-actions profile-actions"><button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar'}</button></div>
-      </form>}
+const profileColors = ['#203b2d', '#3a5f4b', '#355070', '#4d3b5f', '#6b3f46', '#674d2d', '#5b5f32', '#2f5558', '#503f32', '#423b59', '#5a394f', '#263d52'];
+const presenceLabels = { online: 'Disponível', away: 'Ausente', dnd: 'Não incomodar', invisible: 'Invisível' } as const;
+function safeHttps(value: string | null | undefined): string | null {
+  if (!value?.trim()) return null;
+  try { return new URL(value.trim()).protocol === 'https:' ? value.trim() : null; } catch { return null; }
+}
+function presenceColor(presence?: string, online?: boolean): string {
+  if (presence === 'away') return '#e8bd63';
+  if (presence === 'dnd') return '#f07878';
+  if (presence === 'invisible' || online === false) return '#87978c';
+  return '#82e3a6';
+}
+function ProfileBanner({ name, url, color, children }: { name: string; url?: string | null; color?: string | null; children: ReactNode }) {
+  const [failed, setFailed] = useState(false);
+  const background = !failed && url ? `url("${url}") center/cover` : (color || fallbackBannerColor(name));
+  return <div className="profile-banner" style={{ background }}>{url && !failed && <img className="profile-banner-image" src={url} alt="" referrerPolicy="no-referrer" onError={() => setFailed(true)} /> }<div className="profile-banner-shade"/>{children}</div>;
+}
+function ProfileCompactCard({ profile, own, onExpand, onClose, onEdit, onStatus }: { profile: MemberProfile; own: boolean; onExpand: () => void; onClose: () => void; onEdit?: () => void; onStatus?: () => void }) {
+  const presence = profile.presence ?? (profile.online ? 'online' : 'invisible');
+  return <div className="modal-backdrop profile-card-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="profile-card" role="dialog" aria-modal="true" aria-labelledby="profile-card-title">
+      <ProfileBanner name={profile.username} url={profile.bannerUrl} color={profile.bannerColor}><button className="profile-close icon-button" onClick={onClose} aria-label="Fechar perfil">×</button></ProfileBanner>
+      <div className="profile-card-body"><div className="profile-card-head"><span className="profile-large-avatar"><Avatar name={profile.username} url={profile.avatarUrl} size={80}/><span className="profile-status-ring" style={{ backgroundColor: presenceColor(presence, profile.online) }}/></span><div className="profile-card-title"><h2 id="profile-card-title">{profile.username}</h2><span className="profile-presence"><span className="online-dot" style={{ backgroundColor: presenceColor(presence, profile.online) }}/>{presenceLabels[presence as keyof typeof presenceLabels] ?? 'Desligado'}</span></div></div>
+        {profile.statusText ? <p className="profile-status-bubble">{profile.statusText}</p> : own ? <button className="profile-status-bubble profile-status-empty" onClick={onStatus}>＋ Define um estado</button> : null}
+        {profile.aboutMe && <p className="profile-about-clamp">{profile.aboutMe}</p>}
+        <div className="profile-card-actions"><button className="secondary" onClick={onExpand}>Expandir perfil</button>{own && <><button className="secondary" onClick={onEdit}>Editar perfil</button><button className="secondary" onClick={onStatus}>Estado</button></>}</div>
+      </div>
     </section>
   </div>;
 }
 
+function ProfileModal({ data, loading, error, online, busy, onClose, onReload, onSave }: {
+  data: OwnProfileResponse | null; loading: boolean; error: string; online: boolean; busy: boolean; onClose: () => void; onReload: () => void;
+  onSave: (data: { username: string; avatarUrl: string | null; aboutMe: string; bannerUrl: string | null; bannerColor: string | null; statusText: string; presencePreference: 'online' | 'away' | 'dnd' | 'invisible'; visibility: ProfileVisibility }) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [tab, setTab] = useState<'profile' | 'appearance' | 'privacy' | 'account'>('profile');
+  const [username, setUsername] = useState(''); const [avatarUrl, setAvatarUrl] = useState(''); const [aboutMe, setAboutMe] = useState('');
+  const [bannerUrl, setBannerUrl] = useState(''); const [bannerColor, setBannerColor] = useState<string | null>(null); const [statusText, setStatusText] = useState('');
+  const [presencePreference, setPresencePreference] = useState<'online' | 'away' | 'dnd' | 'invisible'>('online');
+  const [visibility, setVisibility] = useState<ProfileVisibility>({ avatar: true, about: true, status: true, joinDate: true, commonCommunities: true, email: false, banner: true });
+  const [savedSnapshot, setSavedSnapshot] = useState('');
+  useEffect(() => { if (!data) return; setUsername(data.user.username); setAvatarUrl(data.user.avatarUrl ?? ''); setAboutMe(data.user.aboutMe); setBannerUrl(data.user.bannerUrl ?? ''); setBannerColor(data.user.bannerColor); setStatusText(data.user.statusText); setPresencePreference(data.user.presencePreference); setVisibility(data.user.visibility); setSavedSnapshot(JSON.stringify(data.user)); }, [data]);
+  useEffect(() => { const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); }; document.addEventListener('keydown', closeOnEscape); return () => document.removeEventListener('keydown', closeOnEscape); }, [onClose]);
+  const draft = { username: username.trim(), avatarUrl: safeHttps(avatarUrl), aboutMe: aboutMe.trim(), bannerUrl: safeHttps(bannerUrl), bannerColor, statusText: statusText.trim(), presencePreference, visibility };
+  const dirty = Boolean(data && JSON.stringify({ ...data.user, ...draft }) !== savedSnapshot);
+  const requestClose = () => { if (!dirty || window.confirm('Sair sem guardar?')) onClose(); };
+  const save = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); onSave({ ...draft }); };
+  const preview: MemberProfile = { id: data?.user.id ?? '', username: username || data?.user.username || 'Perfil', avatarUrl: visibility.avatar ? safeHttps(avatarUrl) : null, aboutMe: visibility.about ? aboutMe.trim() : undefined, bannerUrl: visibility.banner ? safeHttps(bannerUrl) : undefined, bannerColor: visibility.banner ? bannerColor : undefined, statusText: visibility.status ? statusText.trim() : undefined, online, presence: presencePreference };
+  if (loading) return <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true"><p className="muted" role="status">A carregar o teu perfil…</p></section></div>;
+  if (error || !data) return <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true"><p className="error-banner" role="alert">{error || 'Perfil não encontrado.'}</p><button className="secondary" onClick={onReload}>Tentar novamente</button></section></div>;
+  if (!expanded) return <ProfileCompactCard profile={preview} own onExpand={() => setExpanded(true)} onClose={requestClose} onEdit={() => { setExpanded(true); setTab('profile'); }} onStatus={() => { setExpanded(true); setTab('profile'); }}/>
+  return createPortal(<div className="modal-backdrop expanded-profile-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) requestClose(); }}><section className="expanded-profile-panel" role="dialog" aria-modal="true" aria-labelledby="expanded-profile-title"><header className="profile-page-header"><button className="icon-button" onClick={requestClose} aria-label="Voltar">←</button><div><h2 id="expanded-profile-title">O teu perfil</h2><p className="muted">Vê e escolhe o que partilhas.</p></div></header><div className="expanded-profile-grid"><form onSubmit={save} className="profile-editor"><nav className="profile-tabs" aria-label="Secções do perfil">{(['profile', 'appearance', 'privacy', 'account'] as const).map((item) => <button type="button" key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item === 'profile' ? 'Perfil' : item === 'appearance' ? 'Aparência' : item === 'privacy' ? 'Privacidade' : 'Conta'}</button>)}</nav>{tab === 'profile' && <section className="profile-section"><h3>Perfil</h3><label className="field">Nome de utilizador<input value={username} onChange={(event) => setUsername(event.target.value)} minLength={3} maxLength={32} required/><small>O nome de utilizador é sempre público.</small></label><label className="field">Sobre mim<textarea value={aboutMe} onChange={(event) => setAboutMe(event.target.value.slice(0, 160))} maxLength={160} rows={4}/><small className="profile-counter">{aboutMe.length}/160</small></label><label className="field">Texto de estado<input value={statusText} onChange={(event) => setStatusText(event.target.value.slice(0, 80))} maxLength={80}/><small className="profile-counter">{statusText.length}/80</small></label><label className="field">Estado<select value={presencePreference} onChange={(event) => setPresencePreference(event.target.value as typeof presencePreference)}>{Object.entries(presenceLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>O estado Invisível aparece como desligado para os outros.</small></label></section>}{tab === 'appearance' && <section className="profile-section"><h3>Aparência</h3><label className="field">Foto de perfil (link)<input value={avatarUrl} onChange={(event) => setAvatarUrl(event.target.value)} placeholder="https://…"/><small>Cola o link de uma imagem.</small></label><label className="field">Imagem de fundo (link)<input value={bannerUrl} onChange={(event) => setBannerUrl(event.target.value)} placeholder="https://…"/><small>Cola o link de uma imagem. Para o fundo, uma imagem larga fica melhor.</small></label><div className="field"><span>Cor de fundo</span><div className="profile-color-grid"><button type="button" className={!bannerColor ? 'selected' : ''} onClick={() => setBannerColor(null)}>Nenhuma</button>{profileColors.map((color) => <button type="button" key={color} aria-label={color} className={bannerColor === color ? 'selected' : ''} style={{ backgroundColor: color }} onClick={() => setBannerColor(color)}/>)}</div></div></section>}{tab === 'privacy' && <section className="profile-section"><h3>Privacidade</h3><div className="privacy-list">{profileVisibilityOptions.map((option) => <label className="privacy-row" key={option.key}><span><strong>{option.title}</strong><small>{option.help}</small></span><input type="checkbox" checked={visibility[option.key]} onChange={(event) => setVisibility((current) => ({ ...current, [option.key]: event.target.checked }))}/></label>)}</div><button type="button" className="secondary privacy-preview-button" onClick={() => setTab('profile')}>Ver como os outros me veem</button></section>}{tab === 'account' && <section className="profile-section"><h3>Conta</h3><div className="profile-account-info"><div><strong>Email</strong><span>{data.user.email}</span></div><div><strong>Data de entrada</strong><span>{profileDate(data.user.createdAt)}</span></div><div><strong>Comunidades</strong><span>{data.communities.length ? data.communities.map((community) => community.name).join(', ') : 'Ainda não participas em comunidades.'}</span></div></div><button type="button" className="danger-button" onClick={() => { if (window.confirm('Queres terminar sessão?')) onClose(); }}>Terminar sessão</button></section>}<div className="profile-actions"><button type="button" className="secondary" onClick={requestClose}>Descartar alterações</button><button className="primary" disabled={!dirty || busy}>{busy ? 'A guardar…' : 'Guardar'}</button></div></form><aside className="profile-live-preview"><h3>Pré-visualização</h3><ProfileCompactCard profile={preview} own={false} onExpand={() => undefined} onClose={() => undefined}/></aside></div></section></div>, document.body);
+}
+
 function MemberProfileSheet({ profile, loading, error, onClose }: { profile: MemberProfile | null; loading: boolean; error: string; onClose: () => void }) {
-  const visibleItems = Boolean(profile && (profile.aboutMe || Object.hasOwn(profile, 'online') || profile.createdAt || profile.commonCommunities?.length || profile.email));
-  return <div className="modal-backdrop member-profile-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className="modal member-profile-sheet" role="dialog" aria-modal="true" aria-labelledby="member-profile-title">
-      <header className="member-profile-heading"><Avatar name={profile?.username ?? '?'} url={profile?.avatarUrl} size={62}/><div><h2 id="member-profile-title">{profile?.username ?? (loading ? 'Perfil' : 'Perfil do membro')}</h2>{profile && Object.hasOwn(profile, 'online') && <span className="profile-online"><span className={`online-dot ${profile.online ? '' : 'offline'}`}/>{profile.online ? 'Ligado' : 'Desligado'}</span>}</div><button className="icon-button" onClick={onClose} aria-label="Fechar perfil">×</button></header>
-      {loading && <p className="muted" role="status">A carregar o perfil…</p>}
-      {error && <p className="error-banner" role="alert">{error}</p>}
-      {profile && <div className="member-profile-content">
-        {profile.aboutMe && <section className="member-profile-item"><h3>Sobre mim</h3><p>{profile.aboutMe}</p></section>}
-        {profile.createdAt && <section className="member-profile-item"><h3>Data de entrada no Mavuno</h3><p>{profileDate(profile.createdAt)}</p></section>}
-        {!!profile.commonCommunities?.length && <section className="member-profile-item"><h3>Comunidades em comum</h3><ul>{profile.commonCommunities.map((community) => <li key={community.id}>{community.name}</li>)}</ul></section>}
-        {profile.email && <section className="member-profile-item"><h3>Email</h3><p>{profile.email}</p></section>}
-        {!loading && !visibleItems && <p className="muted">Este membro ainda não partilhou mais informações.</p>}
-      </div>}
-    </section>
-  </div>;
+  const [expanded, setExpanded] = useState(false);
+  useEffect(() => { const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); }; document.addEventListener('keydown', closeOnEscape); return () => document.removeEventListener('keydown', closeOnEscape); }, [onClose]);
+  if (loading || error || !profile) return <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true">{loading && <p className="muted" role="status">A carregar o perfil…</p>}{error && <p className="error-banner" role="alert">{error}</p>}{error && <button className="secondary" onClick={onClose}>Fechar</button>}</section></div>;
+  const presence = profile.presence ?? (profile.online ? 'online' : 'invisible');
+  if (!expanded) return <ProfileCompactCard profile={profile} own={false} onExpand={() => setExpanded(true)} onClose={onClose}/>;
+  return <div className="modal-backdrop profile-card-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="expanded-member-panel" role="dialog" aria-modal="true" aria-labelledby="member-profile-title"><ProfileBanner name={profile.username} url={profile.bannerUrl} color={profile.bannerColor}><button className="profile-close icon-button" onClick={onClose} aria-label="Fechar perfil">×</button></ProfileBanner><div className="expanded-member-content"><header className="profile-card-head"><span className="profile-large-avatar"><Avatar name={profile.username} url={profile.avatarUrl} size={80}/><span className="profile-status-ring" style={{ backgroundColor: presenceColor(presence, profile.online) }}/></span><div className="profile-card-title"><h2 id="member-profile-title">{profile.username}</h2><span className="profile-presence">{presenceLabels[presence as keyof typeof presenceLabels] ?? 'Desligado'}{profile.role ? ` · ${roleLabels[profile.role] ?? profile.role}` : ''}</span></div></header>{profile.statusText && <p className="profile-status-bubble">{profile.statusText}</p>}{profile.aboutMe && <section className="member-profile-item"><h3>Sobre mim</h3><p>{profile.aboutMe}</p></section>}{profile.createdAt && <section className="member-profile-item"><h3>Data de entrada no Mavuno</h3><p>{profileDate(profile.createdAt)}</p></section>}{!!profile.commonCommunities?.length && <section className="member-profile-item"><h3>Comunidades em comum</h3><ul>{profile.commonCommunities.map((community) => <li key={community.id}>{community.name}</li>)}</ul></section>}{profile.email && <section className="member-profile-item"><h3>Email</h3><p>{profile.email}</p></section>}</div></section></div>;
 }
 
 function AccountModal({ user, onClose, onEditProfile }: { user: User; onClose: () => void; onEditProfile: () => void }) {

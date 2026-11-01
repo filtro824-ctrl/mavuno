@@ -21,6 +21,11 @@ export const users = pgTable('users', {
   showJoinDate: boolean('show_join_date').notNull().default(true),
   showCommonCommunities: boolean('show_common_communities').notNull().default(true),
   showEmail: boolean('show_email').notNull().default(false),
+  bannerUrl: text('banner_url'),
+  bannerColor: varchar('banner_color', { length: 7 }),
+  statusText: varchar('status_text', { length: 80 }).notNull().default(''),
+  presencePreference: varchar('presence_preference', { length: 12 }).notNull().default('online'),
+  showBanner: boolean('show_banner').notNull().default(true),
 });
 
 export const sessions = pgTable('sessions', {
