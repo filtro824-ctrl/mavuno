@@ -22,14 +22,14 @@
 React/Vite, TypeScript, Express, Socket.IO, PostgreSQL com Drizzle, LiveKit para voz, PWA. Ficheiros principais: src/client/App.tsx, api.ts, styles.css, emoji-data.ts; src/server/index.ts, api.ts, security.ts, permissions.ts, profile-utils.ts, profile-realtime.ts, db/schema.ts; public/service-worker.js; drizzle/; tests/. Comandos: pnpm typecheck, pnpm test, pnpm build.
 
 ## 4. Estado atual
-Feito e no ar: registo, login, sessões, comunidades públicas e privadas, convites básicos, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir (sem tempo), auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd).
-Ainda NÃO existe: menu de ações estilo Discord com silenciar e banir por tempo (etapa 4), barra do utilizador com microfone e auscultadores, cartão de perfil expansível, anexos, emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
+Feito no código: registo, login, sessões, comunidades públicas e privadas, convites básicos, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono.
+Ainda NÃO existe: barra do utilizador com microfone e auscultadores, cartão de perfil expansível, anexos, emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
 
 ## 5. SQL já aplicado no Supabase (por ordem)
 1. Migrações 0000 a 0006 coladas juntas, sem as linhas "--> statement-breakpoint" (18 tabelas, incluindo message_reactions).
 2. ALTER TABLE ... ENABLE ROW LEVEL SECURITY nas 18 tabelas.
 3. Migração 0007: 7 colunas na tabela users (about_me, show_avatar, show_about, show_status, show_join_date, show_common_communities, show_email).
-(A etapa 4 ainda NÃO tem SQL aplicado. A migração seguinte será a 0008.)
+4. Migração 0008, aplicada pelo dono: coluna nullable community_bans.expires_at (timestamp with time zone).
 
 ## 6. Fila de etapas (o dono envia o pedido de cada uma, por esta ordem)
 4 Menu das mensagens ao premir (sem os três pontos), silenciar e banir por tempo. SQL (1 coluna: community_bans.expires_at).

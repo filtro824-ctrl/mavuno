@@ -111,6 +111,7 @@ export const communityBans = pgTable('community_bans', {
   actorId: uuid('actor_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
   reason: varchar('reason', { length: 500 }).notNull().default(''),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
   revokedAt: timestamp('revoked_at', { withTimezone: true }),
 }, (t) => [index('community_bans_lookup_idx').on(t.communityId, t.userId, t.revokedAt)]);
 

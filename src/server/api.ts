@@ -14,6 +14,7 @@ import { hasPermission, isMember, roleFor, roleIdFor, type Permission } from './
 import { groupReactionAggregates, isUnicodeEmoji } from './reaction-utils.js';
 import { profileUpdateSchema, profileVisibilityFromRecord, visibleMemberIdentity, visibleMemberProfile, type CommonCommunity, type ProfileRecord } from './profile-utils.js';
 import { broadcastProfileUpdate } from './profile-realtime.js';
+import { canActOnHierarchy, durationInRange, durationSeconds } from './moderation-utils.js';
 import type { Server as SocketServer } from 'socket.io';
 
 const replyMessages = alias(messages, 'reply_messages');
@@ -120,8 +121,9 @@ async function broadcastCommunityMembers(io: SocketServer, communityId: string, 
   for (const recipient of recipients) io.in(`user:${recipient.userId}`).emit(event, payload);
 }
 async function activeBan(communityId: string, userId: string): Promise<boolean> {
+  const now = new Date();
   const [ban] = await db.select({ id: communityBans.id }).from(communityBans)
-    .where(and(eq(communityBans.communityId, communityId), eq(communityBans.userId, userId), isNull(communityBans.revokedAt))).limit(1);
+    .where(and(eq(communityBans.communityId, communityId), eq(communityBans.userId, userId), isNull(communityBans.revokedAt), or(isNull(communityBans.expiresAt), gt(communityBans.expiresAt, now)))).limit(1);
   return Boolean(ban);
 }
 
@@ -151,7 +153,7 @@ async function audit(communityId: string, actorId: string, action: string, targe
 async function canActOnTarget(actorId: string, communityId: string, targetUserId: string): Promise<boolean> {
   const actor = await roleFor(actorId, communityId);
   const target = await roleFor(targetUserId, communityId);
-  return Boolean(actor && target && target.role !== 'owner' && actor.hierarchy > target.hierarchy);
+  return canActOnHierarchy(actor?.hierarchy ?? null, target?.hierarchy ?? null, target?.role ?? null);
 }
 
 export function createApi(io: SocketServer): Router {
@@ -258,6 +260,7 @@ export function createApi(io: SocketServer): Router {
     const communityId = uuid.safeParse(req.query.communityId);
     if (!userId.success || !communityId.success || userId.data === currentUser(res).id) { res.status(404).json({ error: 'Perfil não encontrado.' }); return; }
     const viewerId = currentUser(res).id;
+    if (await activeBan(communityId.data, viewerId)) { res.status(404).json({ error: 'Perfil não encontrado.' }); return; }
     const [viewerMembership] = await db.select({ id: communityMembers.id })
       .from(communityMembers).where(and(eq(communityMembers.communityId, communityId.data), eq(communityMembers.userId, viewerId))).limit(1);
     const [targetMembership] = await db.select({ id: communityMembers.id })
@@ -316,15 +319,19 @@ export function createApi(io: SocketServer): Router {
     const [community] = await db.select({ id: communities.id, name: communities.name, slug: communities.slug, description: communities.description, category: communities.category, imageUrl: communities.imageUrl, rules: communities.rules, isPrivate: communities.isPrivate, ownerId: communities.ownerId })
       .from(communities).where(eq(communities.id, req.params.communityId)).limit(1);
     if (!community || (community.isPrivate && !(await isMember(currentUser(res).id, community.id)))) { res.status(404).json({ error: 'Comunidade não encontrada.' }); return; }
+    if (await activeBan(community.id, currentUser(res).id)) { res.status(403).json({ error: 'O teu acesso a esta comunidade está banido.' }); return; }
     const mine = await db.select({ role: communityRoles.key }).from(communityMembers).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
       .where(and(eq(communityMembers.userId, currentUser(res).id), eq(communityMembers.communityId, community.id))).limit(1);
+    const permissionRows = await db.select({ permission: rolePermissions.permission }).from(communityMembers)
+      .innerJoin(rolePermissions, eq(communityMembers.roleId, rolePermissions.roleId))
+      .where(and(eq(communityMembers.userId, currentUser(res).id), eq(communityMembers.communityId, community.id)));
     const memberRows = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar, role: communityRoles.key })
       .from(communityMembers).innerJoin(users, eq(communityMembers.userId, users.id)).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
       .where(eq(communityMembers.communityId, community.id)).orderBy(users.username).limit(100);
     const channelRows = await db.select({ id: channels.id, name: channels.name, topic: channels.topic, kind: channels.kind })
       .from(channels).where(eq(channels.communityId, community.id)).orderBy(channels.createdAt);
     const members = memberRows.map(({ role, ...member }) => ({ ...visibleMemberIdentity(member), role }));
-    res.json({ community, myRole: mine[0]?.role ?? null, members, channels: channelRows });
+    res.json({ community, myRole: mine[0]?.role ?? null, myPermissions: permissionRows.map((row) => row.permission), members, channels: channelRows });
   }));
 
   router.patch('/communities/:communityId', asyncRoute(async (req, res) => {
@@ -441,7 +448,7 @@ export function createApi(io: SocketServer): Router {
     if (!channel || channel.kind !== 'text' || !await hasPermission(currentUser(res).id, channel.communityId, 'send_messages')) { res.status(404).json({ error: 'Canal não encontrado ou acesso não autorizado.' }); return; }
     if (await activeBan(channel.communityId, currentUser(res).id)) { res.status(403).json({ error: 'O teu acesso a esta comunidade está banido.' }); return; }
     const mute = await activeMute(channel.communityId, currentUser(res).id);
-    if (mute) { res.status(403).json({ error: `Estás silenciado até ${mute.expiresAt.toISOString()}.` }); return; }
+    if (mute) { res.status(403).json({ error: `Foste silenciado até às ${new Intl.DateTimeFormat('pt-MZ', { hour: '2-digit', minute: '2-digit' }).format(mute.expiresAt)}.` }); return; }
     const input = z.object({ clientMessageId: uuid, body: z.string().trim().min(1).max(2000), replyToId: uuid.nullable().optional() }).safeParse(req.body);
     if (!input.success) { res.status(400).json({ error: 'Mensagem inválida (máximo 2000 caracteres).' }); return; }
     if (input.data.replyToId) {
@@ -482,7 +489,7 @@ export function createApi(io: SocketServer): Router {
         .where(and(eq(communityMembers.communityId, message.communityId), eq(communityMembers.userId, userId))).limit(1);
       if (!member) return { status: 404, error: 'Não tens acesso a esta mensagem.' };
       const [ban] = await tx.select({ id: communityBans.id }).from(communityBans)
-        .where(and(eq(communityBans.communityId, message.communityId), eq(communityBans.userId, userId), isNull(communityBans.revokedAt))).limit(1);
+        .where(and(eq(communityBans.communityId, message.communityId), eq(communityBans.userId, userId), isNull(communityBans.revokedAt), or(isNull(communityBans.expiresAt), gt(communityBans.expiresAt, new Date())))).limit(1);
       if (ban) return { status: 403, error: 'Não podes reagir nesta comunidade.' };
       const [mute] = await tx.select({ id: communityMutes.id }).from(communityMutes)
         .where(and(eq(communityMutes.communityId, message.communityId), eq(communityMutes.userId, userId), isNull(communityMutes.revokedAt), gt(communityMutes.expiresAt, new Date()))).limit(1);
@@ -551,13 +558,17 @@ export function createApi(io: SocketServer): Router {
   router.post('/communities/:communityId/members/:userId/mute', asyncRoute(async (req, res) => {
     const communityId = req.params.communityId; const actorId = currentUser(res).id;
     if (!await hasPermission(actorId, communityId, 'mute_members') || !await canActOnTarget(actorId, communityId, req.params.userId)) { res.status(403).json({ error: 'Não tens permissão para silenciar este membro.' }); return; }
-    const input = z.object({ durationMinutes: z.union([z.literal(5), z.literal(10), z.literal(60), z.literal(1440)]), reason: z.string().trim().max(500).default('') }).safeParse(req.body);
-    if (!input.success) { res.status(400).json({ error: 'Duração de silêncio inválida.' }); return; }
-    const durationSeconds = input.data.durationMinutes * 60; const expiresAt = new Date(Date.now() + durationSeconds * 1000);
+    const input = z.object({ duration: z.object({ amount: z.number().int().positive(), unit: z.enum(['minutes', 'hours', 'days']) }).optional(), durationMinutes: z.number().int().positive().optional(), reason: z.string().trim().max(500).default('') })
+      .refine((value) => Boolean(value.duration) !== (value.durationMinutes !== undefined)).safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: 'Duração ou motivo inválido.' }); return; }
+    const seconds = input.data.duration ? durationSeconds(input.data.duration.amount, input.data.duration.unit) : (input.data.durationMinutes ?? 0) * 60;
+    if (!durationInRange(seconds, 60, 28 * 24 * 60 * 60)) { res.status(400).json({ error: 'O silêncio deve durar entre 1 minuto e 28 dias.' }); return; }
+    const expiresAt = new Date(Date.now() + seconds * 1000);
     await db.update(communityMutes).set({ revokedAt: new Date() }).where(and(eq(communityMutes.communityId, communityId), eq(communityMutes.userId, req.params.userId), isNull(communityMutes.revokedAt)));
     await db.insert(communityMutes).values({ communityId, userId: req.params.userId, actorId, expiresAt, reason: input.data.reason });
-    await audit(communityId, actorId, 'member.muted', req.params.userId, input.data.reason, durationSeconds);
+    await audit(communityId, actorId, 'member.muted', req.params.userId, input.data.reason, seconds);
     io.in(`user:${req.params.userId}`).emit('community:muted', { communityId, expiresAt });
+    await broadcastCommunityMembers(io, communityId, 'community:member_muted', { communityId, userId: req.params.userId, expiresAt });
     res.json({ expiresAt });
   }));
 
@@ -567,18 +578,23 @@ export function createApi(io: SocketServer): Router {
     await db.update(communityMutes).set({ revokedAt: new Date() }).where(and(eq(communityMutes.communityId, communityId), eq(communityMutes.userId, req.params.userId), isNull(communityMutes.revokedAt)));
     await audit(communityId, actorId, 'member.unmuted', req.params.userId);
     io.in(`user:${req.params.userId}`).emit('community:unmuted', { communityId });
+    await broadcastCommunityMembers(io, communityId, 'community:member_unmuted', { communityId, userId: req.params.userId });
     res.json({ ok: true });
   }));
 
   router.post('/communities/:communityId/members/:userId/ban', asyncRoute(async (req, res) => {
     const communityId = req.params.communityId; const actorId = currentUser(res).id;
     if (!await hasPermission(actorId, communityId, 'ban_members') || !await canActOnTarget(actorId, communityId, req.params.userId)) { res.status(403).json({ error: 'Não tens permissão para banir este membro.' }); return; }
-    const input = z.object({ reason: z.string().trim().max(500).default('') }).safeParse(req.body ?? {});
-    if (!input.success) { res.status(400).json({ error: 'Motivo inválido.' }); return; }
-    await db.insert(communityBans).values({ communityId, userId: req.params.userId, actorId, reason: input.data.reason });
+    const input = z.object({ duration: z.object({ amount: z.number().int().positive(), unit: z.enum(['minutes', 'hours', 'days']) }).nullable().optional(), reason: z.string().trim().max(500).default('') }).safeParse(req.body ?? {});
+    if (!input.success) { res.status(400).json({ error: 'Duração ou motivo inválido.' }); return; }
+    const seconds = input.data.duration ? durationSeconds(input.data.duration.amount, input.data.duration.unit) : null;
+    if (seconds !== null && !durationInRange(seconds, 60 * 60, 365 * 24 * 60 * 60)) { res.status(400).json({ error: 'O banimento temporário deve durar entre 1 hora e 365 dias.' }); return; }
+    const expiresAt = seconds === null ? null : new Date(Date.now() + seconds * 1000);
+    await db.update(communityBans).set({ revokedAt: new Date() }).where(and(eq(communityBans.communityId, communityId), eq(communityBans.userId, req.params.userId), isNull(communityBans.revokedAt)));
+    await db.insert(communityBans).values({ communityId, userId: req.params.userId, actorId, reason: input.data.reason, expiresAt });
     await db.delete(communityMembers).where(and(eq(communityMembers.communityId, communityId), eq(communityMembers.userId, req.params.userId)));
-    await audit(communityId, actorId, 'member.banned', req.params.userId, input.data.reason);
-    io.in(`user:${req.params.userId}`).emit('community:banned', { communityId });
+    await audit(communityId, actorId, 'member.banned', req.params.userId, input.data.reason, seconds);
+    io.in(`user:${req.params.userId}`).emit('community:banned', { communityId, expiresAt });
     await removeCommunitySocketAccess(io, req.params.userId, communityId);
     await broadcastCommunityMembers(io, communityId, 'community:member_left', { communityId, userId: req.params.userId });
     res.json({ ok: true });
@@ -587,9 +603,10 @@ export function createApi(io: SocketServer): Router {
   router.get('/communities/:communityId/bans', asyncRoute(async (req, res) => {
     const communityId = req.params.communityId;
     if (!await hasPermission(currentUser(res).id, communityId, 'ban_members')) { res.status(403).json({ error: 'Não tens permissão para consultar banimentos.' }); return; }
-    const rows = await db.select({ userId: communityBans.userId, username: users.username, reason: communityBans.reason, createdAt: communityBans.createdAt })
+    const now = new Date();
+    const rows = await db.select({ userId: communityBans.userId, username: users.username, reason: communityBans.reason, createdAt: communityBans.createdAt, expiresAt: communityBans.expiresAt })
       .from(communityBans).innerJoin(users, eq(communityBans.userId, users.id))
-      .where(and(eq(communityBans.communityId, communityId), isNull(communityBans.revokedAt)))
+      .where(and(eq(communityBans.communityId, communityId), isNull(communityBans.revokedAt), or(isNull(communityBans.expiresAt), gt(communityBans.expiresAt, now))))
       .orderBy(desc(communityBans.createdAt));
     const seen = new Set<string>();
     const bans = rows.filter((row) => { if (seen.has(row.userId)) return false; seen.add(row.userId); return true; });

@@ -1,13 +1,29 @@
-import { type FormEvent, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
 import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type MemberProfile, type Message, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
 import { EMOJI_CATEGORIES, EMOJI_INDEX, type EmojiCategoryId } from './emoji-data';
 import { toggleReactionSummary } from './reaction-state';
+import { ActionMenuOverlay, MessageRow, ModerationPrompt, rectFor, type ActionMenuTarget, type DurationChoice, type MenuRect } from './message-actions';
 
 type ModalType = 'community' | 'channel' | 'profile' | 'memberProfile' | 'account' | 'admin' | null;
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
+function durationLabel(duration: DurationChoice): string {
+  if (!duration) return 'permanentemente';
+  const unit = duration.unit === 'minutes' ? (duration.amount === 1 ? 'minuto' : 'minutos') : duration.unit === 'hours' ? (duration.amount === 1 ? 'hora' : 'horas') : (duration.amount === 1 ? 'dia' : 'dias');
+  return `${duration.amount} ${unit}`;
+}
+function banExpiryLabel(expiresAt: string | null): string {
+  if (!expiresAt) return 'Permanente';
+  const seconds = Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 1000));
+  if (seconds === 0) return 'A terminar';
+  const days = Math.floor(seconds / 86400);
+  if (days > 0) return `Termina em ${days} ${days === 1 ? 'dia' : 'dias'}`;
+  const hours = Math.floor(seconds / 3600);
+  if (hours > 0) return `Termina em ${hours} ${hours === 1 ? 'hora' : 'horas'}`;
+  const minutes = Math.max(1, Math.ceil(seconds / 60));
+  return `Termina em ${minutes} ${minutes === 1 ? 'minuto' : 'minutos'}`;
+}
 
 function initials(value: string): string {
   return value.trim().slice(0, 1).toUpperCase() || '?';
@@ -124,6 +140,10 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const [search, setSearch] = useState('');
   const [publicCommunities, setPublicCommunities] = useState<Community[]>([]);
   const [modal, setModal] = useState<ModalType>(null);
+  const [actionMenu, setActionMenu] = useState<ActionMenuTarget | null>(null);
+  const actionMenuRef = useRef<ActionMenuTarget | null>(null);
+  const menuHistoryRef = useRef(false);
+  const [moderationPrompt, setModerationPrompt] = useState<{ action: 'mute' | 'ban'; member: Member } | null>(null);
   const [toast, setToast] = useState('');
   const [online, setOnline] = useState(navigator.onLine);
   const [reconnecting, setReconnecting] = useState(false);
@@ -161,8 +181,11 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   knownMessageIds.current = new Set(messages.flatMap((message) => [message.id, message.clientMessageId]));
   const nearBottom = useRef(true);
   const tuckTimer = useRef<number | undefined>(undefined);
+  const hintShownRef = useRef(false);
+  useEffect(() => { actionMenuRef.current = actionMenu; }, [actionMenu]);
   useEffect(() => {
     const onPopState = () => {
+      if (menuHistoryRef.current || actionMenuRef.current) { menuHistoryRef.current = false; setActionMenu(null); return; }
       if (mobileHistory.current.length > 1) { mobileHistory.current.pop(); setMobileView(mobileHistory.current[mobileHistory.current.length - 1]); }
       else { window.history.pushState({ mavunoView: 'channels' }, '', window.location.href); setMobileView('channels'); }
     };
@@ -170,6 +193,20 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
+  const openActionMenu = (target: ActionMenuTarget) => {
+    composerInputRef.current?.blur();
+    if ((window.innerWidth <= 760 || target.rect.touch) && !menuHistoryRef.current) {
+      window.history.pushState({ mavunoActionMenu: true }, '', window.location.href);
+      menuHistoryRef.current = true;
+    }
+    setActionMenu(target);
+  };
+  const closeActionMenu = useCallback(() => {
+    setActionMenu(null);
+    if (menuHistoryRef.current) window.history.back();
+  }, []);
+  const openMessageMenu = (message: Message, rect: MenuRect) => openActionMenu({ kind: 'message', message, rect });
+  const openMemberMenu = (member: Member, rect: MenuRect) => openActionMenu({ kind: 'member', member, rect });
   const isManager = details?.myRole === 'owner' || details?.myRole === 'admin';
   const canKick = ['owner', 'admin', 'moderator'].includes(details?.myRole ?? '');
   const activeCommunityId = details?.community.id;
@@ -304,6 +341,15 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     void fetchPinnedMessages(channel.id);
   }, [channel?.id, channel?.kind, fetchMessages, fetchPinnedMessages]);
   useEffect(() => {
+    if (!channel || channel.kind !== 'text' || messages.length === 0 || hintShownRef.current) return;
+    hintShownRef.current = true;
+    try {
+      if (localStorage.getItem('mavuno.message-menu-hint.v1')) return;
+      localStorage.setItem('mavuno.message-menu-hint.v1', '1');
+    } catch { /* a dica continua a ser mostrada uma vez nesta sessão */ }
+    notify('Prime uma mensagem para ver as opções.');
+  }, [channel?.id, channel?.kind, messages.length, notify]);
+  useEffect(() => {
     if (nearBottom.current && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [messages.length, channel?.id]);
   useEffect(() => {
@@ -319,6 +365,12 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     socket.on('community:member_left', (event: { communityId: string; userId: string }) => {
       if (event.communityId === communityId) setDetails((current) => current ? { ...current, members: current.members.filter((member) => member.id !== event.userId) } : current);
     });
+    socket.on('community:member_muted', (event: { communityId: string; userId: string; expiresAt: string }) => {
+      if (event.communityId === communityId) setDetails((current) => current ? { ...current, members: current.members.map((member) => member.id === event.userId ? { ...member, mutedUntil: event.expiresAt } : member) } : current);
+    });
+    socket.on('community:member_unmuted', (event: { communityId: string; userId: string }) => {
+      if (event.communityId === communityId) setDetails((current) => current ? { ...current, members: current.members.map((member) => member.id === event.userId ? { ...member, mutedUntil: null } : member) } : current);
+    });
     socket.on('profile:updated', (event: { userId: string; profile: MemberProfile }) => {
       setDetails((current) => current ? { ...current, members: current.members.map((member) => member.id === event.userId ? refreshVisibleIdentity(member, event.profile) : member) } : current);
       setMessages((current) => current.map((message) => message.authorId === event.userId ? refreshVisibleIdentity(message, event.profile) : message));
@@ -329,14 +381,22 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     socket.on('profile:presence', (event: { userId: string; online: boolean }) => {
       setMemberProfile((current) => current?.id === event.userId && Object.hasOwn(current, 'online') ? { ...current, online: event.online } : current);
     });
-    socket.on('community:kicked', (event: { communityId: string }) => {
-      if (event.communityId === communityId) { setDetails(null); setChannel(null); void loadCommunities(); notify('A tua associação à comunidade foi removida.'); }
-    });
-    socket.on('community:banned', (event: { communityId: string }) => {
-      if (event.communityId === communityId) { setDetails(null); setChannel(null); void loadCommunities(); notify('O teu acesso a esta comunidade foi removido.'); }
-    });
     return () => { socket.disconnect(); };
   }, [details?.community.id, loadCommunities, loadMemberProfile, notify]);
+  useEffect(() => {
+    const socket = io({ withCredentials: true, reconnection: true, transports: ['websocket', 'polling'] });
+    socket.on('community:muted', (event: { communityId: string; expiresAt: string }) => notify(`Foste silenciado até às ${new Intl.DateTimeFormat('pt-MZ', { hour: '2-digit', minute: '2-digit' }).format(new Date(event.expiresAt))}.`));
+    socket.on('community:unmuted', () => notify('O teu silêncio foi removido.'));
+    socket.on('community:kicked', (event: { communityId: string }) => {
+      if (activeCommunityId === event.communityId) { setDetails(null); setChannel(null); setActionMenu(null); void loadCommunities(); }
+      notify('Foste expulso desta comunidade.');
+    });
+    socket.on('community:banned', (event: { communityId: string; expiresAt?: string | null }) => {
+      if (activeCommunityId === event.communityId) { setDetails(null); setChannel(null); setActionMenu(null); void loadCommunities(); }
+      notify(event.expiresAt ? `Foste banido até ${new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(event.expiresAt))}.` : 'Foste banido permanentemente desta comunidade.');
+    });
+    return () => { socket.disconnect(); };
+  }, [activeCommunityId, loadCommunities, notify]);
   useEffect(() => {
     if (!channel || channel.kind !== 'text') return;
     const socket = io({ withCredentials: true, reconnection: true, reconnectionDelay: 700, reconnectionDelayMax: 5000, transports: ['websocket', 'polling'] });
@@ -371,9 +431,6 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     socket.on('message:reactions', (event: { messageId: string; reactions: ReactionSummary[] }) => { setMessages((current) => current.map((message) => message.id === event.messageId ? { ...message, reactions: event.reactions } : message)); setPinnedMessages((current) => current.map((message) => message.id === event.messageId ? { ...message, reactions: event.reactions } : message)); });
     socket.on('channel:deleted', (event: { id: string }) => {
       if (event.id === channel.id) { setChannel(null); notify('Este canal foi removido.'); }
-    });
-    socket.on('community:kicked', (event: { communityId: string }) => {
-      if (event.communityId === details?.community.id) { setDetails(null); setChannel(null); void loadCommunities(); notify('A tua associação à comunidade foi removida.'); }
     });
     socket.on('room:error', () => notify('Não foi possível ligar à sala. Tenta novamente.'));
     socket.on('mention:new', (event: { username: string }) => notify(`Mencionaram-te numa conversa, ${event.username}.`));
@@ -522,7 +579,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível alterar o cargo.'); }
   };
   const kickMember = async (member: Member) => {
-    if (!activeCommunityId || !window.confirm(`Remover ${member.username} desta comunidade?`)) return;
+    if (!activeCommunityId || !window.confirm(`Expulsar ${member.username} da comunidade?`)) return;
     try {
       await api(`/communities/${activeCommunityId}/members/${member.id}`, { method: 'DELETE' });
       setDetails((current) => current ? { ...current, members: current.members.filter((item) => item.id !== member.id) } : current);
@@ -540,15 +597,25 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       else { const result = await api<{ message: { id: string; pinnedAt: string; pinnedBy: string } }>(`/messages/${message.id}/pin`, { method: 'POST', body: '{}' }); const updated = { ...message, ...result.message }; setMessages((current) => current.map((item) => item.id === message.id ? { ...item, ...result.message } : item)); setPinnedMessages((current) => current.some((item) => item.id === message.id) ? current.map((item) => item.id === message.id ? { ...item, ...result.message } : item) : [...current, updated]); notify('Mensagem fixada.'); }
     } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível atualizar a mensagem.'); }
   };
-  const moderateMember = async (action: 'mute' | 'unmute' | 'ban' | 'kick', member: Member, durationMinutes?: number) => {
+  const applyModeration = async (action: 'mute' | 'ban', member: Member, duration: DurationChoice, reason: string) => {
+    if (!activeCommunityId) throw new Error('Não foi possível encontrar a comunidade.');
+    if (action === 'mute') {
+      const result = await api<{ expiresAt: string }>(`/communities/${activeCommunityId}/members/${member.id}/mute`, { method: 'POST', body: JSON.stringify({ duration, reason }) });
+      setDetails((current) => current ? { ...current, members: current.members.map((item) => item.id === member.id ? { ...item, mutedUntil: result.expiresAt } : item) } : current);
+      notify(`${member.username} foi silenciado até às ${new Intl.DateTimeFormat('pt-MZ', { hour: '2-digit', minute: '2-digit' }).format(new Date(result.expiresAt))}.`);
+      return;
+    }
+    await api(`/communities/${activeCommunityId}/members/${member.id}/ban`, { method: 'POST', body: JSON.stringify({ duration, reason }) });
+    setDetails((current) => current ? { ...current, members: current.members.filter((item) => item.id !== member.id) } : current);
+    notify(`${member.username} foi banido${duration ? ` durante ${durationLabel(duration)}` : ' permanentemente'}.`);
+  };
+  const removeMemberMute = async (member: Member) => {
     if (!activeCommunityId) return;
-    if ((action === 'mute' || action === 'unmute') && !window.confirm(action === 'mute' ? `Silenciar ${member.username} por ${durationMinutes === 5 ? '5 minutos' : '1 hora'}?` : `Remover o silenciamento de ${member.username}?`)) return;
     try {
-      if (action === 'kick') await kickMember(member);
-      else if (action === 'ban') { if (!window.confirm(`Banir ${member.username}?`)) return; await api(`/communities/${activeCommunityId}/members/${member.id}/ban`, { method: 'POST', body: JSON.stringify({}) }); setDetails((current) => current ? { ...current, members: current.members.filter((item) => item.id !== member.id) } : current); notify(`${member.username} foi banido.`); }
-      else if (action === 'mute') { const result = await api<{ expiresAt: string }>(`/communities/${activeCommunityId}/members/${member.id}/mute`, { method: 'POST', body: JSON.stringify({ durationMinutes }) }); setDetails((current) => current ? { ...current, members: current.members.map((item) => item.id === member.id ? { ...item, mutedUntil: result.expiresAt } : item) } : current); notify(`${member.username} foi silenciado.`); }
-      else { await api(`/communities/${activeCommunityId}/members/${member.id}/mute`, { method: 'DELETE' }); setDetails((current) => current ? { ...current, members: current.members.map((item) => item.id === member.id ? { ...item, mutedUntil: null } : item) } : current); notify('Silenciamento removido.'); }
-    } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível aplicar a ação de moderação.'); }
+      await api(`/communities/${activeCommunityId}/members/${member.id}/mute`, { method: 'DELETE' });
+      setDetails((current) => current ? { ...current, members: current.members.map((item) => item.id === member.id ? { ...item, mutedUntil: null } : item) } : current);
+      notify('Silenciamento removido.');
+    } catch { notify('Não foi possível remover o silêncio. Tenta de novo.'); }
   };
   const updateProfile = async (data: { username: string; avatarUrl: string | null; aboutMe: string; visibility: ProfileVisibility }) => {
     setProfileBusy(true);
@@ -597,13 +664,13 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
           {isManager && <button className="channel-delete" title={`Apagar ${item.name}`} aria-label={`Apagar canal ${item.name}`} onClick={() => void deleteChannel(item)}>×</button>}
         </div>)}
         <div className="section-label">Membros · {details.members.length}</div>
-        {details.members.map((member) => <div className="member-row" key={member.id} title={roleLabels[member.role] ?? member.role}>
-          <button className="profile-avatar-button" aria-label={`Ver perfil de ${member.username}`} onClick={() => openMemberProfile(member.id)}><Avatar name={member.username} url={member.avatarUrl} size={27}/></button>
-          <button className="member-name profile-name-link" onClick={() => openMemberProfile(member.id)}>{member.username}</button>
-          {isManager && member.role !== 'owner' ? <select className="role-select" aria-label={`Cargo de ${member.username}`} value={member.role} onChange={(event) => void changeRole(member, event.target.value)}>
+        {details.members.map((member) => <div className="member-row member-action-row" key={member.id} title={roleLabels[member.role] ?? member.role} tabIndex={0} aria-label={`Ações de ${member.username}`} onClick={(event) => { if ((event.target as HTMLElement).closest('select')) return; openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect(), navigator.maxTouchPoints > 0)); }} onContextMenu={(event) => { event.preventDefault(); openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect())); }} onKeyDown={(event) => { if ((event.target === event.currentTarget) && (event.key === 'Enter' || event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) { event.preventDefault(); openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect())); } }}>
+          <span className="profile-avatar-button"><Avatar name={member.username} url={member.avatarUrl} size={27}/></span>
+          <span className="member-name profile-name-link">{member.username}</span>
+          {isManager && member.role !== 'owner' ? <select className="role-select" aria-label={`Cargo de ${member.username}`} value={member.role} onClick={(event) => event.stopPropagation()} onChange={(event) => void changeRole(member, event.target.value)}>
             <option value="admin">Admin</option><option value="moderator">Moderador</option><option value="member">Membro</option>
           </select> : <small className="member-role">{roleLabels[member.role] ?? member.role}</small>}
-          {canKick && member.id !== user.id && member.role !== 'owner' && <MemberActions member={member} onAction={(action, duration) => void moderateMember(action, member, duration)} onCall={() => setCallTarget(member)}/>} 
+          <button type="button" className="member-remove member-action-trigger" aria-label={`Mais ações de ${member.username}`} onClick={(event) => { event.stopPropagation(); openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect(), navigator.maxTouchPoints > 0)); }}>⋯</button>
         </div>)}
         {details.myRole && details.myRole !== 'owner' && <button className="text-button" style={{ marginTop: 12 }} onClick={() => void leaveCommunity()}>Sair da comunidade</button>}
         {!details.myRole && <p className="muted" style={{ fontSize: 12, padding: 8 }}>Precisas de um convite para abrir os canais.</p>}
@@ -656,23 +723,10 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
             if (oldest) { nearBottom.current = false; void fetchMessages(channel.id, `${oldest.createdAt}~${oldest.id}`); }
           }}>{loadingMessages ? 'A carregar…' : 'Carregar mensagens anteriores'}</button>}
           {messages.length === 0 && !loadingMessages && <div className="empty-state">Ainda não há mensagens. Começa a conversa.</div>}
-          {messages.map((message, index) => <article className={`message ${index > 0 && messages[index - 1]?.authorId === message.authorId ? 'message-grouped' : ''}`} key={message.id}>
-            <button className="profile-avatar-button message-avatar-button" aria-label={`Ver perfil de ${message.username}`} onClick={() => openMemberProfile(message.authorId)}><Avatar name={message.username} url={message.avatarUrl}/></button>
-            <div style={{ minWidth: 0, flex: 1 }}>
-              <div className="message-meta"><button className="profile-name-link" onClick={() => openMemberProfile(message.authorId)}>{message.username}</button><time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time></div>
-              {message.replyToId && <div className="reply-preview"><strong>{message.replyAuthor ?? 'Mensagem apagada'}</strong>{message.replyBody && <span>{message.replyBody.slice(0, 100)}</span>}</div>}
-              <div className="message-body">{message.pinnedAt && <span className="pinned-label">Fixada · </span>}{message.body}</div>
-              {!!message.reactions?.length && <div className="reaction-pills">{message.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(message, reaction.emoji)} onLongPress={() => void showReactionUsers(message.id, reaction.emoji)}/>)}</div>}
-              {Array.from(pendingReactionKeys).some((key) => key.startsWith(`${message.id}:`)) && !(message.reactions ?? []).some((reaction) => pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)) && <small className="reaction-pending-label">A enviar…</small>}
-              {message.delivery === 'sending' && <span className="message-delivery">A enviar…</span>}
-              {!message.delivery && message.authorId === user.id && <span className="message-delivery">Enviada</span>}
-              {message.delivery === 'failed' && <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span style={{ fontSize: 11, color: 'var(--danger)' }}>Falhou enviar</span><button className="text-button" onClick={() => void sendMessage(message.body, message.clientMessageId, message.replyToId)}>Tentar novamente</button></div>}
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                {!message.delivery && <button className="text-button" style={{ fontSize: 11 }} onClick={() => setReply(message)}>Responder</button>}
-                {!message.delivery && <MessageActions message={message} own={message.authorId === user.id} canModerate={['owner', 'admin', 'moderator'].includes(details?.myRole ?? '')} onDelete={() => void deleteMessage(message)} onPin={() => void togglePin(message)} onQuickReaction={(emoji) => void toggleReaction(message, emoji)} onMoreReactions={() => setEmojiPickerTarget({ messageId: message.id })}/>}
-              </div>
-            </div>
-          </article>)}
+          {messages.map((message, index) => <MessageRow key={message.id} message={message} grouped={index > 0 && messages[index - 1]?.authorId === message.authorId} own={message.authorId === user.id} onOpenMenu={(rect) => openMessageMenu(message, rect)} onProfile={() => openMemberProfile(message.authorId)} onReply={() => setReply(message)} onRetry={() => void sendMessage(message.body, message.clientMessageId, message.replyToId)} onQuickReaction={(emoji) => void toggleReaction(message, emoji)}>
+            {!!message.reactions?.length && <div className="reaction-pills">{message.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(message, reaction.emoji)} onLongPress={() => void showReactionUsers(message.id, reaction.emoji)}/>)}</div>}
+            {Array.from(pendingReactionKeys).some((key) => key.startsWith(`${message.id}:`)) && !(message.reactions ?? []).some((reaction) => pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)) && <small className="reaction-pending-label">A enviar…</small>}
+          </MessageRow>)}
           {newMessages > 0 && <button className="new-messages-button" onClick={() => { if (listRef.current) listRef.current.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' }); nearBottom.current = true; setNewMessages(0); }}>Novas mensagens · Descer</button>}
         </div>
         <div className="composer-wrap">
@@ -703,6 +757,9 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     {pinnedOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setPinnedOpen(false); }}><section className="modal pinned-modal" role="dialog" aria-modal="true" aria-labelledby="pinned-title"><h2 id="pinned-title">Mensagens fixadas</h2><div className="pinned-list">{pinnedMessages.map((item) => <article className="pinned-item" key={item.id}><strong>{item.username}</strong><time className="message-time">{formatTime(item.createdAt)}</time><p>{item.body}</p>{!!item.reactions?.length && <div className="reaction-pills">{item.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${item.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(item, reaction.emoji)} onLongPress={() => void showReactionUsers(item.id, reaction.emoji)}/>)}</div>}</article>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setPinnedOpen(false)}>Fechar</button></div></section></div>}
     {emojiPickerTarget && <EmojiPicker onClose={() => setEmojiPickerTarget(null)} onSelect={(emoji) => { const target = emojiPickerTarget; setEmojiPickerTarget(null); if (target === 'composer') insertComposerEmoji(emoji); else { const message = messages.find((item) => item.id === target.messageId) ?? pinnedMessages.find((item) => item.id === target.messageId); if (message) void toggleReaction(message, emoji); } }}/> }
     {reactionUsers && <ReactionUsersSheet emoji={reactionUsers.emoji} users={reactionUsers.users} loading={reactionUsers.loading} onClose={() => setReactionUsers(null)}/>}
+    {actionMenu && details && <ActionMenuOverlay target={actionMenu} actorId={user.id} actorRole={details.myRole} actorPermissions={details.myPermissions} targetMember={actionMenu.kind === 'member' ? actionMenu.member : details.members.find((member) => member.id === actionMenu.message.authorId) ?? (actionMenu.message.authorId === user.id ? undefined : { id: actionMenu.message.authorId, username: actionMenu.message.username, avatarUrl: actionMenu.message.avatarUrl, role: 'unknown' })} onClose={closeActionMenu} onReply={(message) => setReply(message)} onDelete={deleteMessage} onPin={togglePin} onQuickReaction={(message, emoji) => void toggleReaction(message, emoji)} onMoreReactions={(message) => setEmojiPickerTarget({ messageId: message.id })} onProfile={openMemberProfile} onCall={(member) => setCallTarget(member)} onModerate={(action, member) => setModerationPrompt({ action, member })} onUnmute={(member) => void removeMemberMute(member)} onKick={kickMember} notify={notify}/>}
+    {moderationPrompt && <ModerationPrompt action={moderationPrompt.action} member={moderationPrompt.member} onClose={() => setModerationPrompt(null)} onConfirm={async (duration, reason) => { await applyModeration(moderationPrompt.action, moderationPrompt.member, duration, reason); setModerationPrompt(null); }}/>
+    }
     {modal === 'community' && <CommunityModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createCommunity(data)}/>}
     {modal === 'channel' && <ChannelModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createChannel(data)}/>}
     {modal === 'admin' && details && <AdminModal details={details} onClose={() => setModal(null)} onSaved={() => { if (activeCommunityId) void openCommunity(activeCommunityId, false); }}/>}
@@ -714,52 +771,6 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   </div>;
 }
 
-function ContextMenu({ label, triggerClassName, children }: { label: string; triggerClassName: string; children: (close: () => void) => ReactNode }) {
-  const [open, setOpen] = useState(false);
-  const [position, setPosition] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  const close = useCallback(() => setOpen(false), []);
-  useLayoutEffect(() => {
-    if (!open) return;
-    const place = () => {
-      const anchor = triggerRef.current;
-      const menu = menuRef.current;
-      if (!anchor || !menu) return;
-      const rect = anchor.getBoundingClientRect();
-      if (window.innerWidth <= 760) { setPosition(null); return; }
-      const width = Math.min(menu.getBoundingClientRect().width || 184, window.innerWidth - 24);
-      const height = menu.getBoundingClientRect().height;
-      const below = window.innerHeight - rect.bottom - 8;
-      const above = rect.top - 8;
-      const useBelow = below >= Math.min(height, 220) || below >= above;
-      const maxHeight = Math.max(100, (useBelow ? below : above));
-      const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
-      setPosition({ top: useBelow ? rect.bottom + 6 : Math.max(8, rect.top - Math.min(height, maxHeight) - 6), left, maxHeight });
-    };
-    place();
-    window.addEventListener('resize', place);
-    document.addEventListener('scroll', place, true);
-    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') close(); };
-    const onPointer = (event: PointerEvent) => {
-      if (!menuRef.current?.contains(event.target as Node) && !triggerRef.current?.contains(event.target as Node)) close();
-    };
-    window.addEventListener('keydown', onKey);
-    document.addEventListener('pointerdown', onPointer);
-    return () => { window.removeEventListener('resize', place); document.removeEventListener('scroll', place, true); window.removeEventListener('keydown', onKey); document.removeEventListener('pointerdown', onPointer); };
-  }, [open, close]);
-  return <>
-    <button ref={triggerRef} className={triggerClassName} aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((value) => !value)}>⋯</button>
-    {open && createPortal(<><button className="menu-backdrop" aria-label="Fechar menu" onClick={close}/><div ref={menuRef} className="context-menu" role="menu" style={window.innerWidth > 760 ? { position: 'fixed', top: position?.top ?? -1000, left: position?.left ?? -1000, maxHeight: position?.maxHeight ?? '70dvh', overflowY: 'auto', visibility: position ? 'visible' : 'hidden' } : undefined}>{children(close)}</div></>, document.body)}
-  </>;
-}
-function MessageActions({ message, own, canModerate, onDelete, onPin, onQuickReaction, onMoreReactions }: { message: Message; own: boolean; canModerate: boolean; onDelete: () => void; onPin: () => void; onQuickReaction: (emoji: string) => void; onMoreReactions: () => void }) {
-  return <ContextMenu label="Ações da mensagem" triggerClassName="text-button context-trigger">{(close) => <>
-    <div className="quick-reactions-menu" role="group" aria-label="Reações rápidas">{['👍', '❤️', '😂', '😮', '😢', '🙏'].map((emoji) => <button key={emoji} type="button" aria-label={`Reagir com ${emoji}`} onClick={() => { close(); onQuickReaction(emoji); }}>{emoji}</button>)}<button type="button" aria-label="Mais emojis" onClick={() => { close(); onMoreReactions(); }}>＋</button></div>
-    {canModerate && <button role="menuitem" onClick={() => { close(); onPin(); }}>{message.pinnedAt ? 'Desafixar' : 'Fixar'}</button>}
-    {(own || canModerate) && <button role="menuitem" className="danger-text" onClick={() => { close(); onDelete(); }}>Apagar</button>}
-  </>}</ContextMenu>;
-}
 function ReactionPill({ reaction, pending, onToggle, onLongPress }: { reaction: ReactionSummary; pending: boolean; onToggle: () => void; onLongPress: () => void }) {
   const timer = useRef<number | null>(null);
   const held = useRef(false);
@@ -783,12 +794,6 @@ function EmojiPicker({ onClose, onSelect }: { onClose: () => void; onSelect: (em
 }
 function ReactionUsersSheet({ emoji, users, loading, onClose }: { emoji: string; users: string[]; loading: boolean; onClose: () => void }) {
   return <div className="modal-backdrop reaction-users-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="modal reaction-users-sheet" role="dialog" aria-modal="true" aria-labelledby="reaction-users-title"><div className="sheet-heading"><h2 id="reaction-users-title">{emoji} Reações</h2><button className="icon-button" aria-label="Fechar lista" onClick={onClose}>×</button></div>{loading ? <p className="muted">A carregar…</p> : users.length ? <div className="reaction-user-list">{users.map((username, index) => <div className="reaction-user" key={`${username}-${index}`}>{username}</div>)}</div> : <p className="empty-state">Ainda ninguém reagiu com este emoji.</p>}</section></div>;
-}
-function MemberActions({ member, onAction, onCall }: { member: Member; onAction: (action: 'mute' | 'unmute' | 'ban' | 'kick', duration?: number) => void; onCall: () => void }) {
-  return <ContextMenu label={`Ações de ${member.username}`} triggerClassName="member-remove">{(close) => <>
-    {member.mutedUntil ? <button role="menuitem" onClick={() => { close(); onAction('unmute'); }}>Remover silêncio</button> : <><button role="menuitem" onClick={() => { close(); onAction('mute', 5); }}>Silenciar · 5 min</button><button role="menuitem" onClick={() => { close(); onAction('mute', 60); }}>Silenciar · 1 hora</button></>}
-    <button role="menuitem" onClick={() => { close(); onCall(); }}>Chamada de voz</button><button role="menuitem" className="danger-text" onClick={() => { close(); onAction('kick'); }}>Expulsar</button><button role="menuitem" className="danger-text" onClick={() => { close(); onAction('ban'); }}>Banir</button>
-  </>}</ContextMenu>;
 }
 function PrivateCallDock({ target, onClearTarget, notify }: { target: Member | null; onClearTarget: () => void; notify: (text: string) => void }) {
   const [call, setCall] = useState<PrivateCall | null>(null); const [error, setError] = useState(''); const [connecting, setConnecting] = useState(false); const [micOn, setMicOn] = useState(true); const roomRef = useRef<Room | null>(null); const connectedCall = useRef<string | null>(null);
@@ -833,7 +838,7 @@ function PrivateCallDock({ target, onClearTarget, notify }: { target: Member | n
 
 function AdminModal({ details, onClose, onSaved }: { details: CommunityDetails; onClose: () => void; onSaved: () => void }) {
   type AuditEntry = { id: string; action: string; reason: string; durationSeconds: number | null; metadata: string; createdAt: string; actorId: string; actorUsername: string; targetUserId: string | null };
-  type BanEntry = { userId: string; username: string; reason: string; createdAt: string };
+  type BanEntry = { userId: string; username: string; reason: string; createdAt: string; expiresAt: string | null };
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -892,7 +897,7 @@ function AdminModal({ details, onClose, onSaved }: { details: CommunityDetails; 
         <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar alterações'}</button></div>
       </form>}
       {tab === 'bans' && <div className="admin-list-section"><div className="admin-list-heading"><strong>Banimentos ativos</strong><button className="text-button" onClick={() => void loadBans()} disabled={loadingBans}>Atualizar</button></div>
-        {loadingBans ? <div className="empty-state">A carregar…</div> : bans.length === 0 ? <div className="empty-state">Não há banimentos ativos.</div> : <div className="admin-clean-list">{bans.map((ban) => <div className="admin-list-row" key={ban.userId}><div className="admin-list-copy"><strong>{ban.username}</strong><span className="muted">Banido em {new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(ban.createdAt))}</span>{ban.reason && <span className="muted">{ban.reason}</span>}</div><button className="secondary" onClick={() => void revokeBan(ban.userId)}>Revogar banimento</button></div>)}</div>}
+        {loadingBans ? <div className="empty-state">A carregar…</div> : bans.length === 0 ? <div className="empty-state">Não há banimentos ativos.</div> : <div className="admin-clean-list">{bans.map((ban) => <div className="admin-list-row" key={ban.userId}><div className="admin-list-copy"><strong>{ban.username}</strong><span className="muted">{banExpiryLabel(ban.expiresAt)} · aplicado em {new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(ban.createdAt))}</span>{ban.reason && <span className="muted">{ban.reason}</span>}</div><button className="secondary" onClick={() => void revokeBan(ban.userId)}>Revogar banimento</button></div>)}</div>}
       </div>}
       {tab === 'audit' && <div className="admin-list-section"><div className="admin-list-heading"><strong>Atividade recente</strong><button className="text-button" onClick={() => void loadAudit()} disabled={loadingAudit}>Atualizar</button></div>
         {loadingAudit ? <div className="empty-state">A carregar…</div> : entries.length === 0 ? <div className="empty-state">Ainda não há ações registadas.</div> : <div className="admin-clean-list">{entries.map((entry) => <article className="audit-row" key={entry.id}><div className="audit-row-top"><strong>{actionLabels[entry.action] ?? 'Ação da comunidade'}</strong><time>{new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(entry.createdAt))}</time></div><span className="muted">Por {entry.actorUsername}{entry.targetUserId ? ` · Utilizador ${entry.targetUserId.slice(0, 8)}` : ''}</span>{entry.reason && <p>{entry.reason}</p>}</article>)}</div>}

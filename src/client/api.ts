@@ -6,7 +6,7 @@ export interface MemberProfile { id: string; username: string; avatarUrl?: strin
 export interface Community { id: string; name: string; slug: string; description: string; category: string; imageUrl?: string | null; rules?: string; isPrivate: boolean; role?: string | null }
 export interface Channel { id: string; name: string; topic: string; kind: 'text' | 'voice' }
 export interface Member { id: string; username: string; avatarUrl?: string | null; role: string; mutedUntil?: string | null; banned?: boolean }
-export interface CommunityDetails { community: Community; myRole: string | null; members: Member[]; channels: Channel[] }
+export interface CommunityDetails { community: Community; myRole: string | null; myPermissions: string[]; members: Member[]; channels: Channel[] }
 export interface ReactionSummary { emoji: string; count: number; reactedByMe: boolean }
 export interface Message { id: string; clientMessageId: string; body: string; replyToId: string | null; replyAuthor?: string | null; replyBody?: string | null; createdAt: string; pinnedAt?: string | null; pinnedBy?: string | null; authorId: string; username: string; avatarUrl?: string | null; reactions?: ReactionSummary[]; delivery?: 'sending' | 'failed' }
 export type PrivateCallStatus = 'initiated' | 'ringing' | 'accepted' | 'connecting' | 'in_progress' | 'rejected' | 'timeout' | 'failed' | 'ended';

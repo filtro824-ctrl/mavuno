@@ -1,0 +1,1 @@
+ALTER TABLE "community_bans" ADD COLUMN "expires_at" timestamp with time zone;
