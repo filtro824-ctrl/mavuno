@@ -442,3 +442,13 @@ body.message-pressing,body.message-pressing * { -webkit-user-select: none !impor
 
 /* Narrow and zoomed chat layouts must scroll vertically only. */
 .message-list{overflow-x:hidden}
+
+/* Botão flutuante arrastável, sempre encaixado numa lateral. */
+.floating-wrap{left:0;right:auto;top:0;bottom:auto;will-change:left,top;transition:left .18s cubic-bezier(.2,.8,.2,1),top .18s cubic-bezier(.2,.8,.2,1)}
+.floating-wrap.dragging{z-index:20;transition:none}
+.floating-button{display:grid;place-items:center;touch-action:none;user-select:none;-webkit-user-select:none;cursor:grab;transition:transform .18s cubic-bezier(.2,.8,.2,1),opacity .18s ease;will-change:transform}
+.floating-button:active{cursor:grabbing}
+.floating-button.tucked-left{transform:translateX(-40px);opacity:.82}
+.floating-button.tucked-right{transform:translateX(40px);opacity:.82}
+.quick-panel.quick-panel-left{left:0;right:auto}
+@media(prefers-reduced-motion:reduce){.floating-wrap,.floating-button{transition:none!important}}

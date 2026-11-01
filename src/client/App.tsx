@@ -1,4 +1,4 @@
-import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
@@ -8,10 +8,26 @@ import { toggleReactionSummary } from './reaction-state';
 import { applyDeafenState, audioOutputVolume, DEFAULT_AUDIO_PREFERENCES, microphoneConstraints, readAudioPreferences, writeAudioPreferences, type AudioPreferences, type VoiceProfile } from './audio-preferences';
 import { ActionMenuOverlay, MessageRow, ModerationPrompt, rectFor, type ActionMenuTarget, type DurationChoice, type MenuRect } from './message-actions';
 import { ATTACHMENT_TYPES, validateAttachmentMetadata, type AttachmentKind } from '../server/attachment-utils';
+import { clampFloatingPosition, FLOATING_BUTTON_SIZE, floatingTuckOffset, nearestFloatingSide, type FloatingSide } from './floating-button-utils';
 
 type ModalType = 'community' | 'channel' | 'profile' | 'memberProfile' | 'account' | 'settings' | 'admin' | null;
 type PendingAttachment = { key: string; file: File; previewUrl: string; mimeType: string; kind: AttachmentKind; width: number | null; height: number | null; attachmentId?: string; progress: number; status: 'queued' | 'uploading' | 'ready' | 'failed'; error?: string };
+type FloatingPosition = { side: FloatingSide; top: number };
+type FloatingDragState = { pointerId: number; startX: number; startY: number; startLeft: number; startTop: number; moved: boolean };
+const FLOATING_POSITION_KEY = 'mavuno-floating-button-position-v1';
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
+
+function maxFloatingTop(): number { return Math.max(0, window.innerHeight - FLOATING_BUTTON_SIZE); }
+function readFloatingPosition(): FloatingPosition {
+  const fallback = { side: 'right' as const, top: Math.max(0, window.innerHeight - FLOATING_BUTTON_SIZE - 82) };
+  try {
+    const raw = window.localStorage.getItem(FLOATING_POSITION_KEY);
+    if (!raw) return fallback;
+    const stored = JSON.parse(raw) as { side?: unknown; topRatio?: unknown };
+    if ((stored.side !== 'left' && stored.side !== 'right') || typeof stored.topRatio !== 'number' || !Number.isFinite(stored.topRatio)) return fallback;
+    return { side: stored.side, top: Math.max(0, Math.min(1, stored.topRatio)) * maxFloatingTop() };
+  } catch { return fallback; }
+}
 
 function inferredMimeType(file: File): string {
   if (file.type) return file.type.toLowerCase();
@@ -262,6 +278,8 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   }, []);
   const [quickOpen, setQuickOpen] = useState(false);
   const [tucked, setTucked] = useState(false);
+  const [floatingPosition, setFloatingPosition] = useState<FloatingPosition>(() => readFloatingPosition());
+  const [floatingDragPosition, setFloatingDragPosition] = useState<{ left: number; top: number } | null>(null);
   const [reply, setReply] = useState<Message | null>(null);
   const [pinnedOpen, setPinnedOpen] = useState(false);
   const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
@@ -301,6 +319,9 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   knownMessageIds.current = new Set(messages.flatMap((message) => [message.id, message.clientMessageId]));
   const nearBottom = useRef(true);
   const tuckTimer = useRef<number | undefined>(undefined);
+  const floatingButtonRef = useRef<HTMLButtonElement | null>(null);
+  const floatingDragRef = useRef<FloatingDragState | null>(null);
+  const suppressFloatingClickRef = useRef(false);
   const hintShownRef = useRef(false);
   useEffect(() => { actionMenuRef.current = actionMenu; }, [actionMenu]);
   useEffect(() => () => { attachmentDraftsRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl)); }, []);
@@ -471,11 +492,84 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     window.addEventListener('offline', onOffline);
     return () => { window.removeEventListener('online', onOnline); window.removeEventListener('offline', onOffline); };
   }, []);
+  const resetTuckTimer = useCallback(() => {
+    if (tuckTimer.current !== undefined) window.clearTimeout(tuckTimer.current);
+    setTucked(false);
+    tuckTimer.current = window.setTimeout(() => { if (!floatingDragRef.current) setTucked(true); }, 10_000);
+  }, []);
   useEffect(() => {
-    if (tuckTimer.current) window.clearTimeout(tuckTimer.current);
-    tuckTimer.current = window.setTimeout(() => setTucked(true), 3600);
-    return () => { if (tuckTimer.current) window.clearTimeout(tuckTimer.current); };
-  }, [quickOpen]);
+    resetTuckTimer();
+    return () => { if (tuckTimer.current !== undefined) window.clearTimeout(tuckTimer.current); };
+  }, [quickOpen, resetTuckTimer]);
+  useEffect(() => {
+    try {
+      const maxTop = maxFloatingTop();
+      window.localStorage.setItem(FLOATING_POSITION_KEY, JSON.stringify({ side: floatingPosition.side, topRatio: maxTop ? floatingPosition.top / maxTop : 0 }));
+    } catch { /* A posição continua funcional mesmo quando o armazenamento local não está disponível. */ }
+  }, [floatingPosition]);
+  useEffect(() => {
+    const onResize = () => {
+      setFloatingPosition((current) => ({ ...current, top: clampFloatingPosition(0, current.top, window.innerWidth, window.innerHeight).top }));
+      setFloatingDragPosition((current) => current ? clampFloatingPosition(current.left, current.top, window.innerWidth, window.innerHeight) : null);
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  const startFloatingPointer = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) return;
+    suppressFloatingClickRef.current = false;
+    const bounds = floatingButtonRef.current?.getBoundingClientRect();
+    const edgeLeft = floatingPosition.side === 'left' ? 0 : Math.max(0, window.innerWidth - FLOATING_BUTTON_SIZE);
+    floatingDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startLeft: tucked ? edgeLeft : bounds?.left ?? edgeLeft,
+      startTop: tucked ? floatingPosition.top : bounds?.top ?? floatingPosition.top,
+      moved: false,
+    };
+    try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* Pointer capture is optional on older browsers. */ }
+    resetTuckTimer();
+  };
+  const moveFloatingPointer = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const drag = floatingDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - drag.startX;
+    const deltaY = event.clientY - drag.startY;
+    if (!drag.moved && Math.hypot(deltaX, deltaY) < 6) return;
+    drag.moved = true;
+    setFloatingDragPosition(clampFloatingPosition(drag.startLeft + deltaX, drag.startTop + deltaY, window.innerWidth, window.innerHeight));
+    setQuickOpen(false);
+  };
+  const finishFloatingPointer = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const drag = floatingDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - drag.startX;
+    const deltaY = event.clientY - drag.startY;
+    if (!drag.moved && Math.hypot(deltaX, deltaY) >= 6) drag.moved = true;
+    floatingDragRef.current = null;
+    try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { /* The browser may already have released capture. */ }
+    if (drag.moved) {
+      const position = clampFloatingPosition(drag.startLeft + deltaX, drag.startTop + deltaY, window.innerWidth, window.innerHeight);
+      setFloatingPosition({ side: nearestFloatingSide(position.left, window.innerWidth), top: position.top });
+      setFloatingDragPosition(null);
+      setQuickOpen(false);
+      suppressFloatingClickRef.current = true;
+      window.setTimeout(() => { suppressFloatingClickRef.current = false; }, 100);
+    }
+    resetTuckTimer();
+  };
+  const moveFloatingWithKeyboard = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    setFloatingPosition((current) => {
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') return { ...current, side: event.key === 'ArrowLeft' ? 'left' : 'right' };
+      const top = event.key === 'Home' ? 0 : event.key === 'End' ? maxFloatingTop() : current.top + (event.key === 'ArrowDown' ? 32 : -32);
+      return { ...current, top: clampFloatingPosition(0, top, window.innerWidth, window.innerHeight).top };
+    });
+    resetTuckTimer();
+  };
 
   const fetchPinnedMessages = useCallback(async (channelId: string) => {
     try { const result = await api<{ messages: Message[] }>(`/channels/${channelId}/pinned`); setPinnedMessages(result.messages); }
@@ -1028,9 +1122,9 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       </section>}
     </main>
 
-    <div className="floating-wrap">
-      <button className={`floating-button ${tucked && !quickOpen ? 'tucked' : ''}`} aria-label="Abrir painel rápido" aria-expanded={quickOpen} onClick={() => { setTucked(false); setQuickOpen((value) => !value); }} onPointerDown={() => setTucked(false)}>m</button>
-      {quickOpen && <div className="quick-panel"><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}><strong>Conversas rápidas</strong><button className="text-button" onClick={() => setQuickOpen(false)} aria-label="Fechar painel">×</button></div>
+    <div className={`floating-wrap${floatingDragPosition ? ' dragging' : ''}`} style={{ left: `${floatingDragPosition?.left ?? (floatingPosition.side === 'left' ? 0 : Math.max(0, window.innerWidth - FLOATING_BUTTON_SIZE))}px`, top: `${floatingDragPosition?.top ?? floatingPosition.top}px` }}>
+      <button ref={floatingButtonRef} className={`floating-button${tucked ? ` tucked-${floatingPosition.side}` : ''}`} aria-label="Abrir painel rápido; arrasta para mover. Usa as setas para posicionar." aria-expanded={quickOpen} onClick={() => { if (suppressFloatingClickRef.current) { suppressFloatingClickRef.current = false; return; } resetTuckTimer(); setQuickOpen((value) => !value); }} onPointerDown={startFloatingPointer} onPointerMove={moveFloatingPointer} onPointerUp={finishFloatingPointer} onPointerCancel={finishFloatingPointer} onKeyDown={moveFloatingWithKeyboard}>m</button>
+      {quickOpen && <div className={`quick-panel${floatingPosition.side === 'left' ? ' quick-panel-left' : ''}`} onPointerDown={resetTuckTimer}><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}><strong>Conversas rápidas</strong><button className="text-button" onClick={() => setQuickOpen(false)} aria-label="Fechar painel">×</button></div>
         {quickItems.length === 0 ? <p className="muted" style={{ fontSize: 13 }}>As tuas comunidades aparecem aqui.</p> : quickItems.map((item) => <button key={item.id} className="channel-row" onClick={() => { void openCommunity(item.id); setQuickOpen(false); }}>{item.name}</button>)}
         <button className="text-button" onClick={() => { void loadExplore(); setQuickOpen(false); }}>Explorar comunidades</button>
       </div>}

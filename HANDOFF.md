@@ -23,6 +23,7 @@
 React/Vite, TypeScript, Express, Socket.IO, PostgreSQL com Drizzle, LiveKit para voz, PWA. Ficheiros principais: src/client/App.tsx, api.ts, styles.css, emoji-data.ts; src/server/index.ts, api.ts, security.ts, permissions.ts, profile-utils.ts, profile-realtime.ts, db/schema.ts; public/service-worker.js; drizzle/; tests/. Comandos: pnpm typecheck, pnpm test, pnpm build.
 
 ## 4. Estado atual
+O botão flutuante de conversas rápidas pode ser arrastado e encaixa na lateral mais próxima; a posição lateral e vertical é guardada neste aparelho, o botão recolhe após 10 segundos sem uso e pode ser reposicionado por toque, rato ou teclado.
 Feito no código: registo, login, sessões, comunidades públicas e privadas, convites básicos, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono. Etapa 5 concluída: barra do utilizador com microfone, auscultadores, definições e menus responsivos; preferências de áudio locais, teste de microfone, integração com voz/chamadas e correção da altura da lista de mensagens. Etapa 6 concluída: cartão de perfil compacto e expansível para o próprio e outros membros, banner por link ou cor de fallback, texto e preferência de presença, presença invisível tratada como offline no servidor, privacidade de banner/estado, editor por separadores, pré-visualização, validação HTTPS e testes unitários; aguarda deploy do dono. Etapa 7 concluída no código: armazenamento S3 privado, rotas protegidas, validação/quotas, envio, visualização, descarregamento, renovação de URLs, limpeza de anexos, pré-visualizações, compressão local de imagens e testes; migração 0010 aplicada pelo dono. Aguarda configuração do bucket privado e deploy pelo dono.
 Ainda NÃO existe: emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
 
@@ -33,6 +34,7 @@ Ainda NÃO existe: emojis personalizados e stickers, mensagens privadas (DMs), c
 4. Migração 0008, aplicada pelo dono: coluna nullable community_bans.expires_at (timestamp with time zone).
 5. Migração 0009, aplicada pelo dono: banner_url, banner_color, status_text, presence_preference e show_banner na tabela users.
 6. Migração 0010, aplicada pelo dono: nova tabela message_attachments, índices message_id/user_id e RLS ativo.
+Nota: o ajuste do botão flutuante é apenas de interface e não requer alteração SQL; a migração mais recente continua a ser a 0010.
 
 ## 6. Fila de etapas (o dono envia o pedido de cada uma, por esta ordem)
 4 Menu das mensagens ao premir (sem os três pontos), silenciar e banir por tempo. SQL (1 coluna: community_bans.expires_at).
