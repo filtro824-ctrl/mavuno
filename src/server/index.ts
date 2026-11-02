@@ -117,6 +117,7 @@ if (process.env.NODE_ENV === 'production') {
   app.use(express.static(clientDir, { fallthrough: true, maxAge: '1h', index: false }));
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api/') || req.path.startsWith('/socket.io/')) { res.status(404).json({ error: 'Não encontrado.' }); return; }
+    if (/^\/invite\/[\w-]{32,64}$/.test(req.path)) { res.setHeader('Cache-Control', 'no-store'); res.setHeader('Referrer-Policy', 'no-referrer'); }
     res.sendFile(resolve(clientDir, 'index.html'), (error) => { if (error) next(error); });
   });
 } else {
@@ -126,6 +127,7 @@ if (process.env.NODE_ENV === 'production') {
   app.use(express.static(publicDir, { fallthrough: true }));
   app.get('*', async (req, res, next) => {
     if (req.path.startsWith('/api/') || req.path.startsWith('/socket.io/')) { res.status(404).json({ error: 'Não encontrado.' }); return; }
+    if (/^\/invite\/[\w-]{32,64}$/.test(req.path)) { res.setHeader('Cache-Control', 'no-store'); res.setHeader('Referrer-Policy', 'no-referrer'); }
     try {
       const template = await import('node:fs/promises').then((fs) => fs.readFile(resolve(root, 'src/client/index.html'), 'utf8'));
       res.status(200).set({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }).end(await vite.transformIndexHtml(req.originalUrl, template));

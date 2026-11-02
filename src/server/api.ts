@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { AccessToken } from 'livekit-server-sdk';
 import { db, pool } from './db/index.js';
 import {
-  channels, communities, communityMembers, communityRoles, invitations, messages,
+  channels, communities, communityMembers, communityRoles, messages, joinRequests,
   messageMentions, rolePermissions, sessions, users, voiceRooms, communityBans, communityMutes,
   moderationAuditLogs, privateCalls, messageReactions, messageAttachments,
 } from './db/schema.js';
@@ -21,6 +21,7 @@ import { MAX_ATTACHMENTS_PER_MESSAGE, signatureMatches } from './attachment-util
 import { createProfileMediaRouter } from './profile-media-api.js';
 import { PROFILE_MEDIA_MAX_BYTES, makeProfileMediaReference, parseProfileMediaReference, profileMediaObjectKey, profileMediaStagingObjectKey } from './profile-media-utils.js';
 import { copyStoredObject, deleteStoredObject, inspectStoredObject, storageIsConfigured } from './storage.js';
+import { createJoinFlowRouter, createPublicInvitePreviewRouter } from './join-flow-api.js';
 
 const replyMessages = alias(messages, 'reply_messages');
 const replyAuthors = alias(users, 'reply_authors');
@@ -226,7 +227,9 @@ export function createApi(io: SocketServer): Router {
     res.status(503).json({ error: 'A recuperação por email ainda não está configurada. Contacta o administrador do serviço.' });
   }));
 
+  router.use(createPublicInvitePreviewRouter());
   router.use(requireAuth);
+  router.use(createJoinFlowRouter(io));
   router.use(createAttachmentsRouter(io));
   router.use(createProfileMediaRouter());
   router.get('/auth/me', (_req, res) => res.json({ user: currentUser(res) }));
@@ -427,28 +430,31 @@ export function createApi(io: SocketServer): Router {
 
   router.get('/communities/:communityId', asyncRoute(async (req, res) => {
     if (!uuid.safeParse(req.params.communityId).success) { res.status(400).json({ error: 'Comunidade inválida.' }); return; }
-    const [community] = await db.select({ id: communities.id, name: communities.name, slug: communities.slug, description: communities.description, category: communities.category, imageUrl: communities.imageUrl, rules: communities.rules, isPrivate: communities.isPrivate, ownerId: communities.ownerId })
+    const [community] = await db.select({ id: communities.id, name: communities.name, slug: communities.slug, description: communities.description, category: communities.category, imageUrl: communities.imageUrl, rules: communities.rules, welcomeMessage: communities.welcomeMessage, requireApproval: communities.requireApproval, isPrivate: communities.isPrivate, ownerId: communities.ownerId })
       .from(communities).where(eq(communities.id, req.params.communityId)).limit(1);
     if (!community || (community.isPrivate && !(await isMember(currentUser(res).id, community.id)))) { res.status(404).json({ error: 'Comunidade não encontrada.' }); return; }
-    if (await activeBan(community.id, currentUser(res).id)) { res.status(403).json({ error: 'O teu acesso a esta comunidade está banido.' }); return; }
+    if (await activeBan(community.id, currentUser(res).id)) { res.status(403).json({ error: 'Não foi possível entrar nesta comunidade.' }); return; }
     const mine = await db.select({ role: communityRoles.key }).from(communityMembers).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
       .where(and(eq(communityMembers.userId, currentUser(res).id), eq(communityMembers.communityId, community.id))).limit(1);
     const permissionRows = await db.select({ permission: rolePermissions.permission }).from(communityMembers)
       .innerJoin(rolePermissions, eq(communityMembers.roleId, rolePermissions.roleId))
       .where(and(eq(communityMembers.userId, currentUser(res).id), eq(communityMembers.communityId, community.id)));
+    const canReviewJoinRequests = permissionRows.some((row) => row.permission === 'manage_members');
+    const [pendingJoinCount] = canReviewJoinRequests ? await db.select({ value: count() }).from(joinRequests)
+      .where(and(eq(joinRequests.communityId, community.id), eq(joinRequests.status, 'pending'))) : [];
     const memberRows = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar, role: communityRoles.key })
       .from(communityMembers).innerJoin(users, eq(communityMembers.userId, users.id)).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
       .where(eq(communityMembers.communityId, community.id)).orderBy(users.username).limit(100);
     const channelRows = await db.select({ id: channels.id, name: channels.name, topic: channels.topic, kind: channels.kind })
       .from(channels).where(eq(channels.communityId, community.id)).orderBy(channels.createdAt);
     const members = memberRows.map(({ role, ...member }) => ({ ...visibleMemberIdentity(member), role }));
-    res.json({ community, myRole: mine[0]?.role ?? null, myPermissions: permissionRows.map((row) => row.permission), members, channels: channelRows });
+    res.json({ community, myRole: mine[0]?.role ?? null, myPermissions: permissionRows.map((row) => row.permission), members, channels: channelRows, pendingJoinRequests: pendingJoinCount?.value ?? 0 });
   }));
 
   router.patch('/communities/:communityId', asyncRoute(async (req, res) => {
     const communityId = req.params.communityId;
     if (!await hasPermission(currentUser(res).id, communityId, 'manage_community')) { res.status(403).json({ error: 'Não tens permissão para gerir a comunidade.' }); return; }
-    const input = z.object({ name: z.string().trim().min(2).max(80).optional(), description: z.string().trim().max(500).optional(), category: z.string().trim().min(1).max(40).optional(), imageUrl: z.string().url().max(500).startsWith('https://').nullable().optional(), rules: z.string().trim().max(4000).optional() }).safeParse(req.body);
+    const input = z.object({ name: z.string().trim().min(2).max(80).optional(), description: z.string().trim().max(500).optional(), category: z.string().trim().min(1).max(40).optional(), imageUrl: z.string().url().max(500).startsWith('https://').nullable().optional(), rules: z.string().trim().max(4000).optional(), welcomeMessage: z.string().trim().max(1000).optional(), requireApproval: z.boolean().optional() }).safeParse(req.body);
     if (!input.success || Object.keys(input.data).length === 0) { res.status(400).json({ error: 'Dados da comunidade inválidos.' }); return; }
     const [updated] = await db.update(communities).set(input.data).where(eq(communities.id, communityId)).returning();
     if (!updated) { res.status(404).json({ error: 'Comunidade não encontrada.' }); return; }
@@ -464,32 +470,6 @@ export function createApi(io: SocketServer): Router {
     await db.delete(communityMembers).where(and(eq(communityMembers.communityId, communityId), eq(communityMembers.userId, currentUser(res).id)));
     await removeCommunitySocketAccess(io, currentUser(res).id, communityId);
     res.json({ ok: true });
-  }));
-
-  router.post('/communities/:communityId/invites', asyncRoute(async (req, res) => {
-    const communityId = req.params.communityId;
-    if (!await hasPermission(currentUser(res).id, communityId, 'create_invites')) { res.status(403).json({ error: 'Não tens permissão para criar convites.' }); return; }
-    const input = z.object({ expiresInHours: z.number().int().min(1).max(720).default(168), maxUses: z.number().int().min(1).max(500).nullable().default(null) }).safeParse(req.body ?? {});
-    if (!input.success) { res.status(400).json({ error: 'Opções de convite inválidas.' }); return; }
-    const token = createOpaqueToken();
-    await db.insert(invitations).values({ communityId, createdBy: currentUser(res).id, tokenHash: digestToken(token), expiresAt: new Date(Date.now() + input.data.expiresInHours * 3600_000), maxUses: input.data.maxUses });
-    res.status(201).json({ inviteUrl: `/invite/${token}`, token });
-  }));
-
-  router.post('/invites/:token/join', asyncRoute(async (req, res) => {
-    if (!/^[\w-]{32,64}$/.test(req.params.token)) { res.status(404).json({ error: 'Convite inválido ou expirado.' }); return; }
-    const [invite] = await db.select().from(invitations).where(eq(invitations.tokenHash, digestToken(req.params.token))).limit(1);
-    if (!invite || (invite.expiresAt && invite.expiresAt <= new Date()) || (invite.maxUses !== null && invite.useCount >= invite.maxUses)) { res.status(404).json({ error: 'Convite inválido ou expirado.' }); return; }
-    const already = await isMember(currentUser(res).id, invite.communityId);
-    if (already) { res.json({ communityId: invite.communityId, alreadyMember: true }); return; }
-    if (await activeBan(invite.communityId, currentUser(res).id)) { res.status(403).json({ error: 'Não podes entrar nesta comunidade enquanto o banimento estiver ativo.' }); return; }
-    const [claimed] = await db.update(invitations).set({ useCount: sql`${invitations.useCount} + 1` })
-      .where(and(eq(invitations.id, invite.id), or(isNull(invitations.maxUses), sql`${invitations.useCount} < ${invitations.maxUses}`), or(isNull(invitations.expiresAt), gt(invitations.expiresAt, new Date())))).returning({ id: invitations.id });
-    if (!claimed) { res.status(409).json({ error: 'O convite atingiu o limite de utilizações.' }); return; }
-    await db.insert(communityMembers).values({ communityId: invite.communityId, userId: currentUser(res).id, roleId: await roleIdFor(invite.communityId, 'member') }).onConflictDoNothing();
-    const [joiningUser] = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar }).from(users).where(eq(users.id, currentUser(res).id)).limit(1);
-    if (joiningUser) await broadcastCommunityMembers(io, invite.communityId, 'community:member_joined', { communityId: invite.communityId, member: { ...visibleMemberIdentity(joiningUser), role: 'member' } });
-    res.json({ communityId: invite.communityId, alreadyMember: false });
   }));
 
   router.post('/communities/:communityId/channels', asyncRoute(async (req, res) => {

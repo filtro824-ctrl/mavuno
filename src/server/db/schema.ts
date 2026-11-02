@@ -1,4 +1,5 @@
 import { pgTable, pgEnum, uuid, varchar, text, boolean, timestamp, integer, uniqueIndex, index } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 
 export const roleKey = pgEnum('role_key', ['owner', 'admin', 'moderator', 'member']);
 export const permissionKey = pgEnum('permission_key', [
@@ -44,6 +45,8 @@ export const communities = pgTable('communities', {
   category: varchar('category', { length: 40 }).notNull().default('Geral'),
   imageUrl: text('image_url'),
   rules: varchar('rules', { length: 4000 }).notNull().default(''),
+  welcomeMessage: varchar('welcome_message', { length: 1000 }).notNull().default(''),
+  requireApproval: boolean('require_approval').notNull().default(false),
   isPrivate: boolean('is_private').notNull().default(false),
   ownerId: uuid('owner_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -68,6 +71,7 @@ export const communityMembers = pgTable('community_members', {
   userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
   roleId: uuid('role_id').notNull().references(() => communityRoles.id, { onDelete: 'restrict' }),
   joinedAt: timestamp('joined_at', { withTimezone: true }).notNull().defaultNow(),
+  rulesAcceptedAt: timestamp('rules_accepted_at', { withTimezone: true }),
 }, (t) => [uniqueIndex('community_member_unique').on(t.communityId, t.userId), index('members_user_idx').on(t.userId)]);
 
 export const channels = pgTable('channels', {
@@ -157,7 +161,23 @@ export const invitations = pgTable('invitations', {
   maxUses: integer('max_uses'),
   useCount: integer('use_count').notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
 });
+
+export const joinRequests = pgTable('join_requests', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'cascade' }),
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  invitationId: uuid('invitation_id').references(() => invitations.id, { onDelete: 'set null' }),
+  status: varchar('status', { length: 10 }).notNull().default('pending'),
+  decidedBy: uuid('decided_by').references(() => users.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  decidedAt: timestamp('decided_at', { withTimezone: true }),
+}, (t) => [
+  uniqueIndex('join_requests_pending_user_community_unique').on(t.communityId, t.userId).where(sql`${t.status} = 'pending'`),
+  index('join_requests_community_idx').on(t.communityId),
+  index('join_requests_status_idx').on(t.status),
+]);
 
 export const voiceRooms = pgTable('voice_rooms', {
   id: uuid('id').defaultRandom().primaryKey(),
