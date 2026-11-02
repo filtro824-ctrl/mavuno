@@ -17,7 +17,10 @@ import { broadcastProfileUpdate } from './profile-realtime.js';
 import { canActOnHierarchy, durationInRange, durationSeconds } from './moderation-utils.js';
 import type { Server as SocketServer } from 'socket.io';
 import { attachmentsForMessages, createAttachmentsRouter, deleteChannelWithAttachments, removeMessageAttachments } from './attachments-api.js';
-import { MAX_ATTACHMENTS_PER_MESSAGE } from './attachment-utils.js';
+import { MAX_ATTACHMENTS_PER_MESSAGE, signatureMatches } from './attachment-utils.js';
+import { createProfileMediaRouter } from './profile-media-api.js';
+import { PROFILE_MEDIA_MAX_BYTES, makeProfileMediaReference, parseProfileMediaReference, profileMediaObjectKey, profileMediaStagingObjectKey } from './profile-media-utils.js';
+import { copyStoredObject, deleteStoredObject, inspectStoredObject, storageIsConfigured } from './storage.js';
 
 const replyMessages = alias(messages, 'reply_messages');
 const replyAuthors = alias(users, 'reply_authors');
@@ -225,6 +228,7 @@ export function createApi(io: SocketServer): Router {
 
   router.use(requireAuth);
   router.use(createAttachmentsRouter(io));
+  router.use(createProfileMediaRouter());
   router.get('/auth/me', (_req, res) => res.json({ user: currentUser(res) }));
   router.get('/profile', asyncRoute(async (_req, res) => {
     const profile = await loadOwnProfile(currentUser(res).id);
@@ -233,7 +237,60 @@ export function createApi(io: SocketServer): Router {
   }));
   router.patch('/profile', asyncRoute(async (req, res) => {
     const input = profileUpdateSchema.safeParse(req.body);
-    if (!input.success) { res.status(400).json({ error: 'Confirma os links HTTPS, as cores e os textos (máximo 160 caracteres).' }); return; }
+    if (!input.success) { res.status(400).json({ error: 'Confirma os links HTTPS, as imagens, as cores e os textos.' }); return; }
+    const userId = currentUser(res).id;
+    const uploadCandidates = [
+      input.data.avatarUploadId ? { kind: 'avatar' as const, uploadId: input.data.avatarUploadId } : null,
+      input.data.bannerUploadId ? { kind: 'banner' as const, uploadId: input.data.bannerUploadId } : null,
+    ].filter((item): item is { kind: 'avatar' | 'banner'; uploadId: string } => item !== null)
+      .map((item) => ({ ...item, temporaryKey: profileMediaStagingObjectKey(userId, item.kind, item.uploadId), finalKey: profileMediaObjectKey(userId, item.kind, item.uploadId), reference: makeProfileMediaReference(userId, item.kind, item.uploadId) }));
+    let protectedFinalKeys = new Set<string>();
+    const cleanupCandidates = async (includeFinal: boolean, additionalProtectedKeys = new Set<string>()) => {
+      const safeProtectedKeys = new Set([...protectedFinalKeys, ...additionalProtectedKeys]);
+      if (includeFinal) {
+        try {
+          const [current] = await db.select({ avatarUrl: users.avatarUrl, bannerUrl: users.bannerUrl }).from(users).where(eq(users.id, userId)).limit(1);
+          for (const value of [current?.avatarUrl, current?.bannerUrl]) {
+            if (!value) continue;
+            const reference = parseProfileMediaReference(value);
+            if (reference?.userId === userId) safeProtectedKeys.add(profileMediaObjectKey(reference.userId, reference.kind, reference.assetId));
+          }
+        } catch {
+          for (const item of uploadCandidates) safeProtectedKeys.add(item.finalKey);
+        }
+      }
+      const keys = uploadCandidates.flatMap((item) => [item.temporaryKey, ...(includeFinal && !safeProtectedKeys.has(item.finalKey) ? [item.finalKey] : [])]);
+      await Promise.all(keys.map(async (key) => { try { await deleteStoredObject(key); } catch { /* Staging cleanup is retried by the bucket lifecycle rule. */ } }));
+    };
+    if (uploadCandidates.length) {
+      if (!storageIsConfigured()) { res.status(503).json({ error: 'O envio de imagens ainda não está disponível. Tenta mais tarde.' }); return; }
+      const [current] = await db.select({ avatarUrl: users.avatarUrl, bannerUrl: users.bannerUrl }).from(users).where(eq(users.id, userId)).limit(1);
+      if (!current) { res.status(404).json({ error: 'Não foi possível encontrar o teu perfil.' }); return; }
+      protectedFinalKeys = new Set([current.avatarUrl, current.bannerUrl].flatMap((value) => {
+        if (!value) return [];
+        const reference = parseProfileMediaReference(value);
+        return reference?.userId === userId ? [profileMediaObjectKey(reference.userId, reference.kind, reference.assetId)] : [];
+      }));
+      if (uploadCandidates.some((item) => protectedFinalKeys.has(item.finalKey))) {
+        await cleanupCandidates(false);
+        res.status(400).json({ error: 'Não foi possível validar a nova imagem. Escolhe-a novamente.' }); return;
+      }
+      try {
+        for (const item of uploadCandidates) {
+          const stored = await inspectStoredObject(item.temporaryKey);
+          if (stored.sizeBytes === null || stored.sizeBytes <= 0 || stored.sizeBytes > PROFILE_MEDIA_MAX_BYTES || !signatureMatches('image/jpeg', stored.firstBytes)) {
+            throw new Error('invalid profile image');
+          }
+          await copyStoredObject(item.temporaryKey, item.finalKey, 'image/jpeg');
+        }
+      } catch (error) {
+        await cleanupCandidates(true, protectedFinalKeys);
+        const statusCode = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+        const invalidImage = error instanceof Error && error.message === 'invalid profile image';
+        if (invalidImage || statusCode === 404) { res.status(400).json({ error: 'A imagem não pôde ser confirmada. Tenta escolher e guardar novamente.' }); return; }
+        res.status(503).json({ error: 'O envio de imagens ainda não está disponível. Tenta mais tarde.' }); return;
+      }
+    }
     const changes: {
       username?: string;
       avatarUrl?: string | null;
@@ -250,8 +307,16 @@ export function createApi(io: SocketServer): Router {
       presencePreference?: 'online' | 'away' | 'dnd' | 'invisible';
       showBanner?: boolean;
     } = {};
-    const { visibility, ...profileFields } = input.data;
+    const profileFields = { ...input.data };
+    delete profileFields.visibility;
+    delete profileFields.avatarUploadId;
+    delete profileFields.bannerUploadId;
+    const visibility = input.data.visibility;
     Object.assign(changes, profileFields);
+    for (const item of uploadCandidates) {
+      if (item.kind === 'avatar') changes.avatarUrl = item.reference;
+      else changes.bannerUrl = item.reference;
+    }
     if (visibility) Object.assign(changes, {
       showAvatar: visibility.avatar,
       showAbout: visibility.about,
@@ -261,14 +326,41 @@ export function createApi(io: SocketServer): Router {
       showEmail: visibility.email,
       showBanner: visibility.banner,
     });
+    let previousImages: { avatarUrl: string | null; bannerUrl: string | null };
+    let profileCommitSucceeded = false;
     try {
-      const userId = currentUser(res).id;
-      await db.update(users).set(changes).where(eq(users.id, userId));
+      const result = await db.transaction(async (tx) => {
+        const [current] = await tx.select({ avatarUrl: users.avatarUrl, bannerUrl: users.bannerUrl }).from(users).where(eq(users.id, userId)).for('update');
+        if (!current) return { error: 'missing' as const };
+        const requestedAvatar = input.data.avatarUrl;
+        const requestedBanner = input.data.bannerUrl;
+        const avatarReference = typeof requestedAvatar === 'string' ? parseProfileMediaReference(requestedAvatar) : null;
+        const bannerReference = typeof requestedBanner === 'string' ? parseProfileMediaReference(requestedBanner) : null;
+        if (avatarReference && (avatarReference.userId !== userId || avatarReference.kind !== 'avatar' || (!input.data.avatarUploadId && requestedAvatar !== current.avatarUrl))) return { error: 'reference' as const };
+        if (bannerReference && (bannerReference.userId !== userId || bannerReference.kind !== 'banner' || (!input.data.bannerUploadId && requestedBanner !== current.bannerUrl))) return { error: 'reference' as const };
+        await tx.update(users).set(changes).where(eq(users.id, userId));
+        return { previous: current };
+      });
+      if ('error' in result) {
+        await cleanupCandidates(true, protectedFinalKeys);
+        res.status(result.error === 'missing' ? 404 : 400).json({ error: result.error === 'missing' ? 'Não foi possível encontrar o teu perfil.' : 'A imagem selecionada não pertence a este perfil.' }); return;
+      }
+      previousImages = result.previous;
+      profileCommitSucceeded = true;
       const profile = await loadOwnProfile(userId);
       if (!profile) { res.status(404).json({ error: 'Não foi possível encontrar o teu perfil.' }); return; }
+      const replacedKeys = (['avatar', 'banner'] as const).flatMap((kind) => {
+        const previous = kind === 'avatar' ? previousImages.avatarUrl : previousImages.bannerUrl;
+        const next = kind === 'avatar' ? profile.user.avatarUrl : profile.user.bannerUrl;
+        if (!previous || previous === next) return [];
+        const reference = parseProfileMediaReference(previous);
+        return reference?.userId === userId && reference.kind === kind ? [profileMediaObjectKey(userId, kind, reference.assetId)] : [];
+      });
+      await Promise.all([...uploadCandidates.map((item) => item.temporaryKey), ...replacedKeys].map(async (key) => { try { await deleteStoredObject(key); } catch { console.error('Could not clean a replaced profile image object.'); } }));
       void broadcastProfileUpdate(io, userId).catch(() => undefined);
       res.json(profile);
     } catch (error) {
+      if (!profileCommitSucceeded) await cleanupCandidates(true, protectedFinalKeys);
       if ((error as { code?: string }).code === '23505') { res.status(409).json({ error: 'Esse nome de utilizador já está em uso.' }); return; }
       throw error;
     }

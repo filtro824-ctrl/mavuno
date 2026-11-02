@@ -93,6 +93,8 @@ No fornecedor, configura CORS para permitir apenas a origem `https://mavuno-qfed
 
 No runtime do servidor, configura as cinco variáveis secretas `STORAGE_ENDPOINT`, `STORAGE_BUCKET`, `STORAGE_REGION`, `STORAGE_ACCESS_KEY_ID` e `STORAGE_SECRET_ACCESS_KEY`. O endpoint deve ser o endpoint S3 do fornecedor; o cliente usa endereçamento compatível com buckets privados. Se alguma variável estiver em falta, o resto da aplicação continua disponível e o envio mostra uma mensagem simples de indisponibilidade. Nunca coloques estas credenciais no bundle do cliente, no Git ou nos logs.
 
+As fotografias de perfil e de fundo também usam este bucket privado. O navegador envia primeiro para o prefixo temporário `profile-upload-pending/`; após a validação e a gravação do perfil, o servidor promove o ficheiro para `profile-media/` e remove o temporário. Configura uma regra de ciclo de vida no fornecedor para apagar objetos em `profile-upload-pending/` com mais de 1 dia, cobrindo envios interrompidos antes de o perfil ser guardado. Não tornes nenhum destes prefixos público. As imagens antigas por HTTPS mantêm-se até o utilizador guardar uma substituição.
+
 ## Planos Free/Pro e pagamentos
 
 O estado entregue nesta versão não contém um modelo de subscrição Free/Pro, regras de limites pagas, cobrança, renovação ou ativação de funcionalidades Pro. Não há qualquer endpoint ou ecrã que apresente uma subscrição como ativa; estes pontos permanecem pendentes e devem ser implementados no backend antes de serem expostos na interface.

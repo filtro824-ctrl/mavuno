@@ -42,7 +42,7 @@ app.use(helmet({
     defaultSrc: ["'self'"],
     scriptSrc: ["'self'"],
     styleSrc: process.env.NODE_ENV === 'production' ? ["'self'"] : ["'self'", "'unsafe-inline'"],
-    imgSrc: ["'self'", 'data:', ...(storageOrigin ? [storageOrigin] : [])],
+    imgSrc: ["'self'", 'data:', 'blob:', 'https:', ...(storageOrigin ? [storageOrigin] : [])],
     connectSrc: ["'self'", ...(storageOrigin ? [storageOrigin] : [])],
     mediaSrc: ["'self'", 'blob:', ...(storageOrigin ? [storageOrigin] : [])],
     workerSrc: ["'self'", 'blob:'],

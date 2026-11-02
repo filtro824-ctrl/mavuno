@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { parseProfileMediaReference } from './profile-media-utils.js';
 
 export const presencePreferences = ['online', 'away', 'dnd', 'invisible'] as const;
 export type PresencePreference = typeof presencePreferences[number];
@@ -17,14 +18,18 @@ const httpsImageUrl = z.string().trim().min(1).max(500).url().refine((value) => 
   try { return new URL(value).protocol === 'https:'; }
   catch { return false; }
 }, 'A imagem deve usar uma ligação HTTPS.');
+const profileMediaReference = z.string().max(150).refine((value) => parseProfileMediaReference(value) !== null, 'A referência de imagem não é válida.');
+const profileImageUrl = z.union([httpsImageUrl, profileMediaReference]);
 const colorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/, 'A cor deve estar no formato #RRGGBB.');
 const presenceSchema = z.enum(presencePreferences);
 
 export const profileUpdateSchema = z.object({
   username: z.string().trim().min(3).max(32).regex(/^[\p{L}\p{N}_-]+$/u).optional(),
-  avatarUrl: z.union([httpsImageUrl, z.null()]).optional(),
+  avatarUrl: z.union([profileImageUrl, z.null()]).optional(),
+  avatarUploadId: z.string().uuid().optional(),
   aboutMe: z.string().trim().max(160).optional(),
-  bannerUrl: z.union([httpsImageUrl, z.null()]).optional(),
+  bannerUrl: z.union([profileImageUrl, z.null()]).optional(),
+  bannerUploadId: z.string().uuid().optional(),
   bannerColor: z.union([colorSchema, z.null()]).optional(),
   statusText: z.string().trim().max(80).optional(),
   presencePreference: presenceSchema.optional(),

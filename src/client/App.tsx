@@ -1,4 +1,4 @@
-import { type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type ChangeEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
@@ -8,10 +8,13 @@ import { toggleReactionSummary } from './reaction-state';
 import { applyDeafenState, audioOutputVolume, DEFAULT_AUDIO_PREFERENCES, microphoneConstraints, readAudioPreferences, writeAudioPreferences, type AudioPreferences, type VoiceProfile } from './audio-preferences';
 import { ActionMenuOverlay, MessageRow, ModerationPrompt, rectFor, type ActionMenuTarget, type DurationChoice, type MenuRect } from './message-actions';
 import { ATTACHMENT_TYPES, validateAttachmentMetadata, type AttachmentKind } from '../server/attachment-utils';
+import { profileMediaReferenceOwnedBy, type ProfileMediaKind } from '../server/profile-media-utils';
 import { clampFloatingPosition, FLOATING_BUTTON_SIZE, floatingTuckOffset, nearestFloatingSide, type FloatingSide } from './floating-button-utils';
+import { ProfileImageCropper } from './profile-image-cropper';
 
 type ModalType = 'community' | 'channel' | 'profile' | 'memberProfile' | 'account' | 'settings' | 'admin' | null;
 type PendingAttachment = { key: string; file: File; previewUrl: string; mimeType: string; kind: AttachmentKind; width: number | null; height: number | null; attachmentId?: string; progress: number; status: 'queued' | 'uploading' | 'ready' | 'failed'; error?: string };
+type ProfileSaveData = { username: string; avatarUrl: string | null; avatarFile?: File; aboutMe: string; bannerUrl: string | null; bannerFile?: File; bannerColor: string | null; statusText: string; presencePreference: 'online' | 'away' | 'dnd' | 'invisible'; visibility: ProfileVisibility };
 type FloatingPosition = { side: FloatingSide; top: number };
 type FloatingDragState = { pointerId: number; startX: number; startY: number; startLeft: number; startTop: number; moved: boolean };
 const FLOATING_POSITION_KEY = 'mavuno-floating-button-position-v1';
@@ -979,10 +982,31 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       notify('Silenciamento removido.');
     } catch { notify('Não foi possível remover o silêncio. Tenta de novo.'); }
   };
-  const updateProfile = async (data: { username: string; avatarUrl: string | null; aboutMe: string; bannerUrl: string | null; bannerColor: string | null; statusText: string; presencePreference: 'online' | 'away' | 'dnd' | 'invisible'; visibility: ProfileVisibility }) => {
+  const updateProfile = async (data: ProfileSaveData) => {
     setProfileBusy(true);
+    const stagedUploads: Array<{ kind: ProfileMediaKind; uploadId: string }> = [];
     try {
-      const result = await api<OwnProfileResponse>('/profile', { method: 'PATCH', body: JSON.stringify(data) });
+      const stageImage = async (kind: ProfileMediaKind, file: File): Promise<string> => {
+        const staged = await api<{ uploadId: string; uploadUrl: string }>('/profile/media/upload', { method: 'POST', body: JSON.stringify({ kind, mimeType: 'image/jpeg', sizeBytes: file.size }) });
+        stagedUploads.push({ kind, uploadId: staged.uploadId });
+        await uploadWithProgress(staged.uploadUrl, file, 'image/jpeg', () => undefined);
+        return staged.uploadId;
+      };
+      const avatarUploadId = data.avatarFile ? await stageImage('avatar', data.avatarFile) : undefined;
+      const bannerUploadId = data.bannerFile ? await stageImage('banner', data.bannerFile) : undefined;
+      const payload: Record<string, unknown> = {
+        username: data.username,
+        avatarUrl: data.avatarUrl,
+        aboutMe: data.aboutMe,
+        bannerUrl: data.bannerUrl,
+        bannerColor: data.bannerColor,
+        statusText: data.statusText,
+        presencePreference: data.presencePreference,
+        visibility: data.visibility,
+      };
+      if (avatarUploadId) { delete payload.avatarUrl; payload.avatarUploadId = avatarUploadId; }
+      if (bannerUploadId) { delete payload.bannerUrl; payload.bannerUploadId = bannerUploadId; }
+      const result = await api<OwnProfileResponse>('/profile', { method: 'PATCH', body: JSON.stringify(payload) });
       setOwnProfile(result);
       onUserChange(result.user);
       setDetails((current) => current ? { ...current, members: current.members.map((member) => member.id === user.id ? { ...member, username: result.user.username, avatarUrl: result.user.avatarUrl } : member) } : current);
@@ -990,7 +1014,10 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       setPinnedMessages((current) => current.map((message) => message.authorId === user.id ? { ...message, username: result.user.username, avatarUrl: result.user.avatarUrl } : message));
       setModal(null);
       notify('Perfil atualizado.');
-    } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível atualizar o perfil.'); }
+    } catch (cause) {
+      await Promise.allSettled(stagedUploads.map(({ kind, uploadId }) => api<{ ok: boolean }>(`/profile/media/upload/${kind}/${uploadId}`, { method: 'DELETE' })));
+      notify(cause instanceof Error ? cause.message : 'Não foi possível atualizar o perfil.');
+    }
     finally { setProfileBusy(false); }
   };
   const appClass = `app-shell ${mobileView === 'channels' ? 'mobile-channels' : 'mobile-chat'}`;
@@ -1338,6 +1365,11 @@ function safeHttps(value: string | null | undefined): string | null {
   if (!value?.trim()) return null;
   try { return new URL(value.trim()).protocol === 'https:' ? value.trim() : null; } catch { return null; }
 }
+function safeProfileImage(value: string | null | undefined, userId: string, kind: ProfileMediaKind): string | null {
+  if (!value?.trim()) return null;
+  const trimmed = value.trim();
+  return profileMediaReferenceOwnedBy(trimmed, userId, kind) ? trimmed : safeHttps(trimmed);
+}
 function presenceColor(presence?: string, online?: boolean): string {
   if (presence === 'away') return '#e8bd63';
   if (presence === 'dnd') return '#f07878';
@@ -1365,7 +1397,7 @@ function ProfileCompactCard({ profile, own, onExpand, onClose, onEdit, onStatus 
 
 function ProfileModal({ data, loading, error, online, busy, onClose, onReload, onLogout, onSave }: {
   data: OwnProfileResponse | null; loading: boolean; error: string; online: boolean; busy: boolean; onClose: () => void; onReload: () => void; onLogout: () => void;
-  onSave: (data: { username: string; avatarUrl: string | null; aboutMe: string; bannerUrl: string | null; bannerColor: string | null; statusText: string; presencePreference: 'online' | 'away' | 'dnd' | 'invisible'; visibility: ProfileVisibility }) => void;
+  onSave: (data: ProfileSaveData) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [tab, setTab] = useState<'profile' | 'appearance' | 'privacy' | 'account'>('profile');
@@ -1374,17 +1406,57 @@ function ProfileModal({ data, loading, error, online, busy, onClose, onReload, o
   const [presencePreference, setPresencePreference] = useState<'online' | 'away' | 'dnd' | 'invisible'>('online');
   const [visibility, setVisibility] = useState<ProfileVisibility>({ avatar: true, about: true, status: true, joinDate: true, commonCommunities: true, email: false, banner: true });
   const [savedSnapshot, setSavedSnapshot] = useState('');
+  const [avatarFile, setAvatarFile] = useState<File | null>(null); const [bannerFile, setBannerFile] = useState<File | null>(null);
+  const [cropSelection, setCropSelection] = useState<{ kind: ProfileMediaKind; file: File } | null>(null);
+  const [profileImageError, setProfileImageError] = useState(''); const [checkingImageStorage, setCheckingImageStorage] = useState(false);
+  const avatarPickerRef = useRef<HTMLInputElement>(null); const bannerPickerRef = useRef<HTMLInputElement>(null);
+  const previewUrlsRef = useRef(new Set<string>());
   useEffect(() => { if (!data) return; setUsername(data.user.username); setAvatarUrl(data.user.avatarUrl ?? ''); setAboutMe(data.user.aboutMe); setBannerUrl(data.user.bannerUrl ?? ''); setBannerColor(data.user.bannerColor); setStatusText(data.user.statusText); setPresencePreference(data.user.presencePreference); setVisibility(data.user.visibility); setSavedSnapshot(JSON.stringify(data.user)); }, [data]);
-  useEffect(() => { const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); }; document.addEventListener('keydown', closeOnEscape); return () => document.removeEventListener('keydown', closeOnEscape); }, [onClose]);
-  const draft = { username: username.trim(), avatarUrl: safeHttps(avatarUrl), aboutMe: aboutMe.trim(), bannerUrl: safeHttps(bannerUrl), bannerColor, statusText: statusText.trim(), presencePreference, visibility };
-  const dirty = Boolean(data && JSON.stringify({ ...data.user, ...draft }) !== savedSnapshot);
+  useEffect(() => () => { for (const url of previewUrlsRef.current) URL.revokeObjectURL(url); previewUrlsRef.current.clear(); }, []);
+  useEffect(() => { const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') { if (cropSelection) setCropSelection(null); else onClose(); } }; document.addEventListener('keydown', closeOnEscape); return () => document.removeEventListener('keydown', closeOnEscape); }, [cropSelection, onClose]);
+  const chooseProfileImage = async (kind: ProfileMediaKind) => {
+    setProfileImageError(''); setCheckingImageStorage(true);
+    try {
+      const status = await api<{ available: boolean }>('/profile/media/availability');
+      if (!status.available) { setProfileImageError('O envio de fotos ainda não está disponível. Podes continuar a usar um link.'); return; }
+      (kind === 'avatar' ? avatarPickerRef : bannerPickerRef).current?.click();
+    } catch (cause) { setProfileImageError(cause instanceof Error ? cause.message : 'Não foi possível verificar o envio de fotos.'); }
+    finally { setCheckingImageStorage(false); }
+  };
+  const selectProfileImage = (kind: ProfileMediaKind, event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (!file) return;
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type.toLowerCase())) { setProfileImageError('Escolhe uma imagem JPEG, PNG ou WebP.'); return; }
+    if (file.size <= 0 || file.size > 20 * 1024 * 1024) { setProfileImageError('A imagem original deve ter até 20 MB.'); return; }
+    setProfileImageError(''); setCropSelection({ kind, file });
+  };
+  const releaseCropPreview = (value: string) => {
+    if (value.startsWith('blob:')) { URL.revokeObjectURL(value); previewUrlsRef.current.delete(value); }
+  };
+  const updateImageLink = (kind: ProfileMediaKind, value: string) => {
+    if (kind === 'avatar') { releaseCropPreview(avatarUrl); setAvatarFile(null); setAvatarUrl(value); }
+    else { releaseCropPreview(bannerUrl); setBannerFile(null); setBannerUrl(value); }
+  };
+  const completeProfileCrop = (kind: ProfileMediaKind, file: File) => {
+    const previewUrl = URL.createObjectURL(file);
+    previewUrlsRef.current.add(previewUrl);
+    const previousUrl = kind === 'avatar' ? avatarUrl : bannerUrl;
+    releaseCropPreview(previousUrl);
+    if (kind === 'avatar') { setAvatarFile(file); setAvatarUrl(previewUrl); }
+    else { setBannerFile(file); setBannerUrl(previewUrl); }
+    setCropSelection(null); setProfileImageError('');
+  };
+  const currentUserId = data?.user.id ?? '';
+  const draft = { username: username.trim(), avatarUrl: avatarFile ? null : safeProfileImage(avatarUrl, currentUserId, 'avatar'), aboutMe: aboutMe.trim(), bannerUrl: bannerFile ? null : safeProfileImage(bannerUrl, currentUserId, 'banner'), bannerColor, statusText: statusText.trim(), presencePreference, visibility };
+  const dirty = Boolean(data && JSON.stringify({ ...data.user, ...draft }) !== savedSnapshot) || Boolean(avatarFile || bannerFile);
   const requestClose = () => { if (!dirty || window.confirm('Sair sem guardar?')) onClose(); };
-  const save = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); onSave({ ...draft }); };
-  const preview: MemberProfile = { id: data?.user.id ?? '', username: username || data?.user.username || 'Perfil', avatarUrl: visibility.avatar ? safeHttps(avatarUrl) : null, aboutMe: visibility.about ? aboutMe.trim() : undefined, bannerUrl: visibility.banner ? safeHttps(bannerUrl) : undefined, bannerColor: visibility.banner ? bannerColor : undefined, statusText: visibility.status ? statusText.trim() : undefined, online, presence: presencePreference };
+  const save = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); onSave({ ...draft, avatarFile: avatarFile ?? undefined, bannerFile: bannerFile ?? undefined }); };
+  const preview: MemberProfile = { id: currentUserId, username: username || data?.user.username || 'Perfil', avatarUrl: visibility.avatar ? (avatarFile ? avatarUrl : safeProfileImage(avatarUrl, currentUserId, 'avatar')) : null, aboutMe: visibility.about ? aboutMe.trim() : undefined, bannerUrl: visibility.banner ? (bannerFile ? bannerUrl : safeProfileImage(bannerUrl, currentUserId, 'banner')) : undefined, bannerColor: visibility.banner ? bannerColor : undefined, statusText: visibility.status ? statusText.trim() : undefined, online, presence: presencePreference };
   if (loading) return <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true"><p className="muted" role="status">A carregar o teu perfil…</p></section></div>;
   if (error || !data) return <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true"><p className="error-banner" role="alert">{error || 'Perfil não encontrado.'}</p><button className="secondary" onClick={onReload}>Tentar novamente</button></section></div>;
   if (!expanded) return <ProfileCompactCard profile={preview} own onExpand={() => setExpanded(true)} onClose={requestClose} onEdit={() => { setExpanded(true); setTab('profile'); }} onStatus={() => { setExpanded(true); setTab('profile'); }}/>
-  return createPortal(<div className="modal-backdrop expanded-profile-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) requestClose(); }}><section className="expanded-profile-panel" role="dialog" aria-modal="true" aria-labelledby="expanded-profile-title"><header className="profile-page-header"><button className="icon-button" onClick={requestClose} aria-label="Voltar">←</button><div><h2 id="expanded-profile-title">O teu perfil</h2><p className="muted">Vê e escolhe o que partilhas.</p></div></header><div className="expanded-profile-grid"><form onSubmit={save} className="profile-editor"><nav className="profile-tabs" aria-label="Secções do perfil">{(['profile', 'appearance', 'privacy', 'account'] as const).map((item) => <button type="button" key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item === 'profile' ? 'Perfil' : item === 'appearance' ? 'Aparência' : item === 'privacy' ? 'Privacidade' : 'Conta'}</button>)}</nav>{tab === 'profile' && <section className="profile-section"><h3>Perfil</h3><label className="field">Nome de utilizador<input value={username} onChange={(event) => setUsername(event.target.value)} minLength={3} maxLength={32} required/><small>O nome de utilizador é sempre público.</small></label><label className="field">Sobre mim<textarea value={aboutMe} onChange={(event) => setAboutMe(event.target.value.slice(0, 160))} maxLength={160} rows={4}/><small className="profile-counter">{aboutMe.length}/160</small></label><label className="field">Texto de estado<input value={statusText} onChange={(event) => setStatusText(event.target.value.slice(0, 80))} maxLength={80}/><small className="profile-counter">{statusText.length}/80</small></label><label className="field">Estado<select value={presencePreference} onChange={(event) => setPresencePreference(event.target.value as typeof presencePreference)}>{Object.entries(presenceLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>O estado Invisível aparece como desligado para os outros.</small></label></section>}{tab === 'appearance' && <section className="profile-section"><h3>Aparência</h3><label className="field">Foto de perfil (link)<input value={avatarUrl} onChange={(event) => setAvatarUrl(event.target.value)} placeholder="https://…"/><small>Cola o link de uma imagem.</small></label><label className="field">Imagem de fundo (link)<input value={bannerUrl} onChange={(event) => setBannerUrl(event.target.value)} placeholder="https://…"/><small>Cola o link de uma imagem. Para o fundo, uma imagem larga fica melhor.</small></label><div className="field"><span>Cor de fundo</span><div className="profile-color-grid"><button type="button" className={!bannerColor ? 'selected' : ''} onClick={() => setBannerColor(null)}>Nenhuma</button>{profileColors.map((color) => <button type="button" key={color} aria-label={color} className={bannerColor === color ? 'selected' : ''} style={{ backgroundColor: color }} onClick={() => setBannerColor(color)}/>)}</div></div></section>}{tab === 'privacy' && <section className="profile-section"><h3>Privacidade</h3><div className="privacy-list">{profileVisibilityOptions.map((option) => <label className="privacy-row" key={option.key}><span><strong>{option.title}</strong><small>{option.help}</small></span><input type="checkbox" checked={visibility[option.key]} onChange={(event) => setVisibility((current) => ({ ...current, [option.key]: event.target.checked }))}/></label>)}</div><button type="button" className="secondary privacy-preview-button" onClick={() => setTab('profile')}>Ver como os outros me veem</button></section>}{tab === 'account' && <section className="profile-section"><h3>Conta</h3><div className="profile-account-info"><div><strong>Email</strong><span>{data.user.email}</span></div><div><strong>Data de entrada</strong><span>{profileDate(data.user.createdAt)}</span></div><div><strong>Comunidades</strong><span>{data.communities.length ? data.communities.map((community) => community.name).join(', ') : 'Ainda não participas em comunidades.'}</span></div></div><button type="button" className="danger-button" onClick={() => { if (window.confirm('Queres terminar sessão?')) onLogout(); }}>Terminar sessão</button></section>}<div className="profile-actions"><button type="button" className="secondary" onClick={requestClose}>Descartar alterações</button><button className="primary" disabled={!dirty || busy}>{busy ? 'A guardar…' : 'Guardar'}</button></div></form><aside className="profile-live-preview"><h3>Pré-visualização</h3><ProfileCompactCard profile={preview} own={false} onExpand={() => undefined} onClose={() => undefined}/></aside></div></section></div>, document.body);
+  return createPortal(<div className="modal-backdrop expanded-profile-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) requestClose(); }}><section className="expanded-profile-panel" role="dialog" aria-modal="true" aria-labelledby="expanded-profile-title"><header className="profile-page-header"><button className="icon-button" onClick={requestClose} aria-label="Voltar">←</button><div><h2 id="expanded-profile-title">O teu perfil</h2><p className="muted">Vê e escolhe o que partilhas.</p></div></header><div className="expanded-profile-grid"><form onSubmit={save} className="profile-editor"><nav className="profile-tabs" aria-label="Secções do perfil">{(['profile', 'appearance', 'privacy', 'account'] as const).map((item) => <button type="button" key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item === 'profile' ? 'Perfil' : item === 'appearance' ? 'Aparência' : item === 'privacy' ? 'Privacidade' : 'Conta'}</button>)}</nav><input ref={avatarPickerRef} className="profile-file-input" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Escolher foto de perfil" onChange={(event) => selectProfileImage('avatar', event)}/><input ref={bannerPickerRef} className="profile-file-input" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Escolher imagem de fundo" onChange={(event) => selectProfileImage('banner', event)}/>{tab === 'profile' && <section className="profile-section"><h3>Perfil</h3><label className="field">Nome de utilizador<input value={username} onChange={(event) => setUsername(event.target.value)} minLength={3} maxLength={32} required/><small>O nome de utilizador é sempre público.</small></label><label className="field">Sobre mim<textarea value={aboutMe} onChange={(event) => setAboutMe(event.target.value.slice(0, 160))} maxLength={160} rows={4}/><small className="profile-counter">{aboutMe.length}/160</small></label><label className="field">Texto de estado<input value={statusText} onChange={(event) => setStatusText(event.target.value.slice(0, 80))} maxLength={80}/><small className="profile-counter">{statusText.length}/80</small></label><label className="field">Estado<select value={presencePreference} onChange={(event) => setPresencePreference(event.target.value as typeof presencePreference)}>{Object.entries(presenceLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>O estado Invisível aparece como desligado para os outros.</small></label></section>}{tab === 'appearance' && <section className="profile-section"><h3>Aparência</h3><div className="profile-image-field"><div><strong>Foto de perfil</strong><small>Escolhe uma fotografia e ajusta o recorte circular.</small></div><button type="button" className="secondary" onClick={() => void chooseProfileImage('avatar')} disabled={checkingImageStorage || busy}>Escolher foto</button></div><label className="field">Link da foto (opcional)<input value={avatarFile || profileMediaReferenceOwnedBy(avatarUrl, currentUserId, 'avatar') ? '' : avatarUrl} onChange={(event) => updateImageLink('avatar', event.target.value)} placeholder="https://…"/><small>As imagens que já tens continuam até guardares uma nova.</small></label>{avatarFile && <p className="profile-image-ready">Recorte pronto. Guarda o perfil para aplicar a foto.</p>}<div className="profile-image-field"><div><strong>Imagem de fundo</strong><small>Escolhe uma fotografia e ajusta o enquadramento largo.</small></div><button type="button" className="secondary" onClick={() => void chooseProfileImage('banner')} disabled={checkingImageStorage || busy}>Escolher imagem</button></div><label className="field">Link da imagem (opcional)<input value={bannerFile || profileMediaReferenceOwnedBy(bannerUrl, currentUserId, 'banner') ? '' : bannerUrl} onChange={(event) => updateImageLink('banner', event.target.value)} placeholder="https://…"/><small>Para o fundo, uma imagem larga fica melhor.</small></label>{bannerFile && <p className="profile-image-ready">Recorte pronto. Guarda o perfil para aplicar a imagem.</p>}{profileImageError && <p className="error-banner" role="alert">{profileImageError}</p>}<div className="field"><span>Cor de fundo</span><div className="profile-color-grid"><button type="button" className={!bannerColor ? 'selected' : ''} onClick={() => setBannerColor(null)}>Nenhuma</button>{profileColors.map((color) => <button type="button" key={color} aria-label={color} className={bannerColor === color ? 'selected' : ''} style={{ backgroundColor: color }} onClick={() => setBannerColor(color)}/>)}</div></div></section>}{tab === 'privacy' && <section className="profile-section"><h3>Privacidade</h3><div className="privacy-list">{profileVisibilityOptions.map((option) => <label className="privacy-row" key={option.key}><span><strong>{option.title}</strong><small>{option.help}</small></span><input type="checkbox" checked={visibility[option.key]} onChange={(event) => setVisibility((current) => ({ ...current, [option.key]: event.target.checked }))}/></label>)}</div><button type="button" className="secondary privacy-preview-button" onClick={() => setTab('profile')}>Ver como os outros me veem</button></section>}{tab === 'account' && <section className="profile-section"><h3>Conta</h3><div className="profile-account-info"><div><strong>Email</strong><span>{data.user.email}</span></div><div><strong>Data de entrada</strong><span>{profileDate(data.user.createdAt)}</span></div><div><strong>Comunidades</strong><span>{data.communities.length ? data.communities.map((community) => community.name).join(', ') : 'Ainda não participas em comunidades.'}</span></div></div><button type="button" className="danger-button" onClick={() => { if (window.confirm('Queres terminar sessão?')) onLogout(); }}>Terminar sessão</button></section>}<div className="profile-actions"><button type="button" className="secondary" onClick={requestClose}>Descartar alterações</button><button className="primary" disabled={!dirty || busy}>{busy ? 'A guardar…' : 'Guardar'}</button></div></form><aside className="profile-live-preview"><h3>Pré-visualização</h3><ProfileCompactCard profile={preview} own={false} onExpand={() => undefined} onClose={() => undefined}/></aside></div>{cropSelection && <ProfileImageCropper file={cropSelection.file} kind={cropSelection.kind} onCancel={() => setCropSelection(null)} onComplete={(file) => completeProfileCrop(cropSelection.kind, file)}/>}</section></div>, document.body);
 }
 
 function MemberProfileSheet({ profile, loading, error, onClose }: { profile: MemberProfile | null; loading: boolean; error: string; onClose: () => void }) {

@@ -1,4 +1,5 @@
 import {
+  CopyObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -72,7 +73,7 @@ function safeContentDisposition(name: string, mode: 'inline' | 'attachment'): st
   return `${mode}; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(safeName)}`;
 }
 
-export async function signReadUrl(storageKey: string, mimeType: string, originalName: string, download: boolean): Promise<string> {
+export async function signReadUrl(storageKey: string, mimeType: string, originalName: string, download: boolean, expiresIn = 3600): Promise<string> {
   const current = s3();
   if (!current) throw new Error('storage unavailable');
   const command = new GetObjectCommand({
@@ -82,7 +83,20 @@ export async function signReadUrl(storageKey: string, mimeType: string, original
     ResponseContentDisposition: safeContentDisposition(originalName, download ? 'attachment' : 'inline'),
     ResponseCacheControl: 'private, no-store',
   });
-  return getSignedUrl(current.client, command, { expiresIn: 3600 });
+  return getSignedUrl(current.client, command, { expiresIn });
+}
+
+export async function copyStoredObject(sourceKey: string, destinationKey: string, mimeType: string): Promise<void> {
+  const current = s3();
+  if (!current) throw new Error('storage unavailable');
+  const copySource = `/${current.settings.bucket}/${sourceKey.split('/').map(encodeURIComponent).join('/')}`;
+  await current.client.send(new CopyObjectCommand({
+    Bucket: current.settings.bucket,
+    Key: destinationKey,
+    CopySource: copySource,
+    ContentType: mimeType,
+    MetadataDirective: 'REPLACE',
+  }));
 }
 
 export async function inspectStoredObject(storageKey: string): Promise<{ sizeBytes: number | null; firstBytes: Uint8Array }> {
