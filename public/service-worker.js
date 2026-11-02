@@ -1,4 +1,4 @@
-const CACHE = 'mavuno-static-v14';
+const CACHE = 'mavuno-static-v15';
 const SHELL = ['/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (event) => {

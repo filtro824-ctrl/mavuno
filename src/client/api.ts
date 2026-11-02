@@ -4,10 +4,16 @@ export interface User { id: string; username: string; email: string; avatarUrl: 
 export interface OwnProfile extends User { aboutMe: string; bannerUrl: string | null; bannerColor: string | null; statusText: string; presencePreference: PresencePreference; createdAt: string; visibility: ProfileVisibility }
 export interface OwnProfileResponse { user: OwnProfile; communities: Array<{ id: string; name: string; role: string; joinedAt: string }> }
 export interface MemberProfile { id: string; username: string; avatarUrl?: string | null; aboutMe?: string; online?: boolean; presence?: PresencePreference; statusText?: string; bannerUrl?: string | null; bannerColor?: string | null; createdAt?: string; commonCommunities?: Array<{ id: string; name: string }>; email?: string; role?: string }
-export interface Community { id: string; name: string; slug: string; description: string; category: string; imageUrl?: string | null; rules?: string; isPrivate: boolean; role?: string | null }
+export interface Community { id: string; name: string; slug: string; description: string; category: string; imageUrl?: string | null; rules?: string; welcomeMessage?: string; requireApproval?: boolean; isPrivate: boolean; role?: string | null }
 export interface Channel { id: string; name: string; topic: string; kind: 'text' | 'voice' }
 export interface Member { id: string; username: string; avatarUrl?: string | null; role: string; mutedUntil?: string | null; banned?: boolean }
-export interface CommunityDetails { community: Community; myRole: string | null; myPermissions: string[]; members: Member[]; channels: Channel[] }
+export interface CommunityDetails { community: Community; myRole: string | null; myPermissions: string[]; members: Member[]; channels: Channel[]; pendingJoinRequests?: number }
+export interface InvitePreview { name: string; imageUrl: string | null; description: string; memberCount: number; valid: true }
+export interface JoinFlowInfo { id: string; name: string; description: string; imageUrl: string | null; rules: string; welcomeMessage: string; requireApproval: boolean; isPrivate: boolean; memberCount: number; alreadyMember: boolean; requestPending: boolean; requestId: string | null; invitationValid?: boolean }
+export type InviteDuration = '30m' | '1h' | '1d' | '7d' | 'never';
+export type InviteUseLimit = 1 | 5 | 25 | null;
+export interface ActiveInvitation { id: string; createdAt: string; expiresAt: string | null; maxUses: number | null; useCount: number; createdBy: string }
+export interface JoinRequest { id: string; createdAt: string; userId: string; username: string; avatarUrl?: string | null }
 export interface ReactionSummary { emoji: string; count: number; reactedByMe: boolean }
 export interface MessageAttachment { id: string; originalName: string; mimeType: string; sizeBytes: number; width: number | null; height: number | null; url: string }
 export interface Message { id: string; clientMessageId: string; body: string; replyToId: string | null; replyAuthor?: string | null; replyBody?: string | null; createdAt: string; pinnedAt?: string | null; pinnedBy?: string | null; authorId: string; username: string; avatarUrl?: string | null; reactions?: ReactionSummary[]; attachments?: MessageAttachment[]; delivery?: 'sending' | 'failed' }
