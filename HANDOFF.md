@@ -27,7 +27,8 @@ Etapa 9 concluída no código: escolha de fotografia no dispositivo, editor de r
 O botão flutuante de conversas rápidas pode ser arrastado e encaixa na lateral mais próxima; a posição lateral e vertical é guardada neste aparelho, o botão recolhe após 10 segundos sem uso e pode ser reposicionado por toque, rato ou teclado.
 Etapa 10 concluída no código: convites com durações e limites configuráveis, pré-visualização pública sem sessão em /invite/<código>, regras com aceitação obrigatória, mensagem de boas-vindas, entrada pública por pedido opcional, gestão e revogação de convites, aprovação/recusa/cancelamento de pedidos, cooldown de 24 horas, limite de 20 pedidos pendentes por utilizador, avisos em tempo real e permissões verificadas no servidor. Migração 0011 aplicada pelo dono; não foi alterado novamente o SQL aplicado.
 Feito no código: registo, login, sessões, comunidades públicas e privadas, convites, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono. Etapa 5 concluída: barra do utilizador com microfone, auscultadores, definições e menus responsivos; preferências de áudio locais, teste de microfone, integração com voz/chamadas e correção da altura da lista de mensagens. Etapa 6 concluída: cartão de perfil compacto e expansível, banner por link ou cor de fallback, texto e preferência de presença, presença invisível tratada como offline no servidor, privacidade de banner/estado, editor por separadores, pré-visualização, validação HTTPS e testes unitários; aguarda deploy do dono. Etapa 7 concluída no código: armazenamento S3 privado, rotas protegidas, validação/quotas, envio, visualização, descarregamento, renovação de URLs, limpeza de anexos, pré-visualizações, compressão local de imagens e testes; migração 0010 aplicada pelo dono. Aguarda configuração do bucket privado e deploy pelo dono.
-Ainda NÃO existe: emojis personalizados e stickers, mensagens privadas (DMs), categorias de canais, AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
+Etapa 11 concluída no código: categorias de canais recolhíveis e ordenáveis, contagens e avisos de não lidas em tempo real, canais só de leitura com permissões verificadas no servidor, capa de comunidade com cor de reserva e lista de banimentos ativos com revogação. Migração 0012 aplicada pelo dono; não foi alterado novamente o SQL aplicado.
+Ainda NÃO existe: emojis personalizados e stickers, mensagens privadas (DMs), AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
 
 ## 5. SQL já aplicado no Supabase (por ordem)
 1. Migrações 0000 a 0006 coladas juntas, sem as linhas "--> statement-breakpoint" (18 tabelas, incluindo message_reactions).
@@ -37,7 +38,8 @@ Ainda NÃO existe: emojis personalizados e stickers, mensagens privadas (DMs), c
 5. Migração 0009, aplicada pelo dono: banner_url, banner_color, status_text, presence_preference e show_banner na tabela users.
 6. Migração 0010, aplicada pelo dono: nova tabela message_attachments, índices message_id/user_id e RLS ativo.
 7. Migração 0011, aplicada pelo dono: colunas welcome_message e require_approval em communities, rules_accepted_at em community_members, revoked_at em invitations, tabela join_requests com índices e RLS ativo.
-Nota: o ajuste do botão flutuante e a etapa 9 não alteram o esquema; a etapa 10 usa a migração 0011 aplicada pelo dono. A etapa 9 usa o bucket privado já previsto, cuja configuração e regra de ciclo de vida continuam a cargo do dono.
+8. Migração 0012, aplicada pelo dono: categorias de canais, posição e leitura em channels, tabela channel_reads com RLS e campos de capa em communities.
+Nota: o ajuste do botão flutuante e a etapa 9 não alteram o esquema; a etapa 10 usa a migração 0011 e a etapa 11 usa a migração 0012, ambas aplicadas pelo dono. A etapa 9 usa o bucket privado já previsto, cuja configuração e regra de ciclo de vida continuam a cargo do dono.
 
 ## 6. Fila de etapas (o dono envia o pedido de cada uma, por esta ordem)
 4 Menu das mensagens ao premir (sem os três pontos), silenciar e banir por tempo. SQL (1 coluna: community_bans.expires_at).
@@ -47,7 +49,7 @@ Nota: o ajuste do botão flutuante e a etapa 9 não alteram o esquema; a etapa 1
 8 Emojis personalizados e stickers. SQL.
 9 Foto de perfil e imagem de fundo enviadas do telemóvel — concluída no código, sem SQL.
 10 Convites, boas-vindas com regras e pedidos de entrada — concluída nesta etapa, migração 0011 aplicada.
-11 Categorias de canais, não lidas, canais só de leitura, capa da comunidade, lista de banimentos ativos. SQL.
+11 Categorias de canais, não lidas, canais só de leitura, capa da comunidade, lista de banimentos ativos — concluída no código; migração 0012 aplicada pelo dono.
 12 Pré-visualização de links.
 13 Mensagens privadas (DMs). SQL.
 14 Favoritar, denunciar, encaminhar, copiar link, marcar como não lido. SQL.
@@ -55,7 +57,7 @@ Nota: o ajuste do botão flutuante e a etapa 9 não alteram o esquema; a etapa 1
 16 Voz real testada com dois telemóveis (configuração do dono com LiveKit).
 17 AutoMod. SQL.
 18 Notificações com o Mavuno fechado. SQL.
-Prioridade: 4, 5, 6, 7 e 10; depois 8, 9, 11 e 13. Próxima etapa: 8. Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
+Prioridade: 4, 5, 6, 7 e 10; depois 8, 9 e 13. Próxima etapa: 8. Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
 
 ## 7. Limitações conhecidas
 Voz sem LiveKit configurado e sem teste com dois aparelhos; anexos e fotos de perfil dependem da configuração do bucket privado no Render e da regra de ciclo de vida para profile-upload-pending/; sem recuperação de conta por email; sem planos nem pagamentos; sem notificações push.

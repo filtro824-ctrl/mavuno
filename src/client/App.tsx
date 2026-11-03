@@ -2,7 +2,7 @@ import { type ChangeEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEv
 import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
-import { api, prepareCsrf, type ActiveInvitation, type Channel, type Community, type CommunityDetails, type InviteDuration, type InvitePreview, type InviteUseLimit, type JoinFlowInfo, type JoinRequest, type Member, type MemberProfile, type Message, type MessageAttachment, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
+import { api, prepareCsrf, type ActiveInvitation, type Channel, type ChannelCategory, type Community, type CommunityDetails, type InviteDuration, type InvitePreview, type InviteUseLimit, type JoinFlowInfo, type JoinRequest, type Member, type MemberProfile, type Message, type MessageAttachment, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
 import { EMOJI_CATEGORIES, EMOJI_INDEX, type EmojiCategoryId } from './emoji-data';
 import { toggleReactionSummary } from './reaction-state';
 import { applyDeafenState, audioOutputVolume, DEFAULT_AUDIO_PREFERENCES, microphoneConstraints, readAudioPreferences, writeAudioPreferences, type AudioPreferences, type VoiceProfile } from './audio-preferences';
@@ -20,6 +20,7 @@ type FloatingDragState = { pointerId: number; startX: number; startY: number; st
 const FLOATING_POSITION_KEY = 'mavuno-floating-button-position-v1';
 const INVITE_RETURN_KEY = 'mavuno-invite-return-v1';
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
+const COVER_COLORS = ['#234B3B', '#356859', '#355070', '#4A4E69', '#6D597A', '#9B5DE5', '#C44536', '#E07A5F', '#D4A373', '#6B705C', '#264653', '#374151'];
 
 function readInviteToken(): string | null {
   const match = window.location.pathname.match(/^\/invite\/([\w-]{32,64})$/);
@@ -248,8 +249,11 @@ export default function App() {
 }
 
 function InvitePreviewCard({ preview }: { preview: InvitePreview }) {
+  const [failed, setFailed] = useState(false);
+  const image = preview.coverUrl ?? preview.imageUrl;
+  useEffect(() => setFailed(false), [image]);
   return <article className="invite-preview-card">
-    {preview.imageUrl ? <img className="invite-preview-cover" src={preview.imageUrl} alt="" referrerPolicy="no-referrer"/> : <div className="invite-preview-cover invite-preview-fallback" aria-hidden="true">m</div>}
+    <div className={`invite-preview-cover ${!image || failed ? 'invite-preview-fallback' : ''}`} style={{ backgroundColor: preview.coverColor ?? '#193124' }} aria-hidden="true">{image && !failed ? <img src={image} alt="" loading="lazy" referrerPolicy="no-referrer" onError={() => setFailed(true)}/> : 'm'}</div>
     <div className="invite-preview-copy"><span className="muted">Convite para a comunidade</span><h2>{preview.name}</h2><p>{preview.description || 'Uma comunidade Mavuno.'}</p><small>{preview.memberCount} {preview.memberCount === 1 ? 'membro' : 'membros'}</small></div>
   </article>;
 }
@@ -311,9 +315,52 @@ function AuthScreen({ onAuthed, notice, initialMode = 'login', invitePreview, on
   </section></main>;
 }
 
+const CATEGORY_COLLAPSE_KEY = 'mavuno.channel-categories-collapsed.v1';
+
+function CommunityCover({ community, compact = false }: { community: Pick<Community, 'name' | 'coverUrl' | 'coverColor'>; compact?: boolean }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [community.coverUrl]);
+  return <div className={`community-cover ${compact ? 'community-cover-compact' : ''}`} style={{ backgroundColor: community.coverColor ?? '#234b3b' }}>
+    {community.coverUrl && !failed && <img src={community.coverUrl} alt="" loading="lazy" referrerPolicy="no-referrer" onError={() => setFailed(true)}/>}
+    <strong>{community.name}</strong>
+  </div>;
+}
+
+function ChannelSidebar({ channels, categories, current, canManage, onSelect, onDelete }: { channels: Channel[]; categories: ChannelCategory[]; current: Channel | null; canManage: boolean; onSelect: (channel: Channel) => void; onDelete: (channel: Channel) => void }) {
+  const [collapsed, setCollapsed] = useState<string[]>(() => {
+    try { const value = JSON.parse(localStorage.getItem(CATEGORY_COLLAPSE_KEY) ?? '[]'); return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : []; }
+    catch { return []; }
+  });
+  const toggle = (id: string) => setCollapsed((current) => {
+    const next = current.includes(id) ? current.filter((item) => item !== id) : [...current, id];
+    try { localStorage.setItem(CATEGORY_COLLAPSE_KEY, JSON.stringify(next)); } catch { /* recolher continua disponível nesta sessão */ }
+    return next;
+  });
+  const renderChannel = (item: Channel) => <div className="channel-manage-row" key={item.id}>
+    <button className={`channel-row ${current?.id === item.id ? 'active' : ''} ${item.unreadCount ? 'channel-unread' : ''}`} onClick={() => onSelect(item)}>
+      <span title={item.readOnly ? 'Canal só de leitura' : undefined} aria-label={item.readOnly ? 'Canal só de leitura' : undefined}>{item.kind === 'voice' ? '◖' : item.readOnly ? '🔒' : '#'}</span><span className="channel-row-name">{item.name}</span>
+      {item.unreadCount ? item.hasMention ? <span className="unread-badge">{item.unreadCount > 99 ? '99+' : item.unreadCount}</span> : <span className="unread-dot" aria-label="Mensagens novas"/> : null}
+    </button>
+    {canManage && <button className="channel-delete" title={`Apagar ${item.name}`} aria-label={`Apagar canal ${item.name}`} onClick={() => onDelete(item)}>×</button>}
+  </div>;
+  const uncategorized = channels.filter((item) => !item.categoryId).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+  return <div className="channel-groups">
+    {uncategorized.map(renderChannel)}
+    {categories.slice().sort((a, b) => a.position - b.position).map((category) => {
+      const closed = collapsed.includes(category.id);
+      return <section className="channel-category" key={category.id}>
+        <button className="channel-category-heading" aria-expanded={!closed} onClick={() => toggle(category.id)}><span aria-hidden="true">{closed ? '›' : '⌄'}</span>{category.name.toLocaleUpperCase()}</button>
+        {!closed && channels.filter((item) => item.categoryId === category.id).sort((a, b) => (a.position ?? 0) - (b.position ?? 0)).map(renderChannel)}
+      </section>;
+    })}
+  </div>;
+}
+
 function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }: { user: User; onUserChange: (user: User) => void; onLogout: () => void; inviteToken: string | null; onClearInvite: () => void }) {
   const [communities, setCommunities] = useState<Community[]>([]);
   const [details, setDetails] = useState<CommunityDetails | null>(null);
+  const detailsRef = useRef<CommunityDetails | null>(details);
+  detailsRef.current = details;
   const [channel, setChannel] = useState<Channel | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [loadingMessages, setLoadingMessages] = useState(false);
@@ -443,7 +490,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
   const canManageCommunity = details?.myPermissions.includes('manage_community') ?? false;
   const canManageRequests = details?.myPermissions.includes('manage_members') ?? false;
   const canCreateInvites = details?.myPermissions.includes('create_invites') ?? false;
-  const canOpenAdmin = canKick || canManageCommunity || canManageRequests || canCreateInvites || (details?.myPermissions.includes('view_audit_log') ?? false);
+  const canOpenAdmin = canKick || canManageCommunity || canManageRequests || canCreateInvites || (details?.myPermissions.includes('manage_channels') ?? false) || (details?.myPermissions.includes('view_audit_log') ?? false);
   const activeCommunityId = details?.community.id;
   const quickItems = useMemo(() => communities.map((community) => ({ id: community.id, name: community.name })), [communities]);
 
@@ -536,6 +583,8 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     try {
       const data = await api<CommunityDetails>(`/communities/${id}`);
       setDetails(data);
+      const unreadCount = Math.min(99, data.channels.reduce((total, item) => total + (item.unreadCount ?? 0), 0));
+      setCommunities((current) => current.map((item) => item.id === id ? { ...item, unreadCount } : item));
       setExplore(false);
       setChannel(null);
       setMessages([]);
@@ -657,6 +706,16 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
       setLoadingMessages(false);
     }
   }, [notify]);
+  const markChannelRead = useCallback(async (channelId: string) => {
+    try {
+      await api(`/channels/${channelId}/read`, { method: 'POST', body: '{}' });
+      const currentDetails = detailsRef.current;
+      const currentChannel = currentDetails?.channels.find((item) => item.id === channelId);
+      if (currentDetails && currentChannel) setCommunities((items) => items.map((item) => item.id === currentDetails.community.id ? { ...item, unreadCount: Math.max(0, (item.unreadCount ?? 0) - (currentChannel.unreadCount ?? 0)) } : item));
+      setDetails((current) => current ? { ...current, channels: current.channels.map((item) => item.id === channelId ? { ...item, unreadCount: 0, hasMention: false } : item) } : current);
+      setNewMessages(0);
+    } catch { /* a failed read mark will be retried on the next visible visit */ }
+  }, []);
   useEffect(() => {
     nearBottom.current = true;
     setNewMessages(0);
@@ -665,6 +724,20 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     void fetchMessages(channel.id);
     void fetchPinnedMessages(channel.id);
   }, [channel?.id, channel?.kind, fetchMessages, fetchPinnedMessages]);
+  useEffect(() => {
+    if (!channel || channel.kind !== 'text' || loadingMessages || document.visibilityState !== 'visible' || !nearBottom.current) return;
+    const timer = window.setTimeout(() => {
+      if (document.visibilityState === 'visible' && nearBottom.current) void markChannelRead(channel.id);
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [channel?.id, channel?.kind, messages.length, loadingMessages, markChannelRead]);
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && channel?.kind === 'text' && nearBottom.current) void markChannelRead(channel.id);
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, [channel?.id, channel?.kind, markChannelRead]);
   useEffect(() => {
     if (!channel || channel.kind !== 'text' || messages.length === 0 || hintShownRef.current) return;
     hintShownRef.current = true;
@@ -684,6 +757,23 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     socket.on('connect', () => { setOnline(true); setReconnecting(false); });
     socket.on('disconnect', (reason) => { if (reason !== 'io client disconnect') setReconnecting(true); });
     socket.on('connect_error', () => setReconnecting(true));
+    socket.on('channels:updated', (event: { communityId: string }) => {
+      if (event.communityId !== communityId) return;
+      void api<CommunityDetails>(`/communities/${communityId}`).then((fresh) => {
+        setDetails(fresh);
+        const unreadCount = Math.min(99, fresh.channels.reduce((total, item) => total + (item.unreadCount ?? 0), 0));
+        setCommunities((items) => items.map((item) => item.id === communityId ? { ...item, unreadCount } : item));
+        if (channel) setChannel(fresh.channels.find((item) => item.id === channel.id) ?? null);
+      }).catch(() => undefined);
+    });
+    socket.on('community:updated', (event: { communityId: string }) => {
+      if (event.communityId === communityId) void api<CommunityDetails>(`/communities/${communityId}`).then(setDetails).catch(() => undefined);
+    });
+    socket.on('channel:unread', (event: { communityId: string; channelId: string; authorId: string; hasMention?: boolean }) => {
+      if (event.authorId === user.id) return;
+      setCommunities((items) => items.map((item) => item.id === event.communityId ? { ...item, unreadCount: Math.min(99, (item.unreadCount ?? 0) + 1) } : item));
+      if (event.communityId === communityId) setDetails((current) => current ? { ...current, channels: current.channels.map((item) => item.id === event.channelId ? { ...item, unreadCount: Math.min(99, (item.unreadCount ?? 0) + 1), hasMention: Boolean(item.hasMention || event.hasMention) } : item) } : current);
+    });
     socket.on('community:member_joined', (event: { communityId: string; member: Member }) => {
       if (event.communityId === communityId) setDetails((current) => current && current.members.some((member) => member.id === event.member.id) ? current : current ? { ...current, members: [...current.members, event.member].sort((a, b) => a.username.localeCompare(b.username)) } : current);
     });
@@ -707,7 +797,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
       setMemberProfile((current) => current?.id === event.userId && Object.hasOwn(current, 'online') ? { ...current, online: event.online } : current);
     });
     return () => { socket.disconnect(); };
-  }, [details?.community.id, loadCommunities, loadMemberProfile, notify]);
+  }, [details?.community.id, channel?.id, loadCommunities, loadMemberProfile, notify, user.id]);
   useEffect(() => {
     const socket = io({ withCredentials: true, reconnection: true, transports: ['websocket', 'polling'] });
     socket.on('community:muted', (event: { communityId: string; expiresAt: string }) => notify(`Foste silenciado até às ${new Intl.DateTimeFormat('pt-MZ', { hour: '2-digit', minute: '2-digit' }).format(new Date(event.expiresAt))}.`));
@@ -883,6 +973,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
 
   const sendMessage = async (body: string, clientMessageId: string = crypto.randomUUID(), replyToId: string | null = reply?.id ?? null, selectedAttachments: PendingAttachment[] = attachmentDrafts): Promise<boolean> => {
     if (!channel || channel.kind !== 'text' || attachmentBusy || (!body.trim() && selectedAttachments.length === 0)) return false;
+    if (channel.readOnly && channel.canWrite === false) { notify('Neste canal só moderadores podem escrever.'); return false; }
     const destination = channel;
     nearBottom.current = true; setNewMessages(0);
     setAttachmentBusy(true);
@@ -1155,12 +1246,13 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     finally { setProfileBusy(false); }
   };
   const appClass = `app-shell ${mobileView === 'channels' ? 'mobile-channels' : 'mobile-chat'}`;
+  const communityUnread = Math.min(99, details?.channels.reduce((total, item) => total + (item.unreadCount ?? 0), 0) ?? 0);
 
   return <div className={appClass}>
     <nav className="community-rail" aria-label="Navegação principal">
       <button className="rail-logo" aria-label="Início" onClick={() => { setDetails(null); setChannel(null); setExplore(false); }}>m</button>
       <div className="rail-divider"/>
-      {communities.map((item) => <button key={item.id} title={item.name} aria-label={item.name} className={`community-chip ${details?.community.id === item.id ? 'active' : ''}`} onClick={() => void openCommunity(item.id)}>{initials(item.name)}</button>)}
+      {communities.map((item) => { const unread = details?.community.id === item.id ? communityUnread : item.unreadCount ?? 0; return <button key={item.id} title={item.name} aria-label={`${item.name}${unread ? `, ${unread} mensagens não lidas` : ''}`} className={`community-chip ${details?.community.id === item.id ? 'active' : ''}`} onClick={() => void openCommunity(item.id)}>{initials(item.name)}{unread > 0 && <span className="community-unread-badge">{unread > 99 ? '99+' : unread}</span>}</button>; })}
       <button className="community-chip" title="Criar comunidade" aria-label="Criar comunidade" onClick={() => setModal('community')}>＋</button>
       <div className="rail-divider"/>
       <button className={`community-chip ${explore ? 'active' : ''}`} title="Explorar comunidades" aria-label="Explorar comunidades" onClick={() => void loadExplore()}>⌕</button>
@@ -1182,10 +1274,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
         {publicCommunities.map((item) => <button className="channel-row" key={item.id} onClick={() => void joinPublic(item)}>{item.name}</button>)}
       </div> : details ? <div className="side-content">
         <div className="section-label">Canais</div>
-        {details.channels.map((item) => <div className="channel-manage-row" key={item.id}>
-          <button disabled={!details.myRole} className={`channel-row ${channel?.id === item.id ? 'active' : ''}`} onClick={() => selectChannel(item)}><span>{item.kind === 'voice' ? '◖' : '#'}</span>{item.name}</button>
-          {isManager && <button className="channel-delete" title={`Apagar ${item.name}`} aria-label={`Apagar canal ${item.name}`} onClick={() => void deleteChannel(item)}>×</button>}
-        </div>)}
+        <ChannelSidebar channels={details.channels} categories={details.categories ?? []} current={channel} canManage={details.myPermissions.includes('manage_channels')} onSelect={selectChannel} onDelete={(item) => void deleteChannel(item)}/>
         <div className="section-label">Membros · {details.members.length}</div>
         {details.members.map((member) => <div className="member-row member-action-row" key={member.id} title={roleLabels[member.role] ?? member.role} tabIndex={0} aria-label={`Ações de ${member.username}`} onClick={(event) => { if ((event.target as HTMLElement).closest('select')) return; openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect(), navigator.maxTouchPoints > 0)); }} onContextMenu={(event) => { event.preventDefault(); openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect())); }} onKeyDown={(event) => { if ((event.target === event.currentTarget) && (event.key === 'Enter' || event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) { event.preventDefault(); openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect())); } }}>
           <button className="profile-avatar-button" aria-label={`Abrir o perfil de ${member.username}`} onClick={(event) => { event.stopPropagation(); openMemberProfile(member.id); }}><Avatar name={member.username} url={member.avatarUrl} size={27}/></button>
@@ -1221,12 +1310,15 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     <main className="main-panel">
       <header className="topbar">
         {mobileView === 'chat' && <button className="icon-button mobile-back" onClick={() => { if (mobileHistory.current.length > 1) window.history.back(); else navigateMobile('channels'); }} aria-label="Voltar aos canais">←</button>}
-        <h1>{explore ? 'Descobrir comunidades' : channel ? `${channel.kind === 'voice' ? '◖' : '#'} ${channel.name}` : details?.community.name ?? 'Mavuno'}</h1>
+        <h1>{explore ? 'Descobrir comunidades' : channel ? `${channel.kind === 'voice' ? '◖' : channel.readOnly ? '🔒' : '#'} ${channel.name}` : details?.community.name ?? 'Mavuno'}</h1>
         <span className={`network-status ${online ? '' : 'offline'}`}>{!online ? '● Sem ligação. A tentar novamente...' : reconnecting ? '● A reconectar…' : '● Ligado'}</span>
         {channel?.kind === 'text' && <span className="muted">Mensagens</span>}
       </header>
 
+      {!explore && details && <CommunityCover community={details.community}/>}
+
       {!explore && channel?.kind === 'text' && pinnedMessages.length > 0 && <div className="pinned-strip"><span aria-hidden="true">◆</span><strong>Fixadas</strong><button onClick={() => void openPinned()}>{pinnedMessages.length} mensagem(ns) · Ver lista</button></div>}
+      {!explore && channel?.kind === 'text' && newMessages > 0 && <div className="new-messages-strip" role="status"><span>{newMessages} {newMessages === 1 ? 'mensagem nova' : 'mensagens novas'}</span><button onClick={() => void markChannelRead(channel.id)}>Marcar como lida</button></div>}
       {explore ? <section className="explore-view">
         <h2>Encontra o teu espaço</h2><p className="muted">Explora comunidades abertas ou pesquisa por nome e categoria.</p>
         <div className="community-cards">{publicCommunities.map((item) => <article className="community-card" key={item.id}>
@@ -1238,7 +1330,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
         <div className="message-list" ref={listRef} aria-live="polite" onScroll={(event) => {
           const element = event.currentTarget;
           nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
-          if (nearBottom.current) setNewMessages(0);
+          if (nearBottom.current) { setNewMessages(0); if ((details?.channels.find((item) => item.id === channel.id)?.unreadCount ?? 0) > 0) void markChannelRead(channel.id); }
         }}>
           {hasMore && <button className="text-button" style={{ display: 'block', margin: '0 auto 10px' }} disabled={loadingMessages} onClick={() => {
             const oldest = messages[0];
@@ -1265,10 +1357,10 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
             </div>)}
           </div>}
           <form className="composer" onSubmit={(event) => { event.preventDefault(); const value = draft.trim(); if (!value && attachmentDrafts.length === 0) return; void sendMessage(value).then((sent) => { if (sent) setDraft(''); }); }}>
-            <input ref={composerInputRef} value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={2000} disabled={attachmentBusy} placeholder={`Escreve uma mensagem em #${channel.name}`} aria-label="Escrever mensagem"/>
-            <button type="button" className="secondary composer-attach-button" aria-label="Anexar ficheiro" title="Anexar ficheiro" disabled={attachmentBusy} onClick={() => void openAttachmentPicker()}><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="m21.4 11.1-8.9 8.9a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg></button>
-            <button type="button" className="secondary composer-emoji-button" aria-label="Inserir emoji" title="Inserir emoji" disabled={attachmentBusy} onClick={() => setEmojiPickerTarget('composer')}>☺</button>
-            <button className="primary send-button" disabled={attachmentBusy || (!draft.trim() && attachmentDrafts.length === 0)} aria-label="Enviar mensagem">Enviar</button>
+            <input ref={composerInputRef} value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={2000} disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false)} placeholder={channel.readOnly && channel.canWrite === false ? 'Neste canal só moderadores podem escrever.' : `Escreve uma mensagem em #${channel.name}`} aria-label="Escrever mensagem"/>
+            <button type="button" className="secondary composer-attach-button" aria-label="Anexar ficheiro" title="Anexar ficheiro" disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false)} onClick={() => void openAttachmentPicker()}><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="m21.4 11.1-8.9 8.9a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg></button>
+            <button type="button" className="secondary composer-emoji-button" aria-label="Inserir emoji" title="Inserir emoji" disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false)} onClick={() => setEmojiPickerTarget('composer')}>☺</button>
+            <button className="primary send-button" disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false) || (!draft.trim() && attachmentDrafts.length === 0)} aria-label="Enviar mensagem">Enviar</button>
           </form>
           <input ref={photoInputRef} className="attachment-file-input" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm" aria-label="Escolher foto ou vídeo" onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; setAttachmentPickerOpen(false); void addSelectedFiles(files); }}/>
           <input ref={documentInputRef} className="attachment-file-input" type="file" multiple accept=".pdf,.txt,.docx,.xlsx,.pptx,.zip,application/pdf,text/plain,application/zip" aria-label="Escolher ficheiro" onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; setAttachmentPickerOpen(false); void addSelectedFiles(files); }}/>
@@ -1299,7 +1391,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     }
     {modal === 'community' && <CommunityModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createCommunity(data)}/>}
     {modal === 'channel' && <ChannelModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createChannel(data)}/>}
-    {modal === 'admin' && details && <AdminModal details={details} requestRefresh={joinRequestsRefresh} inviteRefresh={inviteListRefresh} onClose={() => setModal(null)} onSaved={() => { if (activeCommunityId) void openCommunity(activeCommunityId, false); }}/>}
+    {modal === 'admin' && details && <AdminModal details={details} requestRefresh={joinRequestsRefresh} inviteRefresh={inviteListRefresh} onClose={() => setModal(null)} onSaved={() => { if (activeCommunityId) void api<CommunityDetails>(`/communities/${activeCommunityId}`).then((fresh) => { setDetails(fresh); const unreadCount = Math.min(99, fresh.channels.reduce((total, item) => total + (item.unreadCount ?? 0), 0)); setCommunities((items) => items.map((item) => item.id === activeCommunityId ? { ...item, unreadCount } : item)); setChannel((current) => current ? fresh.channels.find((item) => item.id === current.id) ?? null : null); }).catch(() => undefined); }}/>}
     {joinTarget && <JoinFlowModal info={joinInfo} loading={joinInfoLoading} error={joinInfoError} busy={joinBusy} onClose={closeJoinFlow} onJoin={(accepted) => void submitJoin(accepted)} onCancelRequest={() => void cancelJoinRequest()}/>}
     {inviteShare && <InviteSharePanel share={inviteShare} onChange={(patch) => setInviteShare((current) => current ? { ...current, ...patch } : current)} onClose={() => setInviteShare(null)} onCopy={() => void copyInviteLink()} onShare={() => void shareInviteLink()} onCreate={(duration, maxUses) => void createInvite(duration, maxUses)}/>}
     {modal === 'profile' && <ProfileModal data={ownProfile} loading={profileLoading} error={ownProfileError} online={online && !reconnecting} busy={profileBusy} onClose={() => setModal(null)} onReload={() => void openOwnProfile()} onLogout={onLogout} onSave={(data) => void updateProfile(data)}/>}
@@ -1381,14 +1473,16 @@ function PrivateCallDock({ target, onClearTarget, notify, preferences, onAudioCh
 
 function AdminModal({ details, requestRefresh, inviteRefresh, onClose, onSaved }: { details: CommunityDetails; requestRefresh: number; inviteRefresh: number; onClose: () => void; onSaved: () => void }) {
   type AuditEntry = { id: string; action: string; reason: string; durationSeconds: number | null; metadata: string; createdAt: string; actorId: string; actorUsername: string; targetUserId: string | null };
-  type BanEntry = { userId: string; username: string; reason: string; createdAt: string; expiresAt: string | null };
+  type BanEntry = { userId: string; username: string; reason: string; createdAt: string; expiresAt: string | null; bannedBy: string };
   const permissions = details.myPermissions;
   const canEditCommunity = permissions.includes('manage_community');
   const canReviewRequests = permissions.includes('manage_members');
   const canManageInvites = permissions.includes('create_invites');
-  const canReviewBans = permissions.includes('ban_members');
+  const canReviewBans = permissions.includes('ban_members') || permissions.includes('view_audit_log');
+  const canRevokeBans = permissions.includes('ban_members');
+  const canManageChannels = permissions.includes('manage_channels');
   const canReviewAudit = permissions.includes('view_audit_log');
-  const initialTab = canEditCommunity ? 'community' : canReviewRequests ? 'requests' : canManageInvites ? 'invites' : canReviewBans ? 'bans' : 'audit';
+  const initialTab = canEditCommunity || canManageChannels ? 'community' : canReviewRequests ? 'requests' : canManageInvites ? 'invites' : canReviewBans ? 'bans' : 'audit';
   const [busy, setBusy] = useState(false);
   const [busyRequestId, setBusyRequestId] = useState<string | null>(null);
   const [error, setError] = useState('');
@@ -1403,6 +1497,10 @@ function AdminModal({ details, requestRefresh, inviteRefresh, onClose, onSaved }
   const [loadingInvites, setLoadingInvites] = useState(false);
   const [loadingRequests, setLoadingRequests] = useState(false);
   const [welcomeLength, setWelcomeLength] = useState(details.community.welcomeMessage?.length ?? 0);
+  const [coverUrl, setCoverUrl] = useState(details.community.coverUrl ?? '');
+  const [coverColor, setCoverColor] = useState(details.community.coverColor ?? COVER_COLORS[0]);
+  const [categoryName, setCategoryName] = useState('');
+  const [categoryNames, setCategoryNames] = useState<Record<string, string>>({});
   const loadAudit = async () => {
     setLoadingAudit(true); setError('');
     try { const result = await api<{ entries: AuditEntry[] }>(`/communities/${details.community.id}/audit-log`); setEntries(result.entries); }
@@ -1433,10 +1531,54 @@ function AdminModal({ details, requestRefresh, inviteRefresh, onClose, onSaved }
     else if (tab === 'invites') void loadInvites();
     else if (tab === 'requests') void loadRequests();
   }, [tab, details.community.id, requestRefresh, inviteRefresh]);
+  const addCategory = async () => {
+    const name = categoryName.trim();
+    if (!name) return;
+    try { await api(`/communities/${details.community.id}/channel-categories`, { method: 'POST', body: JSON.stringify({ name }) }); setCategoryName(''); onSaved(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível criar a categoria.'); }
+  };
+  const renameCategory = async (category: ChannelCategory) => {
+    const name = (categoryNames[category.id] ?? category.name).trim();
+    try { await api(`/communities/${details.community.id}/channel-categories/${category.id}`, { method: 'PATCH', body: JSON.stringify({ name }) }); onSaved(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível guardar o nome.'); }
+  };
+  const reorderCategory = async (category: ChannelCategory, direction: -1 | 1) => {
+    const ordered = (details.categories ?? []).slice().sort((a, b) => a.position - b.position);
+    const index = ordered.findIndex((item) => item.id === category.id); const neighbor = ordered[index + direction];
+    if (!neighbor) return;
+    try {
+      await api(`/communities/${details.community.id}/channel-categories/${category.id}`, { method: 'PATCH', body: JSON.stringify({ position: neighbor.position }) });
+      await api(`/communities/${details.community.id}/channel-categories/${neighbor.id}`, { method: 'PATCH', body: JSON.stringify({ position: category.position }) }); onSaved();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível ordenar as categorias.'); }
+  };
+  const deleteCategory = async (category: ChannelCategory) => {
+    if (!window.confirm('Apagar esta categoria? Os canais ficam sem categoria.')) return;
+    try { await api(`/communities/${details.community.id}/channel-categories/${category.id}`, { method: 'DELETE' }); onSaved(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível apagar a categoria.'); }
+  };
+  const updateChannelOrder = async (channel: Channel, direction: -1 | 1) => {
+    const siblings = details.channels.filter((item) => (item.categoryId ?? null) === (channel.categoryId ?? null)).slice().sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+    const index = siblings.findIndex((item) => item.id === channel.id); const neighbor = siblings[index + direction];
+    if (!neighbor) return;
+    try {
+      await api(`/channels/${channel.id}/organization`, { method: 'PATCH', body: JSON.stringify({ categoryId: channel.categoryId ?? null, position: neighbor.position ?? 0 }) });
+      await api(`/channels/${neighbor.id}/organization`, { method: 'PATCH', body: JSON.stringify({ categoryId: neighbor.categoryId ?? null, position: channel.position ?? 0 }) }); onSaved();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível ordenar os canais.'); }
+  };
+  const moveChannel = async (channel: Channel, categoryId: string) => {
+    const nextCategoryId = categoryId || null;
+    const position = nextCategoryId === (channel.categoryId ?? null) ? channel.position ?? 0 : details.channels.filter((item) => (item.categoryId ?? null) === nextCategoryId).length;
+    try { await api(`/channels/${channel.id}/organization`, { method: 'PATCH', body: JSON.stringify({ categoryId: nextCategoryId, position }) }); onSaved(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível mover o canal.'); }
+  };
+  const setChannelReadOnly = async (channel: Channel, readOnly: boolean) => {
+    try { await api(`/channels/${channel.id}/read-only`, { method: 'PATCH', body: JSON.stringify({ readOnly }) }); onSaved(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível guardar a opção.'); }
+  };
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setBusy(true); setError(''); const form = new FormData(event.currentTarget);
     try {
-      await api(`/communities/${details.community.id}`, { method: 'PATCH', body: JSON.stringify({ name: String(form.get('name')), description: String(form.get('description')), category: String(form.get('category')), rules: String(form.get('rules')), welcomeMessage: String(form.get('welcomeMessage')), requireApproval: Boolean(form.get('requireApproval')) }) });
+      await api(`/communities/${details.community.id}`, { method: 'PATCH', body: JSON.stringify({ name: String(form.get('name')), description: String(form.get('description')), category: String(form.get('category')), coverUrl: coverUrl.trim() || null, coverColor, rules: String(form.get('rules')), welcomeMessage: String(form.get('welcomeMessage')), requireApproval: Boolean(form.get('requireApproval')) }) });
       onSaved(); onClose();
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível guardar.'); }
     finally { setBusy(false); }
@@ -1470,22 +1612,42 @@ function AdminModal({ details, requestRefresh, inviteRefresh, onClose, onSaved }
     <section className="modal admin-modal" role="dialog" aria-modal="true" aria-labelledby="admin-title">
       <div className="admin-heading"><div><h2 id="admin-title">Administração</h2><p className="muted">Boas-vindas, convites, pedidos e atividade da comunidade.</p></div><button type="button" className="icon-button" aria-label="Fechar administração" onClick={onClose}>×</button></div>
       <div className="admin-tabs" role="tablist" aria-label="Secções de administração">
-        {canEditCommunity && <button className={tab === 'community' ? 'active' : ''} role="tab" aria-selected={tab === 'community'} onClick={() => setTab('community')}>Comunidade</button>}
+        {(canEditCommunity || canManageChannels) && <button className={tab === 'community' ? 'active' : ''} role="tab" aria-selected={tab === 'community'} onClick={() => setTab('community')}>Comunidade</button>}
         {canManageInvites && <button className={tab === 'invites' ? 'active' : ''} role="tab" aria-selected={tab === 'invites'} onClick={() => setTab('invites')}>Convites</button>}
         {canReviewRequests && <button className={tab === 'requests' ? 'active' : ''} role="tab" aria-selected={tab === 'requests'} onClick={() => setTab('requests')}>Pedidos{(details.pendingJoinRequests ?? 0) > 0 ? ` · ${details.pendingJoinRequests}` : ''}</button>}
         {canReviewBans && <button className={tab === 'bans' ? 'active' : ''} role="tab" aria-selected={tab === 'bans'} onClick={() => setTab('bans')}>Banimentos</button>}
         {canReviewAudit && <button className={tab === 'audit' ? 'active' : ''} role="tab" aria-selected={tab === 'audit'} onClick={() => setTab('audit')}>Auditoria</button>}
       </div>
       {error && <p className="error-banner" role="alert">{error}</p>}{success && <p className="notice" role="status">{success}</p>}
-      {tab === 'community' && canEditCommunity && <form onSubmit={(event) => void save(event)}>
+      {tab === 'community' && (canEditCommunity || canManageChannels) && <form onSubmit={(event) => void save(event)}>
+        {canEditCommunity && <>
         <label className="field">Nome<input name="name" defaultValue={details.community.name} required maxLength={80}/></label>
         <label className="field">Descrição<textarea name="description" defaultValue={details.community.description} maxLength={500} rows={3}/></label>
         <label className="field">Categoria<input name="category" defaultValue={details.community.category} required maxLength={40}/></label>
+        <label className="field">Imagem de capa (link)<input type="url" inputMode="url" value={coverUrl} onChange={(event) => setCoverUrl(event.target.value)} placeholder="https://exemplo.com/imagem.jpg"/></label>
+        <div className="field"><span>Cor de capa</span><div className="cover-palette" role="group" aria-label="Escolher cor de capa">{COVER_COLORS.map((color) => <button type="button" key={color} aria-label={`Cor ${color}`} aria-pressed={coverColor === color} style={{ backgroundColor: color }} onClick={() => setCoverColor(color)}/>)}</div></div>
+        <div className="cover-preview"><span className="cover-preview-label">Pré-visualização</span><CommunityCover community={{ name: details.community.name, coverUrl: coverUrl.trim() || null, coverColor }} compact/></div>
         <label className="field">Mensagem de boas-vindas<textarea name="welcomeMessage" defaultValue={details.community.welcomeMessage ?? ''} maxLength={1000} rows={3} onChange={(event) => setWelcomeLength(event.target.value.length)}/><small className="muted form-counter">{welcomeLength}/1000</small></label>
         <label className="field">Regras<textarea name="rules" defaultValue={details.community.rules ?? ''} maxLength={4000} rows={4} placeholder="Regras da comunidade"/></label>
         <label className="approval-toggle"><input name="requireApproval" type="checkbox" defaultChecked={details.community.requireApproval ?? false}/><span><strong>Pedir aprovação para entrar</strong><small>Quem usar um convite fica à espera de aprovação.</small></span></label>
         <div className="admin-summary"><strong>Gestão de membros</strong><span>{details.members.length} membros · {details.channels.length} canais</span><span>Altera cargos e gere silenciamentos pelo menu de cada membro.</span></div>
-        <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar alterações'}</button></div>
+        </>}
+        {canManageChannels && <section className="channel-management-settings">
+          <h3>Categorias e canais</h3>
+          <div className="category-settings-row"><input aria-label="Nome da nova categoria" value={categoryName} maxLength={40} onChange={(event) => setCategoryName(event.target.value)} placeholder="Nome da categoria"/><button type="button" className="secondary" disabled={!categoryName.trim()} onClick={() => void addCategory()}>Criar categoria</button></div>
+          {(details.categories ?? []).slice().sort((a, b) => a.position - b.position).map((category, index, ordered) => <div className="category-settings-row" key={category.id}>
+            <input aria-label={`Nome da categoria ${category.name}`} value={categoryNames[category.id] ?? category.name} maxLength={40} onChange={(event) => setCategoryNames((current) => ({ ...current, [category.id]: event.target.value }))}/>
+            <button type="button" className="secondary" aria-label={`Subir categoria ${category.name}`} disabled={index === 0} onClick={() => void reorderCategory(category, -1)}>↑</button><button type="button" className="secondary" aria-label={`Descer categoria ${category.name}`} disabled={index === ordered.length - 1} onClick={() => void reorderCategory(category, 1)}>↓</button>
+            <button type="button" className="secondary" onClick={() => void renameCategory(category)}>Guardar</button><button type="button" className="danger-button" onClick={() => void deleteCategory(category)}>Apagar</button>
+          </div>)}
+          <div className="channel-settings-list">{details.channels.map((item) => <div className="channel-settings-row" key={item.id}>
+            <strong>{item.kind === 'voice' ? '◖' : '#'} {item.name}</strong>
+            <select aria-label={`Categoria de ${item.name}`} value={item.categoryId ?? ''} onChange={(event) => void moveChannel(item, event.target.value)}><option value="">Sem categoria</option>{(details.categories ?? []).map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select>
+            <button type="button" className="secondary" aria-label={`Subir ${item.name}`} onClick={() => void updateChannelOrder(item, -1)}>↑</button><button type="button" className="secondary" aria-label={`Descer ${item.name}`} onClick={() => void updateChannelOrder(item, 1)}>↓</button>
+            <label className="channel-readonly-toggle"><input type="checkbox" checked={Boolean(item.readOnly)} onChange={(event) => void setChannelReadOnly(item, event.target.checked)}/>Só moderadores podem escrever</label>
+          </div>)}</div>
+        </section>}
+        <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Fechar</button>{canEditCommunity && <button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar alterações'}</button>}</div>
       </form>}
       {tab === 'invites' && canManageInvites && <div className="admin-list-section"><div className="admin-list-heading"><strong>Convites ativos</strong><button className="text-button" onClick={() => void loadInvites()} disabled={loadingInvites}>Atualizar</button></div>
         {loadingInvites ? <div className="empty-state">A carregar…</div> : invites.length === 0 ? <div className="empty-state">Não há convites ativos.</div> : <div className="admin-clean-list">{invites.map((invite) => <div className="admin-list-row" key={invite.id}><div className="admin-list-copy"><strong>Criado por {invite.createdBy}</strong><span className="muted">{invite.expiresAt ? `Termina ${new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(invite.expiresAt))}` : 'Sem validade'} · {invite.maxUses === null ? 'Usos ilimitados' : `${invite.useCount}/${invite.maxUses} utilizações`}</span><span className="muted">Criado em {new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(invite.createdAt))}</span></div><button className="danger-button" onClick={() => void revokeInvite(invite)}>Revogar</button></div>)}</div>}
@@ -1494,7 +1656,7 @@ function AdminModal({ details, requestRefresh, inviteRefresh, onClose, onSaved }
         {loadingRequests ? <div className="empty-state">A carregar…</div> : requests.length === 0 ? <div className="empty-state">Não há pedidos pendentes.</div> : <div className="admin-clean-list">{requests.map((request) => <div className="join-request-row" key={request.id}><div className="join-request-person"><Avatar name={request.username} url={request.avatarUrl} size={38}/><div className="admin-list-copy"><strong>{request.username}</strong><span className="muted">Pedido em {new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(request.createdAt))}</span></div></div><div className="join-request-actions"><button className="primary" disabled={busyRequestId === request.id} onClick={() => void decideRequest(request, 'approve')}>Aprovar</button><button className="secondary" disabled={busyRequestId === request.id} onClick={() => void decideRequest(request, 'reject')}>Recusar</button></div></div>)}</div>}
       </div>}
       {tab === 'bans' && canReviewBans && <div className="admin-list-section"><div className="admin-list-heading"><strong>Banimentos ativos</strong><button className="text-button" onClick={() => void loadBans()} disabled={loadingBans}>Atualizar</button></div>
-        {loadingBans ? <div className="empty-state">A carregar…</div> : bans.length === 0 ? <div className="empty-state">Não há banimentos ativos.</div> : <div className="admin-clean-list">{bans.map((ban) => <div className="admin-list-row" key={ban.userId}><div className="admin-list-copy"><strong>{ban.username}</strong><span className="muted">{banExpiryLabel(ban.expiresAt)} · aplicado em {new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(ban.createdAt))}</span>{ban.reason && <span className="muted">{ban.reason}</span>}</div><button className="secondary" onClick={() => void revokeBan(ban.userId)}>Revogar banimento</button></div>)}</div>}
+        {loadingBans ? <div className="empty-state">A carregar…</div> : bans.length === 0 ? <div className="empty-state">Não há banimentos ativos.</div> : <div className="admin-clean-list">{bans.map((ban) => <div className="admin-list-row" key={ban.userId}><div className="admin-list-copy"><strong>{ban.username}</strong><span className="muted">{banExpiryLabel(ban.expiresAt)} · aplicado em {new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(ban.createdAt))}</span><span className="muted">Aplicado por {ban.bannedBy}</span>{ban.reason && <span className="muted">{ban.reason}</span>}</div>{canRevokeBans && <button className="secondary" onClick={() => void revokeBan(ban.userId)}>Revogar</button>}</div>)}</div>}
       </div>}
       {tab === 'audit' && canReviewAudit && <div className="admin-list-section"><div className="admin-list-heading"><strong>Atividade recente</strong><button className="text-button" onClick={() => void loadAudit()} disabled={loadingAudit}>Atualizar</button></div>
         {loadingAudit ? <div className="empty-state">A carregar…</div> : entries.length === 0 ? <div className="empty-state">Ainda não há ações registadas.</div> : <div className="admin-clean-list">{entries.map((entry) => <article className="audit-row" key={entry.id}><div className="audit-row-top"><strong>{actionLabels[entry.action] ?? 'Ação da comunidade'}</strong><time>{new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(entry.createdAt))}</time></div><span className="muted">Por {entry.actorUsername}{entry.targetUserId ? ` · Utilizador ${entry.targetUserId.slice(0, 8)}` : ''}</span>{entry.reason && <p>{entry.reason}</p>}</article>)}</div>}
@@ -1511,7 +1673,7 @@ function JoinFlowModal({ info, loading, error, busy, onClose, onJoin, onCancelRe
     <section className="modal join-flow-modal" role="dialog" aria-modal="true" aria-labelledby="join-flow-title">
       <div className="join-flow-heading"><div><h2 id="join-flow-title">{info?.name ?? 'Convite'}</h2><p className="muted">{headline}</p></div><button className="icon-button" aria-label="Fechar" onClick={onClose}>×</button></div>
       {loading ? <div className="empty-state">A carregar…</div> : info ? <>
-        {info.imageUrl ? <img className="join-flow-cover" src={info.imageUrl} alt="" referrerPolicy="no-referrer"/> : <div className="join-flow-cover join-flow-cover-empty" aria-hidden="true">{initials(info.name)}</div>}
+        <CommunityCover community={{ name: info.name, coverUrl: info.coverUrl ?? info.imageUrl, coverColor: info.coverColor }} compact/>
         <div className="join-flow-details"><p className="join-flow-description">{info.description || 'Uma comunidade Mavuno.'}</p><span className="muted">{info.memberCount} {info.memberCount === 1 ? 'membro' : 'membros'}</span>
           {info.welcomeMessage?.trim() && <section className="join-welcome-message"><h3>Boas-vindas</h3><p>{info.welcomeMessage}</p></section>}
           {rulesRequired && <section className="join-rules-block"><h3>Regras</h3><div className="join-rules-text">{info.rules}</div><label className="join-rules-accept"><input type="checkbox" checked={acceptedRules} disabled={info.alreadyMember || info.requestPending} onChange={(event) => setAcceptedRules(event.target.checked)}/><span>Li e aceito as regras desta comunidade.</span></label></section>}
