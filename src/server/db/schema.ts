@@ -1,4 +1,4 @@
-import { pgTable, pgEnum, uuid, varchar, text, boolean, timestamp, integer, uniqueIndex, index } from 'drizzle-orm/pg-core';
+import { pgTable, pgEnum, uuid, varchar, text, boolean, timestamp, integer, uniqueIndex, index, primaryKey } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 export const roleKey = pgEnum('role_key', ['owner', 'admin', 'moderator', 'member']);
@@ -44,6 +44,8 @@ export const communities = pgTable('communities', {
   description: varchar('description', { length: 500 }).notNull().default(''),
   category: varchar('category', { length: 40 }).notNull().default('Geral'),
   imageUrl: text('image_url'),
+  coverUrl: text('cover_url'),
+  coverColor: varchar('cover_color', { length: 7 }),
   rules: varchar('rules', { length: 4000 }).notNull().default(''),
   welcomeMessage: varchar('welcome_message', { length: 1000 }).notNull().default(''),
   requireApproval: boolean('require_approval').notNull().default(false),
@@ -77,11 +79,34 @@ export const communityMembers = pgTable('community_members', {
 export const channels = pgTable('channels', {
   id: uuid('id').defaultRandom().primaryKey(),
   communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'cascade' }),
+  categoryId: uuid('category_id').references(() => channelCategories.id, { onDelete: 'set null' }),
   name: varchar('name', { length: 60 }).notNull(),
   topic: varchar('topic', { length: 200 }).notNull().default(''),
   kind: varchar('kind', { length: 10 }).notNull().default('text'),
+  readOnly: boolean('read_only').notNull().default(false),
+  position: integer('position').notNull().default(0),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [uniqueIndex('channels_community_name_unique').on(t.communityId, t.name), index('channels_community_idx').on(t.communityId)]);
+
+export const channelCategories = pgTable('channel_categories', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'cascade' }),
+  name: varchar('name', { length: 40 }).notNull(),
+  position: integer('position').notNull().default(0),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex('channel_categories_community_name_unique').on(t.communityId, t.name),
+  index('channel_categories_community_idx').on(t.communityId),
+]);
+
+export const channelReads = pgTable('channel_reads', {
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
+  lastReadAt: timestamp('last_read_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ name: 'channel_reads_pkey', columns: [t.userId, t.channelId] }),
+  index('channel_reads_channel_idx').on(t.channelId),
+]);
 
 export const messages = pgTable('messages', {
   id: uuid('id').defaultRandom().primaryKey(),
