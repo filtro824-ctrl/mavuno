@@ -6,6 +6,7 @@ import type { Server as SocketServer } from 'socket.io';
 import { db } from './db/index.js';
 import { channels, communityBans, communityMutes, messageAttachments, users } from './db/schema.js';
 import { hasPermission, isMember } from './permissions.js';
+import { canWriteToChannel } from './channel-utils.js';
 import {
   dailyQuotaAllows,
   signatureMatches,
@@ -42,9 +43,10 @@ async function activeMute(communityId: string, userId: string): Promise<boolean>
 }
 
 async function uploadAccess(userId: string, channelId: string): Promise<{ ok: true; channel: { id: string; communityId: string } } | { ok: false; status: number; error: string }> {
-  const [channel] = await db.select({ id: channels.id, communityId: channels.communityId, kind: channels.kind }).from(channels).where(eq(channels.id, channelId)).limit(1);
+  const [channel] = await db.select({ id: channels.id, communityId: channels.communityId, kind: channels.kind, readOnly: channels.readOnly }).from(channels).where(eq(channels.id, channelId)).limit(1);
   if (!channel || channel.kind !== 'text' || !await isMember(userId, channel.communityId)) return { ok: false, status: 404, error: 'Canal não encontrado.' };
   if (await isBanned(channel.communityId, userId)) return { ok: false, status: 403, error: 'Não tens acesso a esta comunidade.' };
+  if (!canWriteToChannel(channel.readOnly, await hasPermission(userId, channel.communityId, 'manage_channels'))) return { ok: false, status: 403, error: 'Neste canal só moderadores podem escrever.' };
   if (!await hasPermission(userId, channel.communityId, 'send_messages')) return { ok: false, status: 403, error: 'Não tens permissão para enviar anexos neste canal.' };
   if (await activeMute(channel.communityId, userId)) return { ok: false, status: 403, error: 'Não podes enviar anexos enquanto estiveres silenciado.' };
   return { ok: true, channel: { id: channel.id, communityId: channel.communityId } };

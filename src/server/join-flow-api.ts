@@ -100,6 +100,8 @@ async function communityJoinCard(communityId: string) {
     name: communities.name,
     description: communities.description,
     imageUrl: communities.imageUrl,
+    coverUrl: communities.coverUrl,
+    coverColor: communities.coverColor,
     rules: communities.rules,
     welcomeMessage: communities.welcomeMessage,
     requireApproval: communities.requireApproval,
@@ -126,7 +128,7 @@ export function createPublicInvitePreviewRouter(): Router {
     if (!validToken.test(req.params.token)) { inviteInvalid(res); return; }
     const [invite] = await db.select().from(invitations).where(eq(invitations.tokenHash, digestToken(req.params.token))).limit(1);
     if (!invite || !invitationIsValid(invite)) { inviteInvalid(res); return; }
-    const [community] = await db.select({ name: communities.name, imageUrl: communities.imageUrl, description: communities.description })
+    const [community] = await db.select({ name: communities.name, imageUrl: communities.imageUrl, coverUrl: communities.coverUrl, coverColor: communities.coverColor, description: communities.description })
       .from(communities).where(eq(communities.id, invite.communityId)).limit(1);
     if (!community) { inviteInvalid(res); return; }
     const [members] = await db.select({ value: count() }).from(communityMembers).where(eq(communityMembers.communityId, invite.communityId));

@@ -1,11 +1,11 @@
 import { Router, type Request, type Response, type NextFunction, type RequestHandler } from 'express';
-import { and, count, desc, eq, gt, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gt, inArray, isNotNull, isNull, lt, ne, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 import { AccessToken } from 'livekit-server-sdk';
 import { db, pool } from './db/index.js';
 import {
-  channels, communities, communityMembers, communityRoles, messages, joinRequests,
+  channels, channelCategories, channelReads, communities, communityMembers, communityRoles, messages, joinRequests,
   messageMentions, rolePermissions, sessions, users, voiceRooms, communityBans, communityMutes,
   moderationAuditLogs, privateCalls, messageReactions, messageAttachments,
 } from './db/schema.js';
@@ -22,9 +22,11 @@ import { createProfileMediaRouter } from './profile-media-api.js';
 import { PROFILE_MEDIA_MAX_BYTES, makeProfileMediaReference, parseProfileMediaReference, profileMediaObjectKey, profileMediaStagingObjectKey } from './profile-media-utils.js';
 import { copyStoredObject, deleteStoredObject, inspectStoredObject, storageIsConfigured } from './storage.js';
 import { createJoinFlowRouter, createPublicInvitePreviewRouter } from './join-flow-api.js';
+import { canWriteToChannel, categoryNameSchema, coverColorSchema, coverUrlSchema, summarizeUnreadRows } from './channel-utils.js';
 
 const replyMessages = alias(messages, 'reply_messages');
 const replyAuthors = alias(users, 'reply_authors');
+const banActors = alias(users, 'ban_actors');
 interface PublicUser { id: string; username: string; email: string; avatarUrl: string | null }
 interface RoleDef { key: 'owner' | 'admin' | 'moderator' | 'member'; name: string; hierarchy: number; permissions: Permission[] }
 const permissionSet: RoleDef[] = [
@@ -430,7 +432,7 @@ export function createApi(io: SocketServer): Router {
 
   router.get('/communities/:communityId', asyncRoute(async (req, res) => {
     if (!uuid.safeParse(req.params.communityId).success) { res.status(400).json({ error: 'Comunidade inválida.' }); return; }
-    const [community] = await db.select({ id: communities.id, name: communities.name, slug: communities.slug, description: communities.description, category: communities.category, imageUrl: communities.imageUrl, rules: communities.rules, welcomeMessage: communities.welcomeMessage, requireApproval: communities.requireApproval, isPrivate: communities.isPrivate, ownerId: communities.ownerId })
+    const [community] = await db.select({ id: communities.id, name: communities.name, slug: communities.slug, description: communities.description, category: communities.category, imageUrl: communities.imageUrl, coverUrl: communities.coverUrl, coverColor: communities.coverColor, rules: communities.rules, welcomeMessage: communities.welcomeMessage, requireApproval: communities.requireApproval, isPrivate: communities.isPrivate, ownerId: communities.ownerId })
       .from(communities).where(eq(communities.id, req.params.communityId)).limit(1);
     if (!community || (community.isPrivate && !(await isMember(currentUser(res).id, community.id)))) { res.status(404).json({ error: 'Comunidade não encontrada.' }); return; }
     if (await activeBan(community.id, currentUser(res).id)) { res.status(403).json({ error: 'Não foi possível entrar nesta comunidade.' }); return; }
@@ -445,20 +447,46 @@ export function createApi(io: SocketServer): Router {
     const memberRows = await db.select({ id: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar, role: communityRoles.key })
       .from(communityMembers).innerJoin(users, eq(communityMembers.userId, users.id)).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
       .where(eq(communityMembers.communityId, community.id)).orderBy(users.username).limit(100);
-    const channelRows = await db.select({ id: channels.id, name: channels.name, topic: channels.topic, kind: channels.kind })
-      .from(channels).where(eq(channels.communityId, community.id)).orderBy(channels.createdAt);
+    let channelRows: Array<{ id: string; name: string; topic: string; kind: string; categoryId: string | null; readOnly: boolean; position: number; unreadCount: number; hasMention: boolean; canWrite: boolean }> = [];
+    let categoryRows: Array<{ id: string; communityId: string; name: string; position: number }> = [];
+    if (mine.length) {
+      const accessible = await db.select({ id: channels.id }).from(channels).where(eq(channels.communityId, community.id));
+      if (accessible.length) await db.insert(channelReads).values(accessible.map((item) => ({ userId: currentUser(res).id, channelId: item.id }))).onConflictDoNothing();
+      const unreadRows = await db.select({
+        channelId: channels.id,
+        messageId: messages.id,
+        authorId: messages.authorId,
+        userId: sql<string>`${currentUser(res).id}`,
+        createdAt: messages.createdAt,
+        lastReadAt: channelReads.lastReadAt,
+        mentionUserId: messageMentions.userId,
+      }).from(channels)
+        .leftJoin(channelReads, and(eq(channelReads.channelId, channels.id), eq(channelReads.userId, currentUser(res).id)))
+        .leftJoin(messages, and(eq(messages.channelId, channels.id), gt(messages.createdAt, channelReads.lastReadAt), ne(messages.authorId, currentUser(res).id)))
+        .leftJoin(messageMentions, and(eq(messageMentions.messageId, messages.id), eq(messageMentions.userId, currentUser(res).id)))
+        .where(eq(channels.communityId, community.id));
+      const unreadById = summarizeUnreadRows(unreadRows);
+      const canManageChannels = permissionRows.some((row) => row.permission === 'manage_channels');
+      const canSendMessages = permissionRows.some((row) => row.permission === 'send_messages');
+      channelRows = await db.select({ id: channels.id, name: channels.name, topic: channels.topic, kind: channels.kind, categoryId: channels.categoryId, readOnly: channels.readOnly, position: channels.position })
+        .from(channels).where(eq(channels.communityId, community.id)).orderBy(channels.position, channels.createdAt)
+        .then((rows) => rows.map((row) => ({ ...row, unreadCount: unreadById[row.id]?.unreadCount ?? 0, hasMention: unreadById[row.id]?.hasMention ?? false, canWrite: canSendMessages && canWriteToChannel(row.readOnly, canManageChannels) })));
+      categoryRows = await db.select({ id: channelCategories.id, communityId: channelCategories.communityId, name: channelCategories.name, position: channelCategories.position })
+        .from(channelCategories).where(eq(channelCategories.communityId, community.id)).orderBy(channelCategories.position, channelCategories.name);
+    }
     const members = memberRows.map(({ role, ...member }) => ({ ...visibleMemberIdentity(member), role }));
-    res.json({ community, myRole: mine[0]?.role ?? null, myPermissions: permissionRows.map((row) => row.permission), members, channels: channelRows, pendingJoinRequests: pendingJoinCount?.value ?? 0 });
+    res.json({ community, myRole: mine[0]?.role ?? null, myPermissions: permissionRows.map((row) => row.permission), members, channels: channelRows, categories: categoryRows, pendingJoinRequests: pendingJoinCount?.value ?? 0 });
   }));
 
   router.patch('/communities/:communityId', asyncRoute(async (req, res) => {
     const communityId = req.params.communityId;
     if (!await hasPermission(currentUser(res).id, communityId, 'manage_community')) { res.status(403).json({ error: 'Não tens permissão para gerir a comunidade.' }); return; }
-    const input = z.object({ name: z.string().trim().min(2).max(80).optional(), description: z.string().trim().max(500).optional(), category: z.string().trim().min(1).max(40).optional(), imageUrl: z.string().url().max(500).startsWith('https://').nullable().optional(), rules: z.string().trim().max(4000).optional(), welcomeMessage: z.string().trim().max(1000).optional(), requireApproval: z.boolean().optional() }).safeParse(req.body);
+    const input = z.object({ name: z.string().trim().min(2).max(80).optional(), description: z.string().trim().max(500).optional(), category: z.string().trim().min(1).max(40).optional(), imageUrl: z.string().url().max(500).startsWith('https://').nullable().optional(), coverUrl: coverUrlSchema, coverColor: coverColorSchema, rules: z.string().trim().max(4000).optional(), welcomeMessage: z.string().trim().max(1000).optional(), requireApproval: z.boolean().optional() }).safeParse(req.body);
     if (!input.success || Object.keys(input.data).length === 0) { res.status(400).json({ error: 'Dados da comunidade inválidos.' }); return; }
     const [updated] = await db.update(communities).set(input.data).where(eq(communities.id, communityId)).returning();
     if (!updated) { res.status(404).json({ error: 'Comunidade não encontrada.' }); return; }
     await audit(communityId, currentUser(res).id, 'community.updated', null, '', null, { fields: Object.keys(input.data) });
+    await broadcastCommunityMembers(io, communityId, 'community:updated', { communityId });
     res.json({ community: updated });
   }));
 
@@ -483,6 +511,63 @@ export function createApi(io: SocketServer): Router {
       return created;
     });
     res.status(201).json({ channel });
+  }));
+
+  router.post('/communities/:communityId/channel-categories', asyncRoute(async (req, res) => {
+    const communityId = req.params.communityId;
+    if (!await hasPermission(currentUser(res).id, communityId, 'manage_channels')) { res.status(403).json({ error: 'Não tens permissão para gerir canais.' }); return; }
+    const input = z.object({ name: categoryNameSchema }).safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: 'O nome da categoria deve ter entre 1 e 40 caracteres.' }); return; }
+    const [last] = await db.select({ position: sql<number>`coalesce(max(${channelCategories.position}), -1)` }).from(channelCategories).where(eq(channelCategories.communityId, communityId));
+    const [category] = await db.insert(channelCategories).values({ communityId, name: input.data.name, position: Number(last.position) + 1 }).returning();
+    await broadcastCommunityMembers(io, communityId, 'channels:updated', { communityId });
+    res.status(201).json({ category });
+  }));
+
+  router.patch('/communities/:communityId/channel-categories/:categoryId', asyncRoute(async (req, res) => {
+    const { communityId, categoryId } = req.params;
+    if (!await hasPermission(currentUser(res).id, communityId, 'manage_channels')) { res.status(403).json({ error: 'Não tens permissão para gerir canais.' }); return; }
+    const input = z.object({ name: categoryNameSchema.optional(), position: z.number().int().min(0).optional() }).strict().safeParse(req.body);
+    if (!input.success || !Object.keys(input.data).length) { res.status(400).json({ error: 'Dados da categoria inválidos.' }); return; }
+    const [updated] = await db.update(channelCategories).set(input.data).where(and(eq(channelCategories.id, categoryId), eq(channelCategories.communityId, communityId))).returning();
+    if (!updated) { res.status(404).json({ error: 'Categoria não encontrada.' }); return; }
+    await broadcastCommunityMembers(io, communityId, 'channels:updated', { communityId });
+    res.json({ category: updated });
+  }));
+
+  router.delete('/communities/:communityId/channel-categories/:categoryId', asyncRoute(async (req, res) => {
+    const { communityId, categoryId } = req.params;
+    if (!await hasPermission(currentUser(res).id, communityId, 'manage_channels')) { res.status(403).json({ error: 'Não tens permissão para gerir canais.' }); return; }
+    const [removed] = await db.delete(channelCategories).where(and(eq(channelCategories.id, categoryId), eq(channelCategories.communityId, communityId))).returning({ id: channelCategories.id });
+    if (!removed) { res.status(404).json({ error: 'Categoria não encontrada.' }); return; }
+    await broadcastCommunityMembers(io, communityId, 'channels:updated', { communityId });
+    res.json({ ok: true });
+  }));
+
+  router.patch('/channels/:channelId/organization', asyncRoute(async (req, res) => {
+    const [channel] = await db.select({ id: channels.id, communityId: channels.communityId }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
+    if (!channel) { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
+    if (!await hasPermission(currentUser(res).id, channel.communityId, 'manage_channels')) { res.status(403).json({ error: 'Não tens permissão para gerir canais.' }); return; }
+    const input = z.object({ categoryId: uuid.nullable(), position: z.number().int().min(0) }).strict().safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: 'Categoria ou posição inválida.' }); return; }
+    if (input.data.categoryId) {
+      const [category] = await db.select({ id: channelCategories.id }).from(channelCategories).where(and(eq(channelCategories.id, input.data.categoryId), eq(channelCategories.communityId, channel.communityId))).limit(1);
+      if (!category) { res.status(400).json({ error: 'A categoria não pertence a esta comunidade.' }); return; }
+    }
+    await db.update(channels).set({ categoryId: input.data.categoryId, position: input.data.position }).where(eq(channels.id, channel.id));
+    await broadcastCommunityMembers(io, channel.communityId, 'channels:updated', { communityId: channel.communityId });
+    res.json({ ok: true });
+  }));
+
+  router.patch('/channels/:channelId/read-only', asyncRoute(async (req, res) => {
+    const [channel] = await db.select({ id: channels.id, communityId: channels.communityId }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
+    if (!channel) { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
+    if (!await hasPermission(currentUser(res).id, channel.communityId, 'manage_channels')) { res.status(403).json({ error: 'Não tens permissão para gerir canais.' }); return; }
+    const input = z.object({ readOnly: z.boolean() }).strict().safeParse(req.body);
+    if (!input.success) { res.status(400).json({ error: 'Escolhe se só os moderadores podem escrever.' }); return; }
+    await db.update(channels).set({ readOnly: input.data.readOnly }).where(eq(channels.id, channel.id));
+    await broadcastCommunityMembers(io, channel.communityId, 'channels:updated', { communityId: channel.communityId });
+    res.json({ ok: true });
   }));
 
   router.delete('/channels/:channelId', asyncRoute(async (req, res) => {
@@ -521,6 +606,15 @@ export function createApi(io: SocketServer): Router {
     res.json({ messages: ordered.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [], attachments: attachments[message.id] ?? [] })), hasMore, nextCursor: oldest ? `${oldest.createdAt.toISOString()}~${oldest.id}` : null });
   }));
 
+  router.post('/channels/:channelId/read', asyncRoute(async (req, res) => {
+    const userId = currentUser(res).id;
+    const [channel] = await db.select({ id: channels.id, communityId: channels.communityId }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
+    if (!channel || !await isMember(userId, channel.communityId) || await activeBan(channel.communityId, userId)) { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
+    const lastReadAt = new Date();
+    await db.insert(channelReads).values({ userId, channelId: channel.id, lastReadAt }).onConflictDoUpdate({ target: [channelReads.userId, channelReads.channelId], set: { lastReadAt } });
+    res.json({ lastReadAt: lastReadAt.toISOString() });
+  }));
+
   router.get('/channels/:channelId/pinned', asyncRoute(async (req, res) => {
     const [channel] = await db.select({ id: channels.id, communityId: channels.communityId }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
     const userId = currentUser(res).id;
@@ -536,8 +630,10 @@ export function createApi(io: SocketServer): Router {
   }));
 
   router.post('/channels/:channelId/messages', asyncRoute(async (req, res) => {
-    const [channel] = await db.select({ id: channels.id, communityId: channels.communityId, kind: channels.kind }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
-    if (!channel || channel.kind !== 'text' || !await hasPermission(currentUser(res).id, channel.communityId, 'send_messages')) { res.status(404).json({ error: 'Canal não encontrado ou acesso não autorizado.' }); return; }
+    const [channel] = await db.select({ id: channels.id, communityId: channels.communityId, kind: channels.kind, readOnly: channels.readOnly }).from(channels).where(eq(channels.id, req.params.channelId)).limit(1);
+    if (!channel || channel.kind !== 'text') { res.status(404).json({ error: 'Canal não encontrado ou acesso não autorizado.' }); return; }
+    if (!canWriteToChannel(channel.readOnly, await hasPermission(currentUser(res).id, channel.communityId, 'manage_channels'))) { res.status(403).json({ error: 'Neste canal só moderadores podem escrever.' }); return; }
+    if (!await hasPermission(currentUser(res).id, channel.communityId, 'send_messages')) { res.status(404).json({ error: 'Canal não encontrado ou acesso não autorizado.' }); return; }
     if (await activeBan(channel.communityId, currentUser(res).id)) { res.status(403).json({ error: 'O teu acesso a esta comunidade está banido.' }); return; }
     const mute = await activeMute(channel.communityId, currentUser(res).id);
     if (mute) { res.status(403).json({ error: `Foste silenciado até às ${new Intl.DateTimeFormat('pt-MZ', { hour: '2-digit', minute: '2-digit' }).format(mute.expiresAt)}.` }); return; }
@@ -747,10 +843,10 @@ export function createApi(io: SocketServer): Router {
 
   router.get('/communities/:communityId/bans', asyncRoute(async (req, res) => {
     const communityId = req.params.communityId;
-    if (!await hasPermission(currentUser(res).id, communityId, 'ban_members')) { res.status(403).json({ error: 'Não tens permissão para consultar banimentos.' }); return; }
+    if (!await hasPermission(currentUser(res).id, communityId, 'ban_members') && !await hasPermission(currentUser(res).id, communityId, 'view_audit_log')) { res.status(403).json({ error: 'Não tens permissão para consultar banimentos.' }); return; }
     const now = new Date();
-    const rows = await db.select({ userId: communityBans.userId, username: users.username, reason: communityBans.reason, createdAt: communityBans.createdAt, expiresAt: communityBans.expiresAt })
-      .from(communityBans).innerJoin(users, eq(communityBans.userId, users.id))
+    const rows = await db.select({ userId: communityBans.userId, username: users.username, reason: communityBans.reason, createdAt: communityBans.createdAt, expiresAt: communityBans.expiresAt, bannedBy: banActors.username })
+      .from(communityBans).innerJoin(users, eq(communityBans.userId, users.id)).innerJoin(banActors, eq(communityBans.actorId, banActors.id))
       .where(and(eq(communityBans.communityId, communityId), isNull(communityBans.revokedAt), or(isNull(communityBans.expiresAt), gt(communityBans.expiresAt, now))))
       .orderBy(desc(communityBans.createdAt));
     const seen = new Set<string>();
