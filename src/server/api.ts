@@ -391,10 +391,17 @@ export function createApi(io: SocketServer): Router {
   }));
 
   router.get('/communities/mine', asyncRoute(async (_req, res) => {
+    const userId = currentUser(res).id;
     const rows = await db.select({ id: communities.id, name: communities.name, slug: communities.slug, description: communities.description, category: communities.category, isPrivate: communities.isPrivate, role: communityRoles.key })
       .from(communityMembers).innerJoin(communities, eq(communityMembers.communityId, communities.id)).innerJoin(communityRoles, eq(communityMembers.roleId, communityRoles.id))
-      .where(eq(communityMembers.userId, currentUser(res).id)).orderBy(desc(communities.createdAt));
-    res.json({ communities: rows });
+      .where(eq(communityMembers.userId, userId)).orderBy(desc(communities.createdAt));
+    const unreadRows = await db.select({ communityId: channels.communityId, unreadCount: sql<number>`least(99, count(distinct ${messages.id}))`.mapWith(Number) })
+      .from(communityMembers).innerJoin(channels, eq(channels.communityId, communityMembers.communityId))
+      .leftJoin(channelReads, and(eq(channelReads.channelId, channels.id), eq(channelReads.userId, userId)))
+      .leftJoin(messages, and(eq(messages.channelId, channels.id), gt(messages.createdAt, channelReads.lastReadAt), ne(messages.authorId, userId)))
+      .where(eq(communityMembers.userId, userId)).groupBy(channels.communityId);
+    const unreadByCommunity = new Map(unreadRows.map((item) => [item.communityId, item.unreadCount]));
+    res.json({ communities: rows.map((item) => ({ ...item, unreadCount: unreadByCommunity.get(item.id) ?? 0 })) });
   }));
 
   router.get('/communities/explore', asyncRoute(async (req, res) => {
@@ -694,6 +701,7 @@ export function createApi(io: SocketServer): Router {
     const [row] = await db.select({ id: messages.id, clientMessageId: messages.clientMessageId, body: messages.body, replyToId: messages.replyToId, replyAuthor: replyAuthors.username, replyBody: replyMessages.body, createdAt: messages.createdAt, pinnedAt: messages.pinnedAt, pinnedBy: messages.pinnedBy, authorId: users.id, username: users.username, avatarUrl: users.avatarUrl, showAvatar: users.showAvatar })
       .from(messages).innerJoin(users, eq(messages.authorId, users.id)).leftJoin(replyMessages, eq(messages.replyToId, replyMessages.id)).leftJoin(replyAuthors, eq(replyMessages.authorId, replyAuthors.id))
       .where(and(eq(messages.channelId, channel.id), eq(messages.authorId, author.id), eq(messages.clientMessageId, input.data.clientMessageId))).limit(1);
+    const mentionedUserIds = new Set<string>();
     if (created && row) {
       const mentionedNames = [...new Set(Array.from(input.data.body.matchAll(/@([\p{L}\p{N}_-]{3,32})/gu), (match) => match[1].toLowerCase()))];
       if (mentionedNames.length) {
@@ -703,9 +711,14 @@ export function createApi(io: SocketServer): Router {
         const recipients = mentioned.filter((person) => person.id !== author.id);
         if (recipients.length) {
           await db.insert(messageMentions).values(recipients.map((person) => ({ messageId: row.id, userId: person.id }))).onConflictDoNothing();
+          recipients.forEach((person) => mentionedUserIds.add(person.id));
           for (const person of recipients) io.to(`user:${person.id}`).emit('mention:new', { username: author.username, channelId: channel.id, messageId: row.id });
         }
       }
+    }
+    if (created && row) {
+      const recipients = await db.select({ userId: communityMembers.userId }).from(communityMembers).where(eq(communityMembers.communityId, channel.communityId));
+      for (const recipient of recipients) if (recipient.userId !== author.id) io.to(`user:${recipient.userId}`).emit('channel:unread', { communityId: channel.communityId, channelId: channel.id, authorId: author.id, hasMention: mentionedUserIds.has(recipient.userId) });
     }
     if (row) {
       const attachments = await attachmentsForMessages([row.id]);
