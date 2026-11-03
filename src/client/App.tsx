@@ -2,7 +2,7 @@ import { type ChangeEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEv
 import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
-import { api, prepareCsrf, type Channel, type Community, type CommunityDetails, type Member, type MemberProfile, type Message, type MessageAttachment, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
+import { api, prepareCsrf, type ActiveInvitation, type Channel, type Community, type CommunityDetails, type InviteDuration, type InvitePreview, type InviteUseLimit, type JoinFlowInfo, type JoinRequest, type Member, type MemberProfile, type Message, type MessageAttachment, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
 import { EMOJI_CATEGORIES, EMOJI_INDEX, type EmojiCategoryId } from './emoji-data';
 import { toggleReactionSummary } from './reaction-state';
 import { applyDeafenState, audioOutputVolume, DEFAULT_AUDIO_PREFERENCES, microphoneConstraints, readAudioPreferences, writeAudioPreferences, type AudioPreferences, type VoiceProfile } from './audio-preferences';
@@ -18,7 +18,30 @@ type ProfileSaveData = { username: string; avatarUrl: string | null; avatarFile?
 type FloatingPosition = { side: FloatingSide; top: number };
 type FloatingDragState = { pointerId: number; startX: number; startY: number; startLeft: number; startTop: number; moved: boolean };
 const FLOATING_POSITION_KEY = 'mavuno-floating-button-position-v1';
+const INVITE_RETURN_KEY = 'mavuno-invite-return-v1';
 const roleLabels: Record<string, string> = { owner: 'Proprietário', admin: 'Administrador', moderator: 'Moderador', member: 'Membro' };
+
+function readInviteToken(): string | null {
+  const match = window.location.pathname.match(/^\/invite\/([\w-]{32,64})$/);
+  if (match) {
+    try { window.sessionStorage.setItem(INVITE_RETURN_KEY, match[1]); } catch { /* deep link still works from the URL */ }
+    return match[1];
+  }
+  try {
+    const saved = window.sessionStorage.getItem(INVITE_RETURN_KEY);
+    if (saved && /^[\w-]{32,64}$/.test(saved) && window.location.pathname === '/') {
+      window.history.replaceState({}, '', `/invite/${saved}`);
+      return saved;
+    }
+  } catch { /* session storage is optional */ }
+  return null;
+}
+
+function clearInviteReturn(token: string | null): void {
+  if (!token) return;
+  try { if (window.sessionStorage.getItem(INVITE_RETURN_KEY) === token) window.sessionStorage.removeItem(INVITE_RETURN_KEY); } catch { /* optional storage */ }
+  if (window.location.pathname === `/invite/${token}`) window.history.replaceState({}, '', '/');
+}
 
 function maxFloatingTop(): number { return Math.max(0, window.innerHeight - FLOATING_BUTTON_SIZE); }
 function readFloatingPosition(): FloatingPosition {
@@ -185,6 +208,10 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(true);
   const [sessionExpired, setSessionExpired] = useState(false);
+  const [inviteToken, setInviteToken] = useState<string | null>(() => readInviteToken());
+  const [invitePreview, setInvitePreview] = useState<InvitePreview | null>(null);
+  const [invitePreviewError, setInvitePreviewError] = useState('');
+  const [invitePreviewLoading, setInvitePreviewLoading] = useState(false);
   useEffect(() => { const expired = () => { setSessionExpired(true); setUser(null); }; window.addEventListener('mavuno:session-expired', expired); return () => window.removeEventListener('mavuno:session-expired', expired); }, []);
 
   useEffect(() => {
@@ -201,13 +228,42 @@ export default function App() {
     })();
   }, []);
 
+  useEffect(() => {
+    if (!inviteToken) { setInvitePreview(null); setInvitePreviewError(''); return; }
+    let active = true;
+    setInvitePreviewLoading(true); setInvitePreviewError(''); setInvitePreview(null);
+    void api<InvitePreview>(`/invites/${encodeURIComponent(inviteToken)}/preview`)
+      .then((result) => { if (active) setInvitePreview(result); })
+      .catch((cause) => { if (active) setInvitePreviewError(cause instanceof Error ? cause.message : 'Este convite já não é válido.'); })
+      .finally(() => { if (active) setInvitePreviewLoading(false); });
+    return () => { active = false; };
+  }, [inviteToken]);
+
+  const clearInvite = () => { clearInviteReturn(inviteToken); setInviteToken(null); setInvitePreview(null); setInvitePreviewError(''); };
+
   if (checking) return <main className="boot-screen"><span className="brand-mark">m</span><p>A preparar as conversas…</p></main>;
-  if (!user) return <AuthScreen notice={sessionExpired ? 'A tua sessão terminou. Inicia sessão novamente.' : ''} onAuthed={(next) => { setSessionExpired(false); setUser(next); }}/>;
-  return <Dashboard user={user} onUserChange={setUser} onLogout={() => setUser(null)}/>;
+  if (!user && inviteToken) return <InviteEntryScreen preview={invitePreview} error={invitePreviewError} loading={invitePreviewLoading} notice={sessionExpired ? 'A tua sessão terminou. Inicia sessão novamente.' : ''} onClear={clearInvite} onAuthed={(next) => { setSessionExpired(false); setUser(next); }}/>
+  if (!user) return <AuthScreen notice={sessionExpired ? 'A tua sessão terminou. Inicia sessão novamente.' : ''} onAuthed={(next) => { setSessionExpired(false); setUser(next); }}/>
+  return <Dashboard user={user} onUserChange={setUser} onLogout={() => setUser(null)} inviteToken={inviteToken} onClearInvite={clearInvite}/>;
 }
 
-function AuthScreen({ onAuthed, notice }: { onAuthed: (user: User) => void; notice?: string }) {
-  const [mode, setMode] = useState<'login' | 'register'>('login');
+function InvitePreviewCard({ preview }: { preview: InvitePreview }) {
+  return <article className="invite-preview-card">
+    {preview.imageUrl ? <img className="invite-preview-cover" src={preview.imageUrl} alt="" referrerPolicy="no-referrer"/> : <div className="invite-preview-cover invite-preview-fallback" aria-hidden="true">m</div>}
+    <div className="invite-preview-copy"><span className="muted">Convite para a comunidade</span><h2>{preview.name}</h2><p>{preview.description || 'Uma comunidade Mavuno.'}</p><small>{preview.memberCount} {preview.memberCount === 1 ? 'membro' : 'membros'}</small></div>
+  </article>;
+}
+
+function InviteEntryScreen({ preview, error, loading, notice, onClear, onAuthed }: { preview: InvitePreview | null; error: string; loading: boolean; notice: string; onClear: () => void; onAuthed: (user: User) => void }) {
+  const [authMode, setAuthMode] = useState<'login' | 'register' | null>(null);
+  if (authMode) return <AuthScreen initialMode={authMode} invitePreview={preview ?? undefined} notice={notice} onBack={() => setAuthMode(null)} onAuthed={onAuthed}/>;
+  return <main className="auth-wrap"><section className="auth-card invite-entry-card"><Brand/>
+    {loading ? <div className="empty-state">A verificar o convite…</div> : preview ? <><InvitePreviewCard preview={preview}/><p className="muted">Inicia sessão ou cria uma conta para veres a mensagem de boas-vindas e pedires entrada.</p><div className="invite-entry-actions"><button className="primary" onClick={() => setAuthMode('login')}>Entrar</button><button className="secondary" onClick={() => setAuthMode('register')}>Criar conta</button></div></> : <><h1>Convite indisponível</h1><p className="error-banner" role="status">{error || 'Este convite já não é válido.'}</p><button className="secondary" onClick={onClear}>Ir para o Mavuno</button></>}
+  </section></main>;
+}
+
+function AuthScreen({ onAuthed, notice, initialMode = 'login', invitePreview, onBack }: { onAuthed: (user: User) => void; notice?: string; initialMode?: 'login' | 'register'; invitePreview?: InvitePreview; onBack?: () => void }) {
+  const [mode, setMode] = useState<'login' | 'register'>(initialMode);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -234,6 +290,7 @@ function AuthScreen({ onAuthed, notice }: { onAuthed: (user: User) => void; noti
 
   return <main className="auth-wrap"><section className="auth-card">
     <Brand/>
+    {invitePreview && <><InvitePreviewCard preview={invitePreview}/>{onBack && <button type="button" className="text-button invite-back-button" onClick={onBack}>← Voltar ao convite</button>}</>}
     <h1>{mode === 'login' ? 'Continua a conversa' : 'Cria a tua conta'}</h1>
     <p className="muted">Comunidades leves, mesmo em ligações modestas.</p>
     {notice && <div className="notice" role="status">{notice}</div>}
@@ -254,7 +311,7 @@ function AuthScreen({ onAuthed, notice }: { onAuthed: (user: User) => void; noti
   </section></main>;
 }
 
-function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange: (user: User) => void; onLogout: () => void }) {
+function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }: { user: User; onUserChange: (user: User) => void; onLogout: () => void; inviteToken: string | null; onClearInvite: () => void }) {
   const [communities, setCommunities] = useState<Community[]>([]);
   const [details, setDetails] = useState<CommunityDetails | null>(null);
   const [channel, setChannel] = useState<Channel | null>(null);
@@ -315,6 +372,15 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
   const [audioError, setAudioError] = useState('');
   const [settingsSection, setSettingsSection] = useState<'account' | 'voice'>('account');
+  const [joinTarget, setJoinTarget] = useState<{ kind: 'invite' | 'community'; value: string } | null>(null);
+  const [joinInfo, setJoinInfo] = useState<JoinFlowInfo | null>(null);
+  const [joinInfoLoading, setJoinInfoLoading] = useState(false);
+  const [joinInfoError, setJoinInfoError] = useState('');
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [joinRequestsRefresh, setJoinRequestsRefresh] = useState(0);
+  const [actionToast, setActionToast] = useState<{ text: string; communityId: string } | null>(null);
+  const [inviteShare, setInviteShare] = useState<{ url: string; showOptions: boolean; duration: InviteDuration; maxUses: InviteUseLimit; copyBlocked: boolean } | null>(null);
+  const [inviteListRefresh, setInviteListRefresh] = useState(0);
   const [previousMicMuted, setPreviousMicMuted] = useState<boolean | null>(null);
   const [callTarget, setCallTarget] = useState<Member | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -328,6 +394,16 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const hintShownRef = useRef(false);
   useEffect(() => { actionMenuRef.current = actionMenu; }, [actionMenu]);
   useEffect(() => () => { attachmentDraftsRef.current.forEach((item) => URL.revokeObjectURL(item.previewUrl)); }, []);
+  useEffect(() => {
+    if (!inviteToken) return;
+    let active = true;
+    setJoinTarget({ kind: 'invite', value: inviteToken }); setJoinInfo(null); setJoinInfoError(''); setJoinInfoLoading(true);
+    void api<JoinFlowInfo>(`/invites/${encodeURIComponent(inviteToken)}/join-info`)
+      .then((result) => { if (active) setJoinInfo(result); })
+      .catch((cause) => { if (active) setJoinInfoError(cause instanceof Error ? cause.message : 'Este convite já não é válido.'); })
+      .finally(() => { if (active) setJoinInfoLoading(false); });
+    return () => { active = false; };
+  }, [inviteToken]);
   useEffect(() => {
     const nextChannelId = channel?.id ?? null;
     if (previousAttachmentChannelRef.current !== nextChannelId) {
@@ -364,6 +440,10 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
   const openMemberMenu = (member: Member, rect: MenuRect) => openActionMenu({ kind: 'member', member, rect });
   const isManager = details?.myRole === 'owner' || details?.myRole === 'admin';
   const canKick = ['owner', 'admin', 'moderator'].includes(details?.myRole ?? '');
+  const canManageCommunity = details?.myPermissions.includes('manage_community') ?? false;
+  const canManageRequests = details?.myPermissions.includes('manage_members') ?? false;
+  const canCreateInvites = details?.myPermissions.includes('create_invites') ?? false;
+  const canOpenAdmin = canKick || canManageCommunity || canManageRequests || canCreateInvites || (details?.myPermissions.includes('view_audit_log') ?? false);
   const activeCommunityId = details?.community.id;
   const quickItems = useMemo(() => communities.map((community) => ({ id: community.id, name: community.name })), [communities]);
 
@@ -462,7 +542,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       setPinnedMessages([]);
       navigateMobile('channels');
       if (autoChannel && data.myRole) {
-        const first = data.channels.find((item) => item.kind === 'text') ?? data.channels[0];
+        const first = data.channels.find((item) => item.kind === 'text' && item.name.toLocaleLowerCase() === 'geral') ?? data.channels.find((item) => item.kind === 'text') ?? data.channels[0];
         if (first) { setChannel(first); navigateMobile('chat'); }
       }
     } catch (cause) {
@@ -472,21 +552,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
 
   useEffect(() => {
     void loadCommunities();
-    const invite = window.location.pathname.match(/^\/invite\/([\w-]{32,64})$/);
-    if (invite) {
-      void api<{ communityId: string }>('/invites/' + invite[1] + '/join', { method: 'POST', body: '{}' })
-        .then(async (result) => {
-          window.history.replaceState({}, '', '/');
-          await loadCommunities();
-          await openCommunity(result.communityId);
-          notify('Entraste na comunidade.');
-        })
-        .catch((cause) => {
-          window.history.replaceState({}, '', '/');
-          notify(cause instanceof Error ? cause.message : 'Convite inválido ou expirado.');
-        });
-    }
-  }, [loadCommunities, openCommunity, notify]);
+  }, [loadCommunities]);
 
   useEffect(() => {
     const onOnline = () => setOnline(true);
@@ -653,6 +719,16 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     socket.on('community:banned', (event: { communityId: string; expiresAt?: string | null }) => {
       if (activeCommunityId === event.communityId) { setDetails(null); setChannel(null); setActionMenu(null); void loadCommunities(); }
       notify(event.expiresAt ? `Foste banido até ${new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(event.expiresAt))}.` : 'Foste banido permanentemente desta comunidade.');
+    });
+    socket.on('community:join-request-changed', (event: { communityId: string; requestId: string; status?: string; user?: { username?: string } }) => {
+      setJoinRequestsRefresh((version) => version + 1);
+      if (activeCommunityId === event.communityId) setDetails((current) => current ? { ...current, pendingJoinRequests: Math.max(0, (current.pendingJoinRequests ?? 0) + (event.status === 'pending' ? 1 : -1)) } : current);
+      if (event.status === 'pending') notify(`Novo pedido de entrada${event.user?.username ? ` de ${event.user.username}` : ''}.`);
+    });
+    socket.on('community:join-request-status', (event: { communityId: string; communityName: string; status: 'approved' | 'rejected' }) => {
+      setJoinInfo((current) => current?.id === event.communityId ? { ...current, requestPending: false, requestId: null, alreadyMember: event.status === 'approved' } : current);
+      if (event.status === 'approved') setActionToast({ text: `Já podes entrar em ${event.communityName}.`, communityId: event.communityId });
+      else notify(`O teu pedido para entrar em ${event.communityName} foi recusado.`);
     });
     return () => { socket.disconnect(); };
   }, [activeCommunityId, loadCommunities, notify]);
@@ -902,14 +978,72 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       notify('Canal apagado.');
     } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível apagar o canal.'); }
   };
-  const createInvite = async () => {
+  const openJoinInfo = async (target: { kind: 'invite' | 'community'; value: string }) => {
+    setJoinTarget(target); setJoinInfo(null); setJoinInfoError(''); setJoinInfoLoading(true);
+    try {
+      const path = target.kind === 'invite' ? `/invites/${encodeURIComponent(target.value)}/join-info` : `/communities/${encodeURIComponent(target.value)}/join-info`;
+      setJoinInfo(await api<JoinFlowInfo>(path));
+    } catch (cause) { setJoinInfoError(cause instanceof Error ? cause.message : 'Não foi possível abrir esta comunidade.'); }
+    finally { setJoinInfoLoading(false); }
+  };
+  const submitJoin = async (acceptedRules: boolean) => {
+    if (!joinTarget) return;
+    setJoinBusy(true); setJoinInfoError('');
+    try {
+      const path = joinTarget.kind === 'invite' ? `/invites/${encodeURIComponent(joinTarget.value)}/join` : `/communities/${encodeURIComponent(joinTarget.value)}/join`;
+      const result = await api<{ status: 'joined' | 'already_member' | 'pending'; communityId: string; requestId: string | null }>(path, { method: 'POST', body: JSON.stringify({ acceptedRules }) });
+      if (result.status === 'pending') {
+        setJoinInfo((current) => current ? { ...current, requestPending: true, requestId: result.requestId } : current);
+        if (joinTarget.kind === 'invite') onClearInvite();
+        notify('Pedido enviado. Vais poder entrar quando um moderador aprovar.');
+        return;
+      }
+      const alreadyMember = result.status === 'already_member';
+      if (joinTarget.kind === 'invite') onClearInvite();
+      setJoinInfo(null); setJoinTarget(null);
+      await loadCommunities();
+      await openCommunity(result.communityId);
+      notify(alreadyMember ? 'Já és membro desta comunidade.' : 'Entraste na comunidade.');
+    } catch (cause) { setJoinInfoError(cause instanceof Error ? cause.message : 'Não foi possível entrar nesta comunidade.'); }
+    finally { setJoinBusy(false); }
+  };
+  const cancelJoinRequest = async () => {
+    if (!joinInfo?.requestId) return;
+    setJoinBusy(true); setJoinInfoError('');
+    try {
+      await api(`/communities/${encodeURIComponent(joinInfo.id)}/join-requests/${encodeURIComponent(joinInfo.requestId)}/cancel`, { method: 'POST', body: '{}' });
+      setJoinInfo((current) => current ? { ...current, requestPending: false, requestId: null } : current);
+      notify('Pedido cancelado.');
+    } catch (cause) { setJoinInfoError(cause instanceof Error ? cause.message : 'Não foi possível cancelar o pedido.'); }
+    finally { setJoinBusy(false); }
+  };
+  const closeJoinFlow = () => {
+    if (joinTarget?.kind === 'invite') onClearInvite();
+    setJoinTarget(null); setJoinInfo(null); setJoinInfoError('');
+  };
+  const createInvite = async (duration: InviteDuration = '7d', maxUses: InviteUseLimit = null) => {
     if (!activeCommunityId) return;
     try {
-      const result = await api<{ inviteUrl: string }>(`/communities/${activeCommunityId}/invites`, { method: 'POST', body: '{}' });
+      const result = await api<{ inviteUrl: string }>(`/communities/${activeCommunityId}/invites`, { method: 'POST', body: JSON.stringify({ duration, maxUses }) });
       const url = `${window.location.origin}${result.inviteUrl}`;
-      try { await navigator.clipboard.writeText(url); notify('Ligação de convite copiada.'); }
-      catch { notify(`Convite: ${url}`); }
+      setInviteShare({ url, showOptions: false, duration, maxUses, copyBlocked: false });
+      setInviteListRefresh((version) => version + 1);
+      try { await navigator.clipboard.writeText(url); notify('Link copiado'); }
+      catch { setInviteShare((current) => current ? { ...current, copyBlocked: true } : current); }
     } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível criar convite.'); }
+  };
+  const copyInviteLink = async () => {
+    if (!inviteShare) return;
+    try { await navigator.clipboard.writeText(inviteShare.url); setInviteShare((current) => current ? { ...current, copyBlocked: false } : current); notify('Link copiado'); }
+    catch { setInviteShare((current) => current ? { ...current, copyBlocked: true } : current); notify('Seleciona o link e copia-o.'); }
+  };
+  const shareInviteLink = async () => {
+    if (!inviteShare) return;
+    if (navigator.share) {
+      try { await navigator.share({ title: 'Convite para a comunidade Mavuno', url: inviteShare.url }); return; }
+      catch (cause) { if (cause instanceof DOMException && cause.name === 'AbortError') return; }
+    }
+    await copyInviteLink();
   };
   const loadExplore = async (query = '') => {
     setExplore(true); setDetails(null); setChannel(null); navigateMobile('channels');
@@ -930,7 +1064,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       setDetails(null); setChannel(null); await loadCommunities(); notify('Saíste da comunidade.');
     } catch (cause) { notify(cause instanceof Error ? cause.message : 'Não foi possível sair.'); }
   };
-  const joinPublic = async (community: Community) => { await openCommunity(community.id, false); };
+  const joinPublic = async (community: Community) => { await openJoinInfo({ kind: 'community', value: community.id }); };
   const selectChannel = (item: Channel) => {
     if (!details?.myRole) { notify('Para abrir este canal, entra através de um convite válido.'); return; }
     setChannel(item); setPinnedMessages([]); navigateMobile('chat'); setReply(null);
@@ -1036,8 +1170,8 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
       <header className="side-header">
         <strong>{explore ? 'Explorar' : details?.community.name ?? 'As tuas conversas'}</strong>
         <div style={{ display: 'flex', gap: 4 }}>
-          {details && canKick && <button className="icon-button" title="Administração da comunidade" aria-label="Configurações da comunidade" onClick={() => setModal('admin')}>⚙</button>}
-          {details && isManager && <button className="icon-button" title="Criar convite" aria-label="Criar convite" onClick={() => void createInvite()}>↗</button>}
+          {details && canOpenAdmin && <button className="icon-button admin-gear-button" title="Administração da comunidade" aria-label={`Administração da comunidade${(details.pendingJoinRequests ?? 0) > 0 ? `, ${details.pendingJoinRequests} pedidos pendentes` : ''}`} onClick={() => setModal('admin')}>⚙{(details.pendingJoinRequests ?? 0) > 0 && <span className="admin-pending-badge">{details.pendingJoinRequests! > 99 ? '99+' : details.pendingJoinRequests}</span>}</button>}
+          {details && canCreateInvites && <button className="icon-button" title="Criar convite" aria-label="Criar convite" onClick={() => void createInvite()}>↗</button>}
           {details && isManager && <button className="icon-button" title="Criar canal" aria-label="Criar canal" onClick={() => setModal('channel')}>＋</button>}
         </div>
       </header>
@@ -1062,7 +1196,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
           <button type="button" className="member-remove member-action-trigger" aria-label={`Mais ações de ${member.username}`} onClick={(event) => { event.stopPropagation(); openMemberMenu(member, rectFor(event.currentTarget.getBoundingClientRect(), navigator.maxTouchPoints > 0)); }}>⋯</button>
         </div>)}
         {details.myRole && details.myRole !== 'owner' && <button className="text-button" style={{ marginTop: 12 }} onClick={() => void leaveCommunity()}>Sair da comunidade</button>}
-        {!details.myRole && <p className="muted" style={{ fontSize: 12, padding: 8 }}>Precisas de um convite para abrir os canais.</p>}
+        {!details.myRole && <p className="muted" style={{ fontSize: 12, padding: 8 }}>Consulta as regras e pede entrada para participar.</p>}
       </div> : <div className="side-content">
         <p className="muted" style={{ fontSize: 13, lineHeight: 1.6 }}>Escolhe uma comunidade à esquerda ou explora espaços públicos.</p>
         <button className="secondary" style={{ width: '100%' }} onClick={() => setModal('community')}>＋ Criar comunidade</button>
@@ -1144,7 +1278,7 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
         <h2>{details ? details.community.name : 'Conversas com espaço para todos.'}</h2>
         <p className="muted">{details ? details.community.description || 'Uma comunidade Mavuno.' : 'Cria uma comunidade ou descobre uma conversa pública.'}</p>
         {details && <p className="muted" style={{ fontSize: 13 }}>{details.community.category} · {details.members.length} membros · {details.channels.length} canais</p>}
-        {details && !details.myRole && <p className="notice">Esta comunidade é pública. Para participar nos canais, entra através de um convite válido.</p>}
+        {details && !details.myRole && <p className="notice">Consulta as regras e pede entrada para participar.</p>}
         {!details && <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}><button className="primary" onClick={() => setModal('community')}>Criar comunidade</button><button className="secondary" onClick={() => void loadExplore()}>Explorar comunidades</button></div>}
       </section>}
     </main>
@@ -1165,13 +1299,16 @@ function Dashboard({ user, onUserChange, onLogout }: { user: User; onUserChange:
     }
     {modal === 'community' && <CommunityModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createCommunity(data)}/>}
     {modal === 'channel' && <ChannelModal busy={busy} onClose={() => setModal(null)} onCreate={(data) => void createChannel(data)}/>}
-    {modal === 'admin' && details && <AdminModal details={details} onClose={() => setModal(null)} onSaved={() => { if (activeCommunityId) void openCommunity(activeCommunityId, false); }}/>}
+    {modal === 'admin' && details && <AdminModal details={details} requestRefresh={joinRequestsRefresh} inviteRefresh={inviteListRefresh} onClose={() => setModal(null)} onSaved={() => { if (activeCommunityId) void openCommunity(activeCommunityId, false); }}/>}
+    {joinTarget && <JoinFlowModal info={joinInfo} loading={joinInfoLoading} error={joinInfoError} busy={joinBusy} onClose={closeJoinFlow} onJoin={(accepted) => void submitJoin(accepted)} onCancelRequest={() => void cancelJoinRequest()}/>}
+    {inviteShare && <InviteSharePanel share={inviteShare} onChange={(patch) => setInviteShare((current) => current ? { ...current, ...patch } : current)} onClose={() => setInviteShare(null)} onCopy={() => void copyInviteLink()} onShare={() => void shareInviteLink()} onCreate={(duration, maxUses) => void createInvite(duration, maxUses)}/>}
     {modal === 'profile' && <ProfileModal data={ownProfile} loading={profileLoading} error={ownProfileError} online={online && !reconnecting} busy={profileBusy} onClose={() => setModal(null)} onReload={() => void openOwnProfile()} onLogout={onLogout} onSave={(data) => void updateProfile(data)}/>}
     {modal === 'memberProfile' && <MemberProfileSheet profile={memberProfile} loading={memberProfileLoading} error={memberProfileError} onClose={closeMemberProfile}/>}
     {modal === 'account' && <AccountModal user={user} onClose={() => setModal(null)} onEditProfile={() => setModal('profile')}/>}
     {modal === 'settings' && <SettingsModal user={user} section={settingsSection} preferences={audioPreferences} devices={audioDevices} audioError={audioError} onSection={setSettingsSection} onChange={saveAudio} onRequestMic={() => void requestMicrophone()} onOpenProfile={() => { setModal('profile'); void openOwnProfile(); }} onLogout={logout} onClose={() => setModal(null)}/>}
     <PrivateCallDock target={callTarget} onClearTarget={() => setCallTarget(null)} notify={notify} preferences={audioPreferences} onAudioChange={saveAudio}/>
     {audioMenu && createPortal(<div className="audio-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) setAudioMenu(null); }}><AudioMenu kind={audioMenu} preferences={audioPreferences} devices={audioDevices} error={audioError} onClose={() => setAudioMenu(null)} onToggleMute={toggleMute} onToggleDeafen={toggleDeafen} onChange={saveAudio} onRequestMic={() => void requestMicrophone()} onSettings={() => { setAudioMenu(null); setSettingsSection('voice'); setModal('settings'); }}/></div>, document.body)}
+    {actionToast && <div className="toast toast-action" role="status"><span>{actionToast.text}</span><button className="primary" onClick={() => { const destination = actionToast.communityId; setActionToast(null); void openCommunity(destination); }}>Abrir</button><button className="icon-button" aria-label="Fechar aviso" onClick={() => setActionToast(null)}>×</button></div>}
     {toast && <div className="toast" role="status">{toast}</div>}
   </div>;
 }
@@ -1242,17 +1379,30 @@ function PrivateCallDock({ target, onClearTarget, notify, preferences, onAudioCh
   return <aside className="call-dock" role="dialog" aria-label="Chamada privada"><div className="call-dock-header"><Avatar name={call.peer?.username ?? 'Utilizador'} url={call.peer?.avatarUrl} size={38}/><div><strong>Chamada com {call.peer?.username ?? 'utilizador'}</strong><span className="muted">{statusLabels[call.status]}{connecting ? '…' : ''}</span></div></div>{error && <p className="error-banner">{error}</p>}{call.status === 'ringing' && <div className="call-actions"><button className="primary" onClick={() => void update('accepted')}>Aceitar</button><button className="secondary" onClick={() => void update('rejected')}>Recusar</button></div>}{call.status === 'in_progress' && <div className="call-actions"><button className="secondary" onClick={() => void toggleMicrophone()}>{micOn ? 'Silenciar' : 'Ativar microfone'}</button><button className="danger-button" onClick={() => void close()}>Terminar</button></div>}{['failed', 'ended', 'rejected', 'timeout'].includes(call.status) && <button className="secondary" onClick={() => setCall(null)}>Fechar</button>}</aside>;
 }
 
-function AdminModal({ details, onClose, onSaved }: { details: CommunityDetails; onClose: () => void; onSaved: () => void }) {
+function AdminModal({ details, requestRefresh, inviteRefresh, onClose, onSaved }: { details: CommunityDetails; requestRefresh: number; inviteRefresh: number; onClose: () => void; onSaved: () => void }) {
   type AuditEntry = { id: string; action: string; reason: string; durationSeconds: number | null; metadata: string; createdAt: string; actorId: string; actorUsername: string; targetUserId: string | null };
   type BanEntry = { userId: string; username: string; reason: string; createdAt: string; expiresAt: string | null };
+  const permissions = details.myPermissions;
+  const canEditCommunity = permissions.includes('manage_community');
+  const canReviewRequests = permissions.includes('manage_members');
+  const canManageInvites = permissions.includes('create_invites');
+  const canReviewBans = permissions.includes('ban_members');
+  const canReviewAudit = permissions.includes('view_audit_log');
+  const initialTab = canEditCommunity ? 'community' : canReviewRequests ? 'requests' : canManageInvites ? 'invites' : canReviewBans ? 'bans' : 'audit';
   const [busy, setBusy] = useState(false);
+  const [busyRequestId, setBusyRequestId] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
-  const [tab, setTab] = useState<'community' | 'bans' | 'audit'>(details.myRole === 'moderator' ? 'audit' : 'community');
+  const [tab, setTab] = useState<'community' | 'invites' | 'requests' | 'bans' | 'audit'>(initialTab);
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [bans, setBans] = useState<BanEntry[]>([]);
+  const [invites, setInvites] = useState<ActiveInvitation[]>([]);
+  const [requests, setRequests] = useState<JoinRequest[]>([]);
   const [loadingAudit, setLoadingAudit] = useState(false);
   const [loadingBans, setLoadingBans] = useState(false);
+  const [loadingInvites, setLoadingInvites] = useState(false);
+  const [loadingRequests, setLoadingRequests] = useState(false);
+  const [welcomeLength, setWelcomeLength] = useState(details.community.welcomeMessage?.length ?? 0);
   const loadAudit = async () => {
     setLoadingAudit(true); setError('');
     try { const result = await api<{ entries: AuditEntry[] }>(`/communities/${details.community.id}/audit-log`); setEntries(result.entries); }
@@ -1265,11 +1415,28 @@ function AdminModal({ details, onClose, onSaved }: { details: CommunityDetails; 
     catch { setError('Não foi possível carregar os banimentos.'); }
     finally { setLoadingBans(false); }
   };
-  useEffect(() => { if (tab === 'audit') void loadAudit(); else if (tab === 'bans') void loadBans(); }, [tab, details.community.id]);
+  const loadInvites = async () => {
+    setLoadingInvites(true); setError('');
+    try { const result = await api<{ invites: ActiveInvitation[] }>(`/communities/${details.community.id}/invites`); setInvites(result.invites); }
+    catch { setError('Não foi possível carregar os convites ativos.'); }
+    finally { setLoadingInvites(false); }
+  };
+  const loadRequests = async () => {
+    setLoadingRequests(true); setError('');
+    try { const result = await api<{ requests: JoinRequest[] }>(`/communities/${details.community.id}/join-requests`); setRequests(result.requests); }
+    catch { setError('Não foi possível carregar os pedidos de entrada.'); }
+    finally { setLoadingRequests(false); }
+  };
+  useEffect(() => {
+    if (tab === 'audit') void loadAudit();
+    else if (tab === 'bans') void loadBans();
+    else if (tab === 'invites') void loadInvites();
+    else if (tab === 'requests') void loadRequests();
+  }, [tab, details.community.id, requestRefresh, inviteRefresh]);
   const save = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault(); setBusy(true); setError(''); const form = new FormData(event.currentTarget);
     try {
-      await api(`/communities/${details.community.id}`, { method: 'PATCH', body: JSON.stringify({ name: String(form.get('name')), description: String(form.get('description')), category: String(form.get('category')), rules: String(form.get('rules')) }) });
+      await api(`/communities/${details.community.id}`, { method: 'PATCH', body: JSON.stringify({ name: String(form.get('name')), description: String(form.get('description')), category: String(form.get('category')), rules: String(form.get('rules')), welcomeMessage: String(form.get('welcomeMessage')), requireApproval: Boolean(form.get('requireApproval')) }) });
       onSaved(); onClose();
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível guardar.'); }
     finally { setBusy(false); }
@@ -1280,6 +1447,20 @@ function AdminModal({ details, onClose, onSaved }: { details: CommunityDetails; 
     try { await api(`/communities/${details.community.id}/bans/${userId}`, { method: 'DELETE' }); await loadBans(); setSuccess('Banimento revogado.'); }
     catch { setError('Não foi possível revogar o banimento.'); }
   };
+  const revokeInvite = async (invite: ActiveInvitation) => {
+    if (!window.confirm('Revogar este convite? A ligação deixará de funcionar.')) return;
+    setError('');
+    try { await api(`/communities/${details.community.id}/invites/${invite.id}`, { method: 'DELETE' }); await loadInvites(); setSuccess('Convite revogado.'); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível revogar o convite.'); }
+  };
+  const decideRequest = async (request: JoinRequest, action: 'approve' | 'reject') => {
+    setBusyRequestId(request.id); setError(''); setSuccess('');
+    try {
+      await api(`/communities/${details.community.id}/join-requests/${request.id}/${action}`, { method: 'POST', body: '{}' });
+      await loadRequests(); setSuccess(action === 'approve' ? `Pedido de ${request.username} aprovado.` : `Pedido de ${request.username} recusado.`);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Não foi possível decidir este pedido.'); }
+    finally { setBusyRequestId(null); }
+  };
   const actionLabels: Record<string, string> = {
     'member.banned': 'Banimento aplicado', 'member.unbanned': 'Banimento revogado', 'member.kicked': 'Membro expulso',
     'member.muted': 'Silenciamento aplicado', 'member.unmuted': 'Silenciamento removido', 'member.role_changed': 'Cargo alterado',
@@ -1287,30 +1468,77 @@ function AdminModal({ details, onClose, onSaved }: { details: CommunityDetails; 
   };
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section className="modal admin-modal" role="dialog" aria-modal="true" aria-labelledby="admin-title">
-      <div className="admin-heading"><div><h2 id="admin-title">Administração</h2><p className="muted">Regras, membros e atividade da comunidade.</p></div><button type="button" className="icon-button" aria-label="Fechar administração" onClick={onClose}>×</button></div>
+      <div className="admin-heading"><div><h2 id="admin-title">Administração</h2><p className="muted">Boas-vindas, convites, pedidos e atividade da comunidade.</p></div><button type="button" className="icon-button" aria-label="Fechar administração" onClick={onClose}>×</button></div>
       <div className="admin-tabs" role="tablist" aria-label="Secções de administração">
-        {['owner', 'admin'].includes(details.myRole ?? '') && <button className={tab === 'community' ? 'active' : ''} role="tab" aria-selected={tab === 'community'} onClick={() => setTab('community')}>Comunidade</button>}
-        <button className={tab === 'bans' ? 'active' : ''} role="tab" aria-selected={tab === 'bans'} onClick={() => setTab('bans')}>Banimentos</button>
-        <button className={tab === 'audit' ? 'active' : ''} role="tab" aria-selected={tab === 'audit'} onClick={() => setTab('audit')}>Auditoria</button>
+        {canEditCommunity && <button className={tab === 'community' ? 'active' : ''} role="tab" aria-selected={tab === 'community'} onClick={() => setTab('community')}>Comunidade</button>}
+        {canManageInvites && <button className={tab === 'invites' ? 'active' : ''} role="tab" aria-selected={tab === 'invites'} onClick={() => setTab('invites')}>Convites</button>}
+        {canReviewRequests && <button className={tab === 'requests' ? 'active' : ''} role="tab" aria-selected={tab === 'requests'} onClick={() => setTab('requests')}>Pedidos{(details.pendingJoinRequests ?? 0) > 0 ? ` · ${details.pendingJoinRequests}` : ''}</button>}
+        {canReviewBans && <button className={tab === 'bans' ? 'active' : ''} role="tab" aria-selected={tab === 'bans'} onClick={() => setTab('bans')}>Banimentos</button>}
+        {canReviewAudit && <button className={tab === 'audit' ? 'active' : ''} role="tab" aria-selected={tab === 'audit'} onClick={() => setTab('audit')}>Auditoria</button>}
       </div>
       {error && <p className="error-banner" role="alert">{error}</p>}{success && <p className="notice" role="status">{success}</p>}
-      {tab === 'community' && ['owner', 'admin'].includes(details.myRole ?? '') && <form onSubmit={(event) => void save(event)}>
-        <label className="field">Nome<input name="name" defaultValue={details.community.name} required/></label>
-        <label className="field">Descrição<textarea name="description" defaultValue={details.community.description} rows={3}/></label>
-        <label className="field">Categoria<input name="category" defaultValue={details.community.category} required/></label>
-        <label className="field">Regras<textarea name="rules" defaultValue={details.community.rules ?? ''} rows={4} placeholder="Regras da comunidade"/></label>
+      {tab === 'community' && canEditCommunity && <form onSubmit={(event) => void save(event)}>
+        <label className="field">Nome<input name="name" defaultValue={details.community.name} required maxLength={80}/></label>
+        <label className="field">Descrição<textarea name="description" defaultValue={details.community.description} maxLength={500} rows={3}/></label>
+        <label className="field">Categoria<input name="category" defaultValue={details.community.category} required maxLength={40}/></label>
+        <label className="field">Mensagem de boas-vindas<textarea name="welcomeMessage" defaultValue={details.community.welcomeMessage ?? ''} maxLength={1000} rows={3} onChange={(event) => setWelcomeLength(event.target.value.length)}/><small className="muted form-counter">{welcomeLength}/1000</small></label>
+        <label className="field">Regras<textarea name="rules" defaultValue={details.community.rules ?? ''} maxLength={4000} rows={4} placeholder="Regras da comunidade"/></label>
+        <label className="approval-toggle"><input name="requireApproval" type="checkbox" defaultChecked={details.community.requireApproval ?? false}/><span><strong>Pedir aprovação para entrar</strong><small>Quem usar um convite fica à espera de aprovação.</small></span></label>
         <div className="admin-summary"><strong>Gestão de membros</strong><span>{details.members.length} membros · {details.channels.length} canais</span><span>Altera cargos e gere silenciamentos pelo menu de cada membro.</span></div>
         <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary" disabled={busy}>{busy ? 'A guardar…' : 'Guardar alterações'}</button></div>
       </form>}
-      {tab === 'bans' && <div className="admin-list-section"><div className="admin-list-heading"><strong>Banimentos ativos</strong><button className="text-button" onClick={() => void loadBans()} disabled={loadingBans}>Atualizar</button></div>
+      {tab === 'invites' && canManageInvites && <div className="admin-list-section"><div className="admin-list-heading"><strong>Convites ativos</strong><button className="text-button" onClick={() => void loadInvites()} disabled={loadingInvites}>Atualizar</button></div>
+        {loadingInvites ? <div className="empty-state">A carregar…</div> : invites.length === 0 ? <div className="empty-state">Não há convites ativos.</div> : <div className="admin-clean-list">{invites.map((invite) => <div className="admin-list-row" key={invite.id}><div className="admin-list-copy"><strong>Criado por {invite.createdBy}</strong><span className="muted">{invite.expiresAt ? `Termina ${new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(invite.expiresAt))}` : 'Sem validade'} · {invite.maxUses === null ? 'Usos ilimitados' : `${invite.useCount}/${invite.maxUses} utilizações`}</span><span className="muted">Criado em {new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(invite.createdAt))}</span></div><button className="danger-button" onClick={() => void revokeInvite(invite)}>Revogar</button></div>)}</div>}
+      </div>}
+      {tab === 'requests' && canReviewRequests && <div className="admin-list-section"><div className="admin-list-heading"><strong>Pedidos de entrada</strong><button className="text-button" onClick={() => void loadRequests()} disabled={loadingRequests}>Atualizar</button></div>
+        {loadingRequests ? <div className="empty-state">A carregar…</div> : requests.length === 0 ? <div className="empty-state">Não há pedidos pendentes.</div> : <div className="admin-clean-list">{requests.map((request) => <div className="join-request-row" key={request.id}><div className="join-request-person"><Avatar name={request.username} url={request.avatarUrl} size={38}/><div className="admin-list-copy"><strong>{request.username}</strong><span className="muted">Pedido em {new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(request.createdAt))}</span></div></div><div className="join-request-actions"><button className="primary" disabled={busyRequestId === request.id} onClick={() => void decideRequest(request, 'approve')}>Aprovar</button><button className="secondary" disabled={busyRequestId === request.id} onClick={() => void decideRequest(request, 'reject')}>Recusar</button></div></div>)}</div>}
+      </div>}
+      {tab === 'bans' && canReviewBans && <div className="admin-list-section"><div className="admin-list-heading"><strong>Banimentos ativos</strong><button className="text-button" onClick={() => void loadBans()} disabled={loadingBans}>Atualizar</button></div>
         {loadingBans ? <div className="empty-state">A carregar…</div> : bans.length === 0 ? <div className="empty-state">Não há banimentos ativos.</div> : <div className="admin-clean-list">{bans.map((ban) => <div className="admin-list-row" key={ban.userId}><div className="admin-list-copy"><strong>{ban.username}</strong><span className="muted">{banExpiryLabel(ban.expiresAt)} · aplicado em {new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(ban.createdAt))}</span>{ban.reason && <span className="muted">{ban.reason}</span>}</div><button className="secondary" onClick={() => void revokeBan(ban.userId)}>Revogar banimento</button></div>)}</div>}
       </div>}
-      {tab === 'audit' && <div className="admin-list-section"><div className="admin-list-heading"><strong>Atividade recente</strong><button className="text-button" onClick={() => void loadAudit()} disabled={loadingAudit}>Atualizar</button></div>
+      {tab === 'audit' && canReviewAudit && <div className="admin-list-section"><div className="admin-list-heading"><strong>Atividade recente</strong><button className="text-button" onClick={() => void loadAudit()} disabled={loadingAudit}>Atualizar</button></div>
         {loadingAudit ? <div className="empty-state">A carregar…</div> : entries.length === 0 ? <div className="empty-state">Ainda não há ações registadas.</div> : <div className="admin-clean-list">{entries.map((entry) => <article className="audit-row" key={entry.id}><div className="audit-row-top"><strong>{actionLabels[entry.action] ?? 'Ação da comunidade'}</strong><time>{new Intl.DateTimeFormat('pt-MZ', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(entry.createdAt))}</time></div><span className="muted">Por {entry.actorUsername}{entry.targetUserId ? ` · Utilizador ${entry.targetUserId.slice(0, 8)}` : ''}</span>{entry.reason && <p>{entry.reason}</p>}</article>)}</div>}
       </div>}
     </section>
   </div>;
 }
+function JoinFlowModal({ info, loading, error, busy, onClose, onJoin, onCancelRequest }: { info: JoinFlowInfo | null; loading: boolean; error: string; busy: boolean; onClose: () => void; onJoin: (acceptedRules: boolean) => void; onCancelRequest: () => void }) {
+  const [acceptedRules, setAcceptedRules] = useState(false);
+  useEffect(() => { setAcceptedRules(!info?.rules.trim()); }, [info?.id]);
+  const rulesRequired = Boolean(info?.rules.trim());
+  const headline = info?.alreadyMember ? 'Já fazes parte desta comunidade' : info?.requestPending ? 'Pedido enviado' : info?.requireApproval ? 'Pedir para entrar' : 'Antes de entrar';
+  return <div className="modal-backdrop join-flow-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="modal join-flow-modal" role="dialog" aria-modal="true" aria-labelledby="join-flow-title">
+      <div className="join-flow-heading"><div><h2 id="join-flow-title">{info?.name ?? 'Convite'}</h2><p className="muted">{headline}</p></div><button className="icon-button" aria-label="Fechar" onClick={onClose}>×</button></div>
+      {loading ? <div className="empty-state">A carregar…</div> : info ? <>
+        {info.imageUrl ? <img className="join-flow-cover" src={info.imageUrl} alt="" referrerPolicy="no-referrer"/> : <div className="join-flow-cover join-flow-cover-empty" aria-hidden="true">{initials(info.name)}</div>}
+        <div className="join-flow-details"><p className="join-flow-description">{info.description || 'Uma comunidade Mavuno.'}</p><span className="muted">{info.memberCount} {info.memberCount === 1 ? 'membro' : 'membros'}</span>
+          {info.welcomeMessage?.trim() && <section className="join-welcome-message"><h3>Boas-vindas</h3><p>{info.welcomeMessage}</p></section>}
+          {rulesRequired && <section className="join-rules-block"><h3>Regras</h3><div className="join-rules-text">{info.rules}</div><label className="join-rules-accept"><input type="checkbox" checked={acceptedRules} disabled={info.alreadyMember || info.requestPending} onChange={(event) => setAcceptedRules(event.target.checked)}/><span>Li e aceito as regras desta comunidade.</span></label></section>}
+          {info.requestPending && <div className="notice join-pending-notice" role="status">O teu pedido está à espera de aprovação dos moderadores. Não gastaste uma utilização do convite.</div>}
+          {!info.alreadyMember && !info.requestPending && info.requireApproval && <p className="muted join-approval-help">Um moderador irá analisar o teu pedido antes de poderes participar.</p>}
+        </div>
+        {error && <p className="error-banner" role="alert">{error}</p>}
+        <div className="modal-actions join-flow-actions">
+          {info.requestPending ? <><button type="button" className="secondary" onClick={onClose}>Fechar</button>{info.requestId && <button type="button" className="danger-button" disabled={busy} onClick={onCancelRequest}>{busy ? 'A cancelar…' : 'Cancelar pedido'}</button>}</> : <><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button type="button" className="primary" disabled={busy || (rulesRequired && !acceptedRules)} onClick={() => onJoin(info.alreadyMember ? false : acceptedRules)}>{busy ? 'A processar…' : info.alreadyMember ? 'Abrir comunidade' : info.requireApproval ? 'Pedir para entrar' : 'Entrar na comunidade'}</button></>}
+        </div>
+      </> : <><p className="error-banner" role="alert">{error || 'Este convite já não é válido.'}</p><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Fechar</button></div></>}
+    </section>
+  </div>;
+}
+
+function InviteSharePanel({ share, onChange, onClose, onCopy, onShare, onCreate }: { share: { url: string; showOptions: boolean; duration: InviteDuration; maxUses: InviteUseLimit; copyBlocked: boolean }; onChange: (patch: Partial<typeof share>) => void; onClose: () => void; onCopy: () => void; onShare: () => void; onCreate: (duration: InviteDuration, maxUses: InviteUseLimit) => Promise<void> | void }) {
+  const [creating, setCreating] = useState(false);
+  const createAnother = async () => { setCreating(true); try { await onCreate(share.duration, share.maxUses); } finally { setCreating(false); } };
+  return <div className="modal-backdrop invite-share-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="modal invite-share-panel" role="dialog" aria-modal="true" aria-labelledby="invite-share-title">
+      <div className="sheet-heading"><div><h2 id="invite-share-title">Convidar para a comunidade</h2><p className="muted">Partilha esta ligação com as pessoas que queres convidar.</p></div><button className="icon-button" aria-label="Fechar convite" onClick={onClose}>×</button></div>
+      {share.url ? <><label className="field">Ligação do convite<input className="invite-link-input" type="url" readOnly value={share.url} onFocus={(event) => event.currentTarget.select()} aria-label="Link do convite"/></label><div className="invite-share-actions"><button type="button" className="primary" onClick={onShare}>Partilhar</button><button type="button" className="secondary" onClick={onCopy}>{share.copyBlocked ? 'Copiar' : 'Copiar outra vez'}</button></div><button type="button" className="text-button invite-options-toggle" aria-expanded={share.showOptions} onClick={() => onChange({ showOptions: !share.showOptions })}>{share.showOptions ? 'Fechar opções' : 'Criar outro link com opções diferentes'}</button></> : <p className="muted">Escolhe a validade e quantas vezes o convite pode ser usado.</p>}
+      {share.showOptions && <div className="invite-options-form"><label className="field">Duração<select value={share.duration} onChange={(event) => onChange({ duration: event.target.value as InviteDuration })}><option value="30m">30 minutos</option><option value="1h">1 hora</option><option value="1d">1 dia</option><option value="7d">7 dias</option><option value="never">Sem validade</option></select></label><label className="field">Limite de utilizações<select value={share.maxUses ?? 'unlimited'} onChange={(event) => onChange({ maxUses: event.target.value === 'unlimited' ? null : Number(event.target.value) as InviteUseLimit })}><option value="1">1 utilização</option><option value="5">5 utilizações</option><option value="25">25 utilizações</option><option value="unlimited">Ilimitadas</option></select></label><button type="button" className="primary" disabled={creating} onClick={() => void createAnother()}>{creating ? 'A criar…' : share.url ? 'Criar novo link' : 'Criar convite'}</button></div>}
+    </section>
+  </div>;
+}
+
 function CommunityModal({ busy, onClose, onCreate }: {
   busy: boolean; onClose: () => void;
   onCreate: (data: { name: string; description: string; category: string; isPrivate: boolean }) => void;
