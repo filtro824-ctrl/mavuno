@@ -2,7 +2,7 @@ import { type ChangeEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEv
 import { createPortal } from 'react-dom';
 import { io } from 'socket.io-client';
 import type { Room, RemoteParticipant } from 'livekit-client';
-import { api, prepareCsrf, type ActiveInvitation, type Channel, type ChannelCategory, type Community, type CommunityDetails, type InviteDuration, type InvitePreview, type InviteUseLimit, type JoinFlowInfo, type JoinRequest, type Member, type MemberProfile, type Message, type MessageAttachment, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User } from './api';
+import { api, prepareCsrf, type ActiveInvitation, type Channel, type ChannelCategory, type Community, type CommunityDetails, type InviteDuration, type InvitePreview, type InviteUseLimit, type JoinFlowInfo, type JoinRequest, type Member, type MemberProfile, type Message, type MessageAttachment, type OwnProfileResponse, type PrivateCall, type PrivateCallStatus, type ProfileVisibility, type ReactionSummary, type User, type CommunityAssetsResponse, type CommunityAsset } from './api';
 import { EMOJI_CATEGORIES, EMOJI_INDEX, type EmojiCategoryId } from './emoji-data';
 import { toggleReactionSummary } from './reaction-state';
 import { applyDeafenState, audioOutputVolume, DEFAULT_AUDIO_PREFERENCES, microphoneConstraints, readAudioPreferences, writeAudioPreferences, type AudioPreferences, type VoiceProfile } from './audio-preferences';
@@ -11,6 +11,7 @@ import { ATTACHMENT_TYPES, validateAttachmentMetadata, type AttachmentKind } fro
 import { profileMediaReferenceOwnedBy, type ProfileMediaKind } from '../server/profile-media-utils';
 import { clampFloatingPosition, FLOATING_BUTTON_SIZE, floatingTuckOffset, nearestFloatingSide, type FloatingSide } from './floating-button-utils';
 import { ProfileImageCropper } from './profile-image-cropper';
+import { AssetReaction, CommunityEmojiPicker, CommunityStickerPicker, InlineEmojiText, MessageStickerView } from './community-assets';
 
 type ModalType = 'community' | 'channel' | 'profile' | 'memberProfile' | 'account' | 'settings' | 'admin' | null;
 type PendingAttachment = { key: string; file: File; previewUrl: string; mimeType: string; kind: AttachmentKind; width: number | null; height: number | null; attachmentId?: string; progress: number; status: 'queued' | 'uploading' | 'ready' | 'failed'; error?: string };
@@ -391,6 +392,8 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
   const [pinnedOpen, setPinnedOpen] = useState(false);
   const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
   const [emojiPickerTarget, setEmojiPickerTarget] = useState<'composer' | { messageId: string } | null>(null);
+  const [stickerPickerOpen, setStickerPickerOpen] = useState(false);
+  const [communityAssets, setCommunityAssets] = useState<CommunityAssetsResponse | null>(null);
   const [reactionUsers, setReactionUsers] = useState<{ messageId: string; emoji: string; users: string[]; loading: boolean } | null>(null);
   const [pendingReactionKeys, setPendingReactionKeys] = useState<Set<string>>(new Set());
   const pendingReactionKeysRef = useRef(new Set<string>());
@@ -493,6 +496,11 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
   const canOpenAdmin = canKick || canManageCommunity || canManageRequests || canCreateInvites || (details?.myPermissions.includes('manage_channels') ?? false) || (details?.myPermissions.includes('view_audit_log') ?? false);
   const activeCommunityId = details?.community.id;
   const quickItems = useMemo(() => communities.map((community) => ({ id: community.id, name: community.name })), [communities]);
+  const shortcodeQuery = draft.match(/:([a-z0-9_]{2,32})$/i)?.[1] ?? '';
+  const shortcodeSuggestions: Array<{ title: string; token: string; search: string }> = shortcodeQuery.length >= 2 ? [
+    ...(communityAssets?.mavuno.emojis ?? []).filter((item) => `${item.key} ${item.label}`.toLowerCase().includes(shortcodeQuery.toLowerCase())).map((item) => ({ title: item.label ?? item.key ?? '', token: `<:builtin:${item.key}>`, search: item.key ?? '' })),
+    ...(communityAssets?.emojis ?? []).filter((item) => `${item.name} ${item.description ?? ''}`.toLowerCase().includes(shortcodeQuery.toLowerCase())).map((item) => ({ title: item.name ?? '', token: `<:${item.name}:${item.id}>`, search: item.name ?? '' })),
+  ].slice(0, 6) : [];
 
   const notify = useCallback((text: string) => {
     setToast(text);
@@ -751,8 +759,10 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     if (nearBottom.current && listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [messages.length, channel?.id]);
   useEffect(() => {
-    if (!details?.community.id) return;
+    if (!details?.community.id) { setCommunityAssets(null); return; }
     const communityId = details.community.id;
+    const refreshAssets = () => { void api<CommunityAssetsResponse>(`/communities/${communityId}/assets`).then(setCommunityAssets).catch(() => setCommunityAssets(null)); };
+    refreshAssets();
     const socket = io({ withCredentials: true, reconnection: true, transports: ['websocket', 'polling'] });
     socket.on('connect', () => { setOnline(true); setReconnecting(false); });
     socket.on('disconnect', (reason) => { if (reason !== 'io client disconnect') setReconnecting(true); });
@@ -766,6 +776,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
         if (channel) setChannel(fresh.channels.find((item) => item.id === channel.id) ?? null);
       }).catch(() => undefined);
     });
+    socket.on('community-assets:updated', (event: { communityId: string }) => { if (event.communityId === communityId) refreshAssets(); });
     socket.on('community:updated', (event: { communityId: string }) => {
       if (event.communityId === communityId) void api<CommunityDetails>(`/communities/${communityId}`).then(setDetails).catch(() => undefined);
     });
@@ -975,6 +986,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     if (!channel || channel.kind !== 'text' || attachmentBusy || (!body.trim() && selectedAttachments.length === 0)) return false;
     if (channel.readOnly && channel.canWrite === false) { notify('Neste canal só moderadores podem escrever.'); return false; }
     const destination = channel;
+    const normalizedBody = body.trim().replace(/:mv_([a-z0-9_]{2,32}):/gi, (raw, key: string) => { const asset = communityAssets?.mavuno.emojis.find((item) => item.key === key.toLowerCase()); return asset ? `<:builtin:${asset.key}>` : raw; }).replace(/:([a-z0-9_]{2,32}):/gi, (raw, name: string) => { const asset = communityAssets?.emojis.find((item) => item.name === name.toLowerCase()); return asset?.id ? `<:${asset.name}:${asset.id}>` : raw; });
     nearBottom.current = true; setNewMessages(0);
     setAttachmentBusy(true);
     let currentUploadKey: string | null = null;
@@ -1016,14 +1028,14 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
         attachmentIds.push(attachmentId);
       }
       const message: Message = {
-        id: `optimistic:${clientMessageId}`, clientMessageId, body: body.trim(), replyToId, replyAuthor: replyToId ? reply?.username ?? null : null, replyBody: replyToId ? reply?.body ?? null : null,
+        id: `optimistic:${clientMessageId}`, clientMessageId, body: normalizedBody, replyToId, replyAuthor: replyToId ? reply?.username ?? null : null, replyBody: replyToId ? reply?.body ?? null : null,
         createdAt: new Date().toISOString(), authorId: user.id, username: user.username,
         avatarUrl: user.avatarUrl, delivery: 'sending',
       };
       setMessages((current) => mergeMessage(current, message));
       optimisticAdded = true;
       const result = await api<{ message: Message }>(`/channels/${destination.id}/messages`, {
-        method: 'POST', body: JSON.stringify({ clientMessageId, body: body.trim(), replyToId, attachmentIds }),
+        method: 'POST', body: JSON.stringify({ clientMessageId, body: normalizedBody, replyToId, attachmentIds }),
       });
       setMessages((current) => mergeMessage(current, result.message));
       setReply(null);
@@ -1337,9 +1349,10 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
             if (oldest) { nearBottom.current = false; void fetchMessages(channel.id, `${oldest.createdAt}~${oldest.id}`); }
           }}>{loadingMessages ? 'A carregar…' : 'Carregar mensagens anteriores'}</button>}
           {messages.length === 0 && !loadingMessages && <div className="empty-state">Ainda não há mensagens. Começa a conversa.</div>}
-          {messages.map((message, index) => <MessageRow key={message.id} message={message} grouped={index > 0 && messages[index - 1]?.authorId === message.authorId} own={message.authorId === user.id} onOpenMenu={(rect) => openMessageMenu(message, rect)} onProfile={() => openMemberProfile(message.authorId)} onReply={() => setReply(message)} onRetry={() => void sendMessage(message.body, message.clientMessageId, message.replyToId)} onQuickReaction={(emoji) => void toggleReaction(message, emoji)}>
+          {messages.map((message, index) => <MessageRow key={message.id} message={message} grouped={index > 0 && messages[index - 1]?.authorId === message.authorId} own={message.authorId === user.id} onOpenMenu={(rect) => openMessageMenu(message, rect)} onProfile={() => openMemberProfile(message.authorId)} onReply={() => setReply(message)} onRetry={() => void sendMessage(message.body, message.clientMessageId, message.replyToId)} onQuickReaction={(emoji) => void toggleReaction(message, emoji)} renderBody={<InlineEmojiText text={message.body} assets={communityAssets}/>}>
+            {message.sticker && <MessageStickerView sticker={message.sticker}/>}
             <AttachmentGallery attachments={message.attachments ?? []} onDownload={downloadAttachment} notify={notify}/>
-            {!!message.reactions?.length && <div className="reaction-pills">{message.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(message, reaction.emoji)} onLongPress={() => void showReactionUsers(message.id, reaction.emoji)}/>)}</div>}
+            {!!message.reactions?.length && <div className="reaction-pills">{message.reactions.map((reaction) => <ReactionPill key={reaction.emoji} assets={communityAssets} reaction={reaction} pending={pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(message, reaction.emoji)} onLongPress={() => void showReactionUsers(message.id, reaction.emoji)}/>)}</div>}
             {Array.from(pendingReactionKeys).some((key) => key.startsWith(`${message.id}:`)) && !(message.reactions ?? []).some((reaction) => pendingReactionKeys.has(`${message.id}:${reaction.emoji}`)) && <small className="reaction-pending-label">A enviar…</small>}
           </MessageRow>)}
           {newMessages > 0 && <button className="new-messages-button" onClick={() => { if (listRef.current) listRef.current.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' }); nearBottom.current = true; setNewMessages(0); }}>Novas mensagens · Descer</button>}
@@ -1358,8 +1371,9 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
           </div>}
           <form className="composer" onSubmit={(event) => { event.preventDefault(); const value = draft.trim(); if (!value && attachmentDrafts.length === 0) return; void sendMessage(value).then((sent) => { if (sent) setDraft(''); }); }}>
             <input ref={composerInputRef} value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={2000} disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false)} placeholder={channel.readOnly && channel.canWrite === false ? 'Neste canal só moderadores podem escrever.' : `Escreve uma mensagem em #${channel.name}`} aria-label="Escrever mensagem"/>
+            {shortcodeSuggestions.length > 0 && <div className="asset-autocomplete" role="listbox" aria-label="Sugestões de emoji">{shortcodeSuggestions.map((item) => <button type="button" role="option" key={item.token} onClick={() => { const current = draft; const start = current.lastIndexOf(':'); setDraft(`${current.slice(0, start)}${item.token} `); composerInputRef.current?.focus(); }}>{item.title} <small>:{item.search}:</small></button>)}</div>}
             <button type="button" className="secondary composer-attach-button" aria-label="Anexar ficheiro" title="Anexar ficheiro" disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false)} onClick={() => void openAttachmentPicker()}><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="m21.4 11.1-8.9 8.9a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg></button>
-            <button type="button" className="secondary composer-emoji-button" aria-label="Inserir emoji" title="Inserir emoji" disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false)} onClick={() => setEmojiPickerTarget('composer')}>☺</button>
+            <button type="button" className="secondary composer-emoji-button" aria-label="Inserir emoji" title="Inserir emoji" disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false)} onClick={() => setEmojiPickerTarget('composer')}>☺</button><button type="button" className="secondary composer-emoji-button" aria-label="Escolher sticker" title="Escolher sticker" disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false)} onClick={() => setStickerPickerOpen(true)}>▧</button>
             <button className="primary send-button" disabled={attachmentBusy || (channel.readOnly && channel.canWrite === false) || (!draft.trim() && attachmentDrafts.length === 0)} aria-label="Enviar mensagem">Enviar</button>
           </form>
           <input ref={photoInputRef} className="attachment-file-input" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm" aria-label="Escolher foto ou vídeo" onChange={(event) => { const files = Array.from(event.currentTarget.files ?? []); event.currentTarget.value = ''; setAttachmentPickerOpen(false); void addSelectedFiles(files); }}/>
@@ -1382,9 +1396,10 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
         <button className="text-button" onClick={() => { void loadExplore(); setQuickOpen(false); }}>Explorar comunidades</button>
       </div>}
     </div>
-    {pinnedOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setPinnedOpen(false); }}><section className="modal pinned-modal" role="dialog" aria-modal="true" aria-labelledby="pinned-title"><h2 id="pinned-title">Mensagens fixadas</h2><div className="pinned-list">{pinnedMessages.map((item) => <article className="pinned-item" key={item.id}><strong>{item.username}</strong><time className="message-time">{formatTime(item.createdAt)}</time><p>{item.body}</p><AttachmentGallery attachments={item.attachments ?? []} onDownload={downloadAttachment} notify={notify}/>{!!item.reactions?.length && <div className="reaction-pills">{item.reactions.map((reaction) => <ReactionPill key={reaction.emoji} reaction={reaction} pending={pendingReactionKeys.has(`${item.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(item, reaction.emoji)} onLongPress={() => void showReactionUsers(item.id, reaction.emoji)}/>)}</div>}</article>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setPinnedOpen(false)}>Fechar</button></div></section></div>}
+    {pinnedOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setPinnedOpen(false); }}><section className="modal pinned-modal" role="dialog" aria-modal="true" aria-labelledby="pinned-title"><h2 id="pinned-title">Mensagens fixadas</h2><div className="pinned-list">{pinnedMessages.map((item) => <article className="pinned-item" key={item.id}><strong>{item.username}</strong><time className="message-time">{formatTime(item.createdAt)}</time><p>{item.body}</p><AttachmentGallery attachments={item.attachments ?? []} onDownload={downloadAttachment} notify={notify}/>{!!item.reactions?.length && <div className="reaction-pills">{item.reactions.map((reaction) => <ReactionPill key={reaction.emoji} assets={communityAssets} reaction={reaction} pending={pendingReactionKeys.has(`${item.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(item, reaction.emoji)} onLongPress={() => void showReactionUsers(item.id, reaction.emoji)}/>)}</div>}</article>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setPinnedOpen(false)}>Fechar</button></div></section></div>}
     {attachmentPickerOpen && createPortal(<div className="attachment-picker-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAttachmentPickerOpen(false); }}><section className="attachment-picker-sheet" role="dialog" aria-modal="true" aria-labelledby="attachment-picker-title" onMouseDown={(event) => event.stopPropagation()}><div className="attachment-picker-handle"/><h2 id="attachment-picker-title">Adicionar anexo</h2><button type="button" className="attachment-picker-option" onClick={() => photoInputRef.current?.click()}><span aria-hidden="true">▧</span><span><strong>Foto ou vídeo</strong><small>JPEG, PNG, WebP, GIF, MP4 ou WebM</small></span></button><button type="button" className="attachment-picker-option" onClick={() => documentInputRef.current?.click()}><span aria-hidden="true">▤</span><span><strong>Ficheiro</strong><small>PDF, TXT, DOCX, XLSX, PPTX ou ZIP</small></span></button><button type="button" className="secondary attachment-picker-cancel" onClick={() => setAttachmentPickerOpen(false)}>Cancelar</button></section></div>, document.body)}
-    {emojiPickerTarget && <EmojiPicker onClose={() => setEmojiPickerTarget(null)} onSelect={(emoji) => { const target = emojiPickerTarget; setEmojiPickerTarget(null); if (target === 'composer') insertComposerEmoji(emoji); else { const message = messages.find((item) => item.id === target.messageId) ?? pinnedMessages.find((item) => item.id === target.messageId); if (message) void toggleReaction(message, emoji); } }}/> }
+    {emojiPickerTarget && <CommunityEmojiPicker assets={communityAssets} onClose={() => setEmojiPickerTarget(null)} onSelect={(emoji) => { const target = emojiPickerTarget; setEmojiPickerTarget(null); if (target === 'composer') insertComposerEmoji(emoji); else { const message = messages.find((item) => item.id === target.messageId) ?? pinnedMessages.find((item) => item.id === target.messageId); if (message) void toggleReaction(message, emoji.startsWith('<:builtin:') ? `builtin:${emoji.slice(10, -1)}` : emoji.startsWith('<:') ? `custom:${emoji.slice(emoji.lastIndexOf(':') + 1, -1)}` : emoji); } }}/>}
+    {stickerPickerOpen && <CommunityStickerPicker assets={communityAssets} onClose={() => setStickerPickerOpen(false)} onSelect={(item, builtin) => { setStickerPickerOpen(false); if (!channel || channel.kind !== 'text') return; const key = builtin ? item.key : undefined; const id = builtin ? undefined : item.id; void api<{message: Message}>(`/channels/${channel.id}/messages`, { method: 'POST', body: JSON.stringify({ clientMessageId: crypto.randomUUID(), body: '', stickerId: id, builtinKey: key }) }).then(({message}) => setMessages((current) => mergeMessage(current, message))).catch((cause) => notify(cause instanceof Error ? cause.message : 'Não foi possível enviar o sticker.')); }}/>} 
     {reactionUsers && <ReactionUsersSheet emoji={reactionUsers.emoji} users={reactionUsers.users} loading={reactionUsers.loading} onClose={() => setReactionUsers(null)}/>}
     {actionMenu && details && <ActionMenuOverlay target={actionMenu} actorId={user.id} actorRole={details.myRole} actorPermissions={details.myPermissions} targetMember={actionMenu.kind === 'member' ? actionMenu.member : details.members.find((member) => member.id === actionMenu.message.authorId) ?? (actionMenu.message.authorId === user.id ? undefined : { id: actionMenu.message.authorId, username: actionMenu.message.username, avatarUrl: actionMenu.message.avatarUrl, role: 'unknown' })} onClose={closeActionMenu} onReply={(message) => setReply(message)} onDelete={deleteMessage} onDownload={downloadMessageAttachments} onPin={togglePin} onQuickReaction={(message, emoji) => void toggleReaction(message, emoji)} onMoreReactions={(message) => setEmojiPickerTarget({ messageId: message.id })} onProfile={openMemberProfile} onCall={(member) => setCallTarget(member)} onModerate={(action, member) => setModerationPrompt({ action, member })} onUnmute={(member) => void removeMemberMute(member)} onKick={kickMember} notify={notify}/>}
     {moderationPrompt && <ModerationPrompt action={moderationPrompt.action} member={moderationPrompt.member} onClose={() => setModerationPrompt(null)} onConfirm={async (duration, reason) => { await applyModeration(moderationPrompt.action, moderationPrompt.member, duration, reason); setModerationPrompt(null); }}/>
@@ -1405,11 +1420,11 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
   </div>;
 }
 
-function ReactionPill({ reaction, pending, onToggle, onLongPress }: { reaction: ReactionSummary; pending: boolean; onToggle: () => void; onLongPress: () => void }) {
+function ReactionPill({ reaction, pending, assets, onToggle, onLongPress }: { reaction: ReactionSummary; pending: boolean; assets: CommunityAssetsResponse | null; onToggle: () => void; onLongPress: () => void }) {
   const timer = useRef<number | null>(null);
   const held = useRef(false);
   const clear = () => { if (timer.current !== null) window.clearTimeout(timer.current); timer.current = null; };
-  return <button type="button" className={`reaction-pill ${reaction.reactedByMe ? 'reacted' : ''} ${pending ? 'pending' : ''}`} aria-label={`${reaction.emoji}, ${reaction.count}; ${reaction.reactedByMe ? 'já reagiste' : 'ainda não reagiste'}. Toca para alternar; mantém premido para ver quem reagiu.`} aria-pressed={reaction.reactedByMe} disabled={pending} onPointerDown={() => { held.current = false; clear(); timer.current = window.setTimeout(() => { held.current = true; onLongPress(); }, 520); }} onPointerUp={clear} onPointerLeave={clear} onPointerCancel={clear} onContextMenu={(event) => { event.preventDefault(); clear(); held.current = true; onLongPress(); }} onClick={() => { if (held.current) { held.current = false; return; } onToggle(); }}>{reaction.emoji}<span>{reaction.count}</span>{pending && <small>A enviar…</small>}</button>;
+  return <button type="button" className={`reaction-pill ${reaction.reactedByMe ? 'reacted' : ''} ${pending ? 'pending' : ''}`} aria-label={`${reaction.emoji}, ${reaction.count}; ${reaction.reactedByMe ? 'já reagiste' : 'ainda não reagiste'}. Toca para alternar; mantém premido para ver quem reagiu.`} aria-pressed={reaction.reactedByMe} disabled={pending} onPointerDown={() => { held.current = false; clear(); timer.current = window.setTimeout(() => { held.current = true; onLongPress(); }, 520); }} onPointerUp={clear} onPointerLeave={clear} onPointerCancel={clear} onContextMenu={(event) => { event.preventDefault(); clear(); held.current = true; onLongPress(); }} onClick={() => { if (held.current) { held.current = false; return; } onToggle(); }}><AssetReaction value={reaction.emoji} assets={assets}/><span>{reaction.count}</span>{pending && <small>A enviar…</small>}</button>;
 }
 function EmojiPicker({ onClose, onSelect }: { onClose: () => void; onSelect: (emoji: string) => void }) {
   const [category, setCategory] = useState<EmojiCategoryId>('recentes');

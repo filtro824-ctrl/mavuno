@@ -17,7 +17,10 @@ export interface ActiveInvitation { id: string; createdAt: string; expiresAt: st
 export interface JoinRequest { id: string; createdAt: string; userId: string; username: string; avatarUrl?: string | null }
 export interface ReactionSummary { emoji: string; count: number; reactedByMe: boolean }
 export interface MessageAttachment { id: string; originalName: string; mimeType: string; sizeBytes: number; width: number | null; height: number | null; url: string }
-export interface Message { id: string; clientMessageId: string; body: string; replyToId: string | null; replyAuthor?: string | null; replyBody?: string | null; createdAt: string; pinnedAt?: string | null; pinnedBy?: string | null; authorId: string; username: string; avatarUrl?: string | null; reactions?: ReactionSummary[]; attachments?: MessageAttachment[]; delivery?: 'sending' | 'failed' }
+export interface CommunityAsset { id?: string; key?: string; name?: string; label?: string; description?: string; mimeType?: string; width?: number; height?: number; animated?: boolean; url: string }
+export interface CommunityAssetsResponse { available: boolean; mavuno: { emojis: CommunityAsset[]; stickers: CommunityAsset[] }; emojis: CommunityAsset[]; stickers: CommunityAsset[] }
+export interface MessageSticker { kind: 'builtin' | 'community' | 'removed'; key?: string; id?: string; name: string; description?: string; url?: string; width?: number; height?: number }
+export interface Message { id: string; clientMessageId: string; body: string; replyToId: string | null; replyAuthor?: string | null; replyBody?: string | null; createdAt: string; pinnedAt?: string | null; pinnedBy?: string | null; authorId: string; username: string; avatarUrl?: string | null; reactions?: ReactionSummary[]; attachments?: MessageAttachment[]; sticker?: MessageSticker | null; delivery?: 'sending' | 'failed' }
 export type PrivateCallStatus = 'initiated' | 'ringing' | 'accepted' | 'connecting' | 'in_progress' | 'rejected' | 'timeout' | 'failed' | 'ended';
 export interface PrivateCall { id: string; status: PrivateCallStatus; peer?: { id: string; username: string; avatarUrl?: string | null } }
 let csrfToken = '';

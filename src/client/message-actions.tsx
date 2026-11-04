@@ -17,8 +17,8 @@ const ranks: Record<string, number> = { owner: 100, admin: 80, moderator: 50, me
 const can = (permissions: string[], permission: string) => permissions.includes(permission);
 const canAct = (actor: string | null, target?: Member) => Boolean(target && target.role !== 'owner' && (ranks[actor ?? ''] ?? 0) > (ranks[target.role] ?? 0));
 
-export function MessageRow({ message, grouped, own, children, onOpenMenu, onProfile, onReply, onRetry, onQuickReaction }: {
-  message: Message; grouped: boolean; own: boolean; children?: ReactNode;
+export function MessageRow({ message, grouped, own, children, renderBody, onOpenMenu, onProfile, onReply, onRetry, onQuickReaction }: {
+  message: Message; grouped: boolean; own: boolean; children?: ReactNode; renderBody?: ReactNode;
   onOpenMenu: (rect: MenuRect) => void; onProfile: () => void; onReply: () => void; onRetry: () => void;
   onQuickReaction: (emoji: string) => void;
 }) {
@@ -52,7 +52,7 @@ export function MessageRow({ message, grouped, own, children, onOpenMenu, onProf
     <div className="message-content" style={{ minWidth: 0, flex: 1 }}>
       <div className="message-meta"><button className="profile-name-link" onClick={onProfile}>{message.username}</button><time className="message-time" dateTime={message.createdAt}>{new Intl.DateTimeFormat('pt-MZ', { hour: '2-digit', minute: '2-digit' }).format(new Date(message.createdAt))}</time></div>
       {message.replyToId && <div className="reply-preview"><strong>{message.replyAuthor ?? 'Mensagem apagada'}</strong>{message.replyBody && <span>{message.replyBody.slice(0, 100)}</span>}</div>}
-      <div className="message-body">{message.pinnedAt && <span className="pinned-label">Fixada · </span>}{message.body}</div>
+      <div className="message-body">{message.pinnedAt && <span className="pinned-label">Fixada · </span>}{renderBody ?? message.body}</div>
       {children}
       {message.delivery === 'sending' && <span className="message-delivery">A enviar…</span>}
       {!message.delivery && own && <span className="message-delivery">Enviada</span>}
