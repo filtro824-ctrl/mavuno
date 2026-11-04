@@ -1,4 +1,4 @@
-import { pgTable, pgEnum, uuid, varchar, text, boolean, timestamp, integer, uniqueIndex, index, primaryKey } from 'drizzle-orm/pg-core';
+import { pgTable, pgEnum, uuid, varchar, text, boolean, timestamp, integer, uniqueIndex, index, primaryKey, check, type AnyPgColumn } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 
 export const roleKey = pgEnum('role_key', ['owner', 'admin', 'moderator', 'member']);
@@ -289,4 +289,51 @@ export const messageAttachments = pgTable('message_attachments', {
 }, (table) => [
   index('message_attachments_message_idx').on(table.messageId),
   index('message_attachments_user_idx').on(table.userId),
+]);
+
+
+export const directConversations = pgTable('direct_conversations', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userAId: uuid('user_a_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  userBId: uuid('user_b_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  lastMessageAt: timestamp('last_message_at', { withTimezone: true }),
+}, (t) => [
+  uniqueIndex('direct_conversations_users_unique').on(t.userAId, t.userBId),
+  index('direct_conversations_user_a_idx').on(t.userAId),
+  index('direct_conversations_user_b_idx').on(t.userBId),
+  check('direct_conversations_user_order_check', sql`${t.userAId} < ${t.userBId}`),
+]);
+
+export const directMessages = pgTable('direct_messages', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  conversationId: uuid('conversation_id').notNull().references(() => directConversations.id, { onDelete: 'cascade' }),
+  authorId: uuid('author_id').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  clientMessageId: uuid('client_message_id').notNull(),
+  body: varchar('body', { length: 2000 }).notNull(),
+  replyToId: uuid('reply_to_id').references((): AnyPgColumn => directMessages.id, { onDelete: 'set null' }),
+  builtinStickerKey: varchar('builtin_sticker_key', { length: 64 }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  deletedAt: timestamp('deleted_at', { withTimezone: true }),
+}, (t) => [
+  uniqueIndex('direct_messages_client_unique').on(t.conversationId, t.authorId, t.clientMessageId),
+  index('direct_messages_conversation_cursor_idx').on(t.conversationId, t.createdAt, t.id),
+]);
+
+export const directReads = pgTable('direct_reads', {
+  userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  conversationId: uuid('conversation_id').notNull().references(() => directConversations.id, { onDelete: 'cascade' }),
+  lastReadAt: timestamp('last_read_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ name: 'direct_reads_pkey', columns: [t.userId, t.conversationId] }),
+]);
+
+export const dmBlocks = pgTable('dm_blocks', {
+  blockerId: uuid('blocker_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  blockedId: uuid('blocked_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ name: 'dm_blocks_pkey', columns: [t.blockerId, t.blockedId] }),
+  index('dm_blocks_blocked_idx').on(t.blockedId),
+  check('dm_blocks_not_self_check', sql`${t.blockerId} <> ${t.blockedId}`),
 ]);

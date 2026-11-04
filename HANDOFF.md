@@ -29,7 +29,8 @@ O botão flutuante de conversas rápidas pode ser arrastado e encaixa na lateral
 Etapa 10 concluída no código: convites com durações e limites configuráveis, pré-visualização pública sem sessão em /invite/<código>, regras com aceitação obrigatória, mensagem de boas-vindas, entrada pública por pedido opcional, gestão e revogação de convites, aprovação/recusa/cancelamento de pedidos, cooldown de 24 horas, limite de 20 pedidos pendentes por utilizador, avisos em tempo real e permissões verificadas no servidor. Migração 0011 aplicada pelo dono; não foi alterado novamente o SQL aplicado.
 Feito no código: registo, login, sessões, comunidades públicas e privadas, convites, cargos e permissões, canais, mensagens em tempo real, respostas, menções, fixar, silenciar, expulsar e banir, auditoria, chamadas privadas e salas de voz via LiveKit (sem teste real de áudio), reações persistentes com seletor de emojis (commit 81697b0), redesign visual e correção de layout com zoom (commit 74e474a), perfil com controlo de privacidade (commit 3ed4fdd). Etapa 4 concluída: menu unificado para mensagens e membros, silenciamento temporário, expulsão e banimentos temporários/permanentes; aguarda deploy do dono. Etapa 5 concluída: barra do utilizador com microfone, auscultadores, definições e menus responsivos; preferências de áudio locais, teste de microfone, integração com voz/chamadas e correção da altura da lista de mensagens. Etapa 6 concluída: cartão de perfil compacto e expansível, banner por link ou cor de fallback, texto e preferência de presença, presença invisível tratada como offline no servidor, privacidade de banner/estado, editor por separadores, pré-visualização, validação HTTPS e testes unitários; aguarda deploy do dono. Etapa 7 concluída no código: armazenamento S3 privado, rotas protegidas, validação/quotas, envio, visualização, descarregamento, renovação de URLs, limpeza de anexos, pré-visualizações, compressão local de imagens e testes; migração 0010 aplicada pelo dono. Aguarda configuração do bucket privado e deploy pelo dono.
 Etapa 11 concluída no código: categorias de canais recolhíveis e ordenáveis, contagens e avisos de não lidas em tempo real, canais só de leitura com permissões verificadas no servidor, capa de comunidade com cor de reserva e lista de banimentos ativos com revogação. Migração 0012 aplicada pelo dono; não foi alterado novamente o SQL aplicado.
-Ainda NÃO existe: mensagens privadas (DMs), AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
+Etapa 13 em curso: esquema aditivo de mensagens privadas concluído no código; migração 0014 aplicada pelo dono. Servidor e interface das DMs ainda por implementar.
+Ainda NÃO existe: AutoMod, notificações push, recuperação de conta por email, planos e pagamentos.
 
 ## 5. SQL já aplicado no Supabase (por ordem)
 1. Migrações 0000 a 0006 coladas juntas, sem as linhas "--> statement-breakpoint" (18 tabelas, incluindo message_reactions).
@@ -41,7 +42,8 @@ Ainda NÃO existe: mensagens privadas (DMs), AutoMod, notificações push, recup
 7. Migração 0011, aplicada pelo dono: colunas welcome_message e require_approval em communities, rules_accepted_at em community_members, revoked_at em invitations, tabela join_requests com índices e RLS ativo.
 8. Migração 0012, aplicada pelo dono: categorias de canais, posição e leitura em channels, tabela channel_reads com RLS e campos de capa em communities.
 9. Migração 0013, aplicada pelo dono: tabelas custom_emojis, stickers e message_stickers com índices e RLS ativo; alargamento de message_reactions.emoji para varchar(64).
-Nota: o ajuste do botão flutuante e a etapa 9 não alteram o esquema; a etapa 10 usa a migração 0011, a etapa 11 usa a migração 0012 e o esquema da etapa 8 usa a migração 0013, aplicadas pelo dono. A etapa 9 e a etapa 8 usam o bucket privado já previsto, cuja configuração e regra de ciclo de vida continuam a cargo do dono.
+10. Migração 0014, aplicada pelo dono: novas tabelas direct_conversations, direct_messages, direct_reads e dm_blocks, com chaves, índices, checks e RLS. Não voltar a alterar esta migração ou o esquema aplicado.
+Nota: o ajuste do botão flutuante e a etapa 9 não alteram o esquema; a etapa 10 usa a migração 0011, a etapa 11 usa a migração 0012, o esquema da etapa 8 usa a migração 0013 e o esquema da etapa 13 usa a migração 0014, aplicadas pelo dono. A etapa 9 e a etapa 8 usam o bucket privado já previsto, cuja configuração e regra de ciclo de vida continuam a cargo do dono.
 
 ## 6. Fila de etapas (o dono envia o pedido de cada uma, por esta ordem)
 4 Menu das mensagens ao premir (sem os três pontos), silenciar e banir por tempo. SQL (1 coluna: community_bans.expires_at).
@@ -59,7 +61,7 @@ Nota: o ajuste do botão flutuante e a etapa 9 não alteram o esquema; a etapa 1
 16 Voz real testada com dois telemóveis (configuração do dono com LiveKit).
 17 AutoMod. SQL.
 18 Notificações com o Mavuno fechado. SQL.
-Prioridade: 4, 5, 6, 7, 10, 8 e 9 concluídas. Próxima etapa: 13 (mensagens privadas/DMs). Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
+Prioridade: 4, 5, 6, 7, 10, 8 e 9 concluídas. Etapa 13 em curso (migração 0014 aplicada; servidor e interface pendentes). Próxima etapa após concluir DMs: 12 (pré-visualização de links). Fora da fila: recuperação de conta por email, planos e pagamentos, app nativa.
 
 ## 7. Limitações conhecidas
 Voz sem LiveKit configurado e sem teste com dois aparelhos; anexos e fotos de perfil dependem da configuração do bucket privado no Render e da regra de ciclo de vida para profile-upload-pending/; sem recuperação de conta por email; sem planos nem pagamentos; sem notificações push.
