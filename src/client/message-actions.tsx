@@ -88,10 +88,11 @@ function MenuRow({ icon, children, danger, onClick }: { icon: string; children: 
   return <button type="button" className={`action-menu-row ${danger ? 'danger-text' : ''}`} onClick={onClick}><Icon name={icon}/><span>{children}</span></button>;
 }
 
-export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions, targetMember, onClose, onReply, onDelete, onDownload, onPin, onQuickReaction, onMoreReactions, onProfile, onCall, onModerate, onUnmute, onKick, notify, mode = 'channel' }: {
+export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions, targetMember, onClose, onReply, onDelete, onDownload, onPin, onQuickReaction, onMoreReactions, onProfile, onCall, onDirectMessage, onModerate, onUnmute, onKick, notify, mode = 'channel' }: {
   target: ActionMenuTarget; actorId: string; actorRole: string | null; actorPermissions: string[]; targetMember?: Member;
   onClose: () => void; onReply: (message: Message) => void; onDelete: (message: Message) => Promise<void> | void; onDownload: (message: Message) => Promise<void> | void; onPin: (message: Message) => Promise<void> | void;
   onQuickReaction: (message: Message, emoji: string) => void; onMoreReactions: (message: Message) => void; onProfile: (userId: string) => void; onCall: (member: Member) => void;
+  onDirectMessage?: (member: Member) => void;
   onModerate: (action: 'mute' | 'ban', member: Member) => void; onUnmute: (member: Member) => void; onKick: (member: Member) => Promise<void> | void; notify: (text: string) => void;
   mode?: 'channel' | 'direct';
 }) {
@@ -184,6 +185,7 @@ export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions
         {mayPin && <MenuRow icon="pin" onClick={() => run(() => { void onPin(message); })}>{message.pinnedAt ? 'Desafixar' : 'Fixar'}</MenuRow>}
       </div>}
       {member && member.id !== actorId && <div className="action-menu-group"><h3>Membro</h3>
+        {onDirectMessage && <MenuRow icon="reply" onClick={() => run(() => onDirectMessage(member))}>Mensagem</MenuRow>}
         <MenuRow icon="user" onClick={() => run(() => onProfile(member.id))}>Ver perfil</MenuRow>
         <MenuRow icon="call" onClick={() => run(() => onCall(member))}>Chamada privada</MenuRow>
       </div>}
