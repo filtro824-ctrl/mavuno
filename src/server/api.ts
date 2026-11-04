@@ -7,7 +7,7 @@ import { db, pool } from './db/index.js';
 import {
   channels, channelCategories, channelReads, communities, communityMembers, communityRoles, messages, joinRequests,
   messageMentions, rolePermissions, sessions, users, voiceRooms, communityBans, communityMutes,
-  moderationAuditLogs, privateCalls, messageReactions, messageAttachments,
+  moderationAuditLogs, privateCalls, messageReactions, messageAttachments, customEmojis, messageStickers, stickers,
 } from './db/schema.js';
 import { createOpaqueToken, digestToken, hashPassword, readSessionCookie, setCsrfCookie, setSessionCookie, clearSessionCookie, verifyPassword } from './security.js';
 import { hasPermission, isMember, roleFor, roleIdFor, type Permission } from './permissions.js';
@@ -20,9 +20,12 @@ import { attachmentsForMessages, createAttachmentsRouter, deleteChannelWithAttac
 import { MAX_ATTACHMENTS_PER_MESSAGE, signatureMatches } from './attachment-utils.js';
 import { createProfileMediaRouter } from './profile-media-api.js';
 import { PROFILE_MEDIA_MAX_BYTES, makeProfileMediaReference, parseProfileMediaReference, profileMediaObjectKey, profileMediaStagingObjectKey } from './profile-media-utils.js';
-import { copyStoredObject, deleteStoredObject, inspectStoredObject, storageIsConfigured } from './storage.js';
+import { copyStoredObject, deleteStoredObject, inspectStoredObject, signReadUrl, storageIsConfigured } from './storage.js';
 import { createJoinFlowRouter, createPublicInvitePreviewRouter } from './join-flow-api.js';
 import { canWriteToChannel, categoryNameSchema, coverColorSchema, coverUrlSchema, summarizeUnreadRows } from './channel-utils.js';
+import { createCustomAssetsRouter } from './custom-assets-api.js';
+import { builtinEmoji, builtinSticker, builtinStickerUrl } from './builtin-assets.js';
+import { parseReactionValue, extractEmojiReferences } from './custom-asset-utils.js';
 
 const replyMessages = alias(messages, 'reply_messages');
 const replyAuthors = alias(users, 'reply_authors');
@@ -163,6 +166,43 @@ async function reactionSummariesFor(messageIds: string[], userId: string): Promi
   return groupReactionAggregates(rows);
 }
 
+async function stickersForMessages(messageIds: string[]): Promise<Record<string, Record<string, unknown>>> {
+  if (!messageIds.length) return {};
+  const rows = await db.select({
+    messageId: messageStickers.messageId,
+    stickerId: messageStickers.stickerId,
+    stickerName: messageStickers.stickerName,
+    builtinKey: messageStickers.builtinKey,
+    storageKey: stickers.storageKey,
+    mimeType: stickers.mimeType,
+    width: stickers.width,
+    height: stickers.height,
+    description: stickers.description,
+    removedAt: stickers.removedAt,
+  }).from(messageStickers).leftJoin(stickers, eq(messageStickers.stickerId, stickers.id)).where(inArray(messageStickers.messageId, messageIds));
+  const result: Record<string, Record<string, unknown>> = {};
+  for (const row of rows) {
+    if (row.builtinKey) {
+      const builtin = builtinSticker(row.builtinKey);
+      if (builtin) result[row.messageId] = { kind: 'builtin', key: row.builtinKey, name: builtin.label, description: builtin.label, url: builtinStickerUrl(row.builtinKey) };
+    } else if (row.stickerId) {
+      result[row.messageId] = row.removedAt || !row.storageKey
+        ? { kind: 'removed', name: row.stickerName }
+        : { kind: 'community', id: row.stickerId, name: row.stickerName, description: row.description ?? '', width: row.width, height: row.height, url: await signReadUrl(row.storageKey, row.mimeType ?? 'image/png', `${row.stickerName}.png`, false) };
+    }
+  }
+  return result;
+}
+
+async function validateMessageEmojiReferences(body: string, communityId: string): Promise<boolean> {
+  const references = extractEmojiReferences(body);
+  if (references.some((reference) => reference.kind === 'builtin' && !builtinEmoji(reference.value))) return false;
+  const ids = [...new Set(references.filter((reference): reference is { kind: 'custom'; value: string; id: string; raw: string } => reference.kind === 'custom' && Boolean(reference.id)).map((reference) => reference.id))];
+  if (!ids.length) return true;
+  const rows = await db.select({ id: customEmojis.id }).from(customEmojis).where(and(inArray(customEmojis.id, ids), eq(customEmojis.communityId, communityId), isNull(customEmojis.removedAt)));
+  return rows.length === ids.length;
+}
+
 async function audit(communityId: string, actorId: string, action: string, targetUserId: string | null, reason = '', durationSeconds: number | null = null, metadata: Record<string, unknown> = {}): Promise<void> {
   await db.insert(moderationAuditLogs).values({ communityId, actorId, targetUserId, action, reason, durationSeconds, metadata: JSON.stringify(metadata) });
 }
@@ -233,6 +273,7 @@ export function createApi(io: SocketServer): Router {
   router.use(requireAuth);
   router.use(createJoinFlowRouter(io));
   router.use(createAttachmentsRouter(io));
+  router.use(createCustomAssetsRouter(io));
   router.use(createProfileMediaRouter());
   router.get('/auth/me', (_req, res) => res.json({ user: currentUser(res) }));
   router.get('/profile', asyncRoute(async (_req, res) => {
@@ -610,7 +651,8 @@ export function createApi(io: SocketServer): Router {
     const ordered = selected.reverse();
     const reactions = await reactionSummariesFor(ordered.map((message) => message.id), currentUser(res).id);
     const attachments = await attachmentsForMessages(ordered.map((message) => message.id));
-    res.json({ messages: ordered.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [], attachments: attachments[message.id] ?? [] })), hasMore, nextCursor: oldest ? `${oldest.createdAt.toISOString()}~${oldest.id}` : null });
+    const messageStickerRows = await stickersForMessages(ordered.map((message) => message.id));
+    res.json({ messages: ordered.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [], attachments: attachments[message.id] ?? [], sticker: messageStickerRows[message.id] ?? null })), hasMore, nextCursor: oldest ? `${oldest.createdAt.toISOString()}~${oldest.id}` : null });
   }));
 
   router.post('/channels/:channelId/read', asyncRoute(async (req, res) => {
@@ -632,8 +674,9 @@ export function createApi(io: SocketServer): Router {
       .where(and(eq(messages.channelId, channel.id), isNotNull(messages.pinnedAt))).orderBy(desc(messages.pinnedAt), desc(messages.id));
     const reactions = await reactionSummariesFor(rows.map((message) => message.id), userId);
     const attachments = await attachmentsForMessages(rows.map((message) => message.id));
+    const messageStickerRows = await stickersForMessages(rows.map((message) => message.id));
     res.setHeader('Cache-Control', 'private, no-store');
-    res.json({ messages: rows.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [], attachments: attachments[message.id] ?? [] })) });
+    res.json({ messages: rows.map((message) => ({ ...withoutHiddenAvatar(message), reactions: reactions[message.id] ?? [], attachments: attachments[message.id] ?? [], sticker: messageStickerRows[message.id] ?? null })) });
   }));
 
   router.post('/channels/:channelId/messages', asyncRoute(async (req, res) => {
@@ -649,9 +692,23 @@ export function createApi(io: SocketServer): Router {
       body: z.string().trim().max(2000).default(''),
       replyToId: uuid.nullable().optional(),
       attachmentIds: z.array(uuid).max(MAX_ATTACHMENTS_PER_MESSAGE).default([]).refine((ids) => new Set(ids).size === ids.length),
+      stickerId: uuid.nullable().optional(),
+      builtinKey: z.string().regex(/^[a-z0-9_]{2,32}$/).nullable().optional(),
     }).safeParse(req.body);
     if (!input.success) { res.status(400).json({ error: 'Mensagem inválida. Podes enviar até 5 anexos e 2000 caracteres.' }); return; }
-    if (!input.data.body && input.data.attachmentIds.length === 0) { res.status(400).json({ error: 'Escreve uma mensagem ou escolhe pelo menos um anexo.' }); return; }
+    if (input.data.stickerId && input.data.builtinKey) { res.status(400).json({ error: 'Escolhe apenas um sticker.' }); return; }
+    if (!input.data.body && input.data.attachmentIds.length === 0 && !input.data.stickerId && !input.data.builtinKey) { res.status(400).json({ error: 'Escreve uma mensagem ou escolhe um anexo ou sticker.' }); return; }
+    if (!await validateMessageEmojiReferences(input.data.body, channel.communityId)) { res.status(400).json({ error: 'Um emoji personalizado já não está disponível.' }); return; }
+    let messageStickerName: string | null = null;
+    if (input.data.builtinKey) {
+      const builtin = builtinSticker(input.data.builtinKey);
+      if (!builtin) { res.status(400).json({ error: 'Sticker do Pacote Mavuno inválido.' }); return; }
+      messageStickerName = builtin.label;
+    } else if (input.data.stickerId) {
+      const [sticker] = await db.select({ id: stickers.id, name: stickers.name }).from(stickers).where(and(eq(stickers.id, input.data.stickerId), eq(stickers.communityId, channel.communityId), isNull(stickers.removedAt))).limit(1);
+      if (!sticker) { res.status(400).json({ error: 'Esse sticker já não está disponível.' }); return; }
+      messageStickerName = sticker.name;
+    }
     if (input.data.replyToId) {
       const [parent] = await db.select({ id: messages.id }).from(messages).where(and(eq(messages.id, input.data.replyToId), eq(messages.channelId, channel.id))).limit(1);
       if (!parent) { res.status(400).json({ error: 'A resposta deve referir uma mensagem deste canal.' }); return; }
@@ -693,6 +750,9 @@ export function createApi(io: SocketServer): Router {
           .returning({ id: messageAttachments.id });
         if (linked.length !== input.data.attachmentIds.length) throw new Error('Attachment link changed during message transaction');
       }
+      if (messageStickerName) {
+        await tx.insert(messageStickers).values({ messageId: created.id, stickerId: input.data.stickerId ?? null, stickerName: messageStickerName, builtinKey: input.data.builtinKey ?? null });
+      }
       return { type: 'created' as const, id: created.id };
     });
     if (outcome.type === 'channel-missing') { res.status(404).json({ error: 'Canal não encontrado.' }); return; }
@@ -722,7 +782,8 @@ export function createApi(io: SocketServer): Router {
     }
     if (row) {
       const attachments = await attachmentsForMessages([row.id]);
-      const message = { ...withoutHiddenAvatar(row), attachments: attachments[row.id] ?? [] };
+      const messageStickerRows = await stickersForMessages([row.id]);
+      const message = { ...withoutHiddenAvatar(row), attachments: attachments[row.id] ?? [], sticker: messageStickerRows[row.id] ?? null };
       if (created) io.to(`channel:${channel.id}`).emit('message:new', message);
       res.status(created ? 201 : 200).json({ message });
       return;
@@ -731,7 +792,7 @@ export function createApi(io: SocketServer): Router {
   }));
 
   router.post('/messages/:messageId/reactions', asyncRoute(async (req, res) => {
-    const input = z.object({ emoji: z.string().min(1).max(32).refine(isUnicodeEmoji), active: z.boolean() }).safeParse(req.body);
+    const input = z.object({ emoji: z.string().min(1).max(64), active: z.boolean() }).safeParse(req.body);
     if (!input.success) { res.status(400).json({ error: 'Escolhe um único emoji válido.' }); return; }
     const userId = currentUser(res).id;
     const outcome = await db.transaction(async (tx) => {
@@ -747,6 +808,14 @@ export function createApi(io: SocketServer): Router {
       const [mute] = await tx.select({ id: communityMutes.id }).from(communityMutes)
         .where(and(eq(communityMutes.communityId, message.communityId), eq(communityMutes.userId, userId), isNull(communityMutes.revokedAt), gt(communityMutes.expiresAt, new Date()))).limit(1);
       if (mute) return { status: 403, error: 'Não podes reagir enquanto estiveres silenciado.' };
+      const reaction = parseReactionValue(input.data.emoji);
+      if (!reaction || (reaction.kind === 'unicode' && !isUnicodeEmoji(reaction.value))) return { status: 400, error: 'Escolhe um único emoji válido.' };
+      if (reaction.kind === 'builtin' && !builtinEmoji(reaction.value)) return { status: 400, error: 'Emoji do Pacote Mavuno inválido.' };
+      if (reaction.kind === 'custom') {
+        const [custom] = await tx.select({ id: customEmojis.id }).from(customEmojis)
+          .where(and(eq(customEmojis.id, reaction.value), eq(customEmojis.communityId, message.communityId), isNull(customEmojis.removedAt))).limit(1);
+        if (!custom) return { status: 400, error: 'Esse emoji já não está disponível.' };
+      }
       const [existing] = await tx.select({ id: messageReactions.id }).from(messageReactions)
         .where(and(eq(messageReactions.messageId, message.id), eq(messageReactions.userId, userId), eq(messageReactions.emoji, input.data.emoji))).limit(1);
       if (input.data.active && !existing) {

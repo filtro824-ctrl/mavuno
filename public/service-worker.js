@@ -1,4 +1,4 @@
-const CACHE = 'mavuno-static-v17';
+const CACHE = 'mavuno-static-v18';
 const SHELL = ['/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -13,7 +13,7 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  if (event.request.method !== 'GET' || url.origin !== self.location.origin || url.pathname.startsWith('/api/') || url.pathname.startsWith('/socket.io/') || url.pathname.startsWith('/invite/')) return;
+  if (event.request.method !== 'GET' || url.origin !== self.location.origin || url.search || url.pathname.startsWith('/api/') || url.pathname.startsWith('/socket.io/') || url.pathname.startsWith('/invite/')) return;
   if (!/\.(?:js|css|svg|png|webmanifest|woff2?)$/i.test(url.pathname)) return;
   event.respondWith((async () => {
     const cached = await caches.match(event.request);

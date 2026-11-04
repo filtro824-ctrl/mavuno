@@ -80,6 +80,8 @@ io.on('connection', (socket) => {
   void (async () => {
     const existing = await io.in(userRoom).fetchSockets();
     await socket.join(userRoom);
+    const memberships = await db.select({ communityId: communityMembers.communityId }).from(communityMembers).where(eq(communityMembers.userId, user.id));
+    for (const membership of memberships) await socket.join(`community:${membership.communityId}`);
     if (existing.length === 0) await broadcastProfilePresence(io, user.id, true);
   })().catch(() => undefined);
   let lastJoin = 0;
