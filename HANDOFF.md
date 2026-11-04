@@ -23,6 +23,7 @@
 React/Vite, TypeScript, Express, Socket.IO, PostgreSQL com Drizzle, LiveKit para voz, PWA. Ficheiros principais: src/client/App.tsx, api.ts, styles.css, emoji-data.ts; src/server/index.ts, api.ts, security.ts, permissions.ts, profile-utils.ts, profile-realtime.ts, db/schema.ts; public/service-worker.js; drizzle/; tests/. Comandos: pnpm typecheck, pnpm test, pnpm build.
 
 ## 4. Estado atual
+Etapa 8 em curso: o esquema para emojis personalizados, stickers e stickers de mensagens foi acrescentado no código e a migração 0013 foi aplicada pelo dono no Supabase. A implementação do servidor, do Pacote Mavuno e da interface ainda está por concluir.
 Etapa 9 concluída no código: escolha de fotografia no dispositivo, editor de recorte circular para o perfil e enquadramento largo para o fundo, ajuste por arrasto/toque e zoom, pré-visualização, cancelar/concluir e envio para o bucket S3 privado existente. Os links HTTPS já guardados mantêm-se até o utilizador guardar uma substituição. Não foi alterado o esquema nem o SQL aplicado.
 O botão flutuante de conversas rápidas pode ser arrastado e encaixa na lateral mais próxima; a posição lateral e vertical é guardada neste aparelho, o botão recolhe após 10 segundos sem uso e pode ser reposicionado por toque, rato ou teclado.
 Etapa 10 concluída no código: convites com durações e limites configuráveis, pré-visualização pública sem sessão em /invite/<código>, regras com aceitação obrigatória, mensagem de boas-vindas, entrada pública por pedido opcional, gestão e revogação de convites, aprovação/recusa/cancelamento de pedidos, cooldown de 24 horas, limite de 20 pedidos pendentes por utilizador, avisos em tempo real e permissões verificadas no servidor. Migração 0011 aplicada pelo dono; não foi alterado novamente o SQL aplicado.
@@ -39,7 +40,8 @@ Ainda NÃO existe: emojis personalizados e stickers, mensagens privadas (DMs), A
 6. Migração 0010, aplicada pelo dono: nova tabela message_attachments, índices message_id/user_id e RLS ativo.
 7. Migração 0011, aplicada pelo dono: colunas welcome_message e require_approval em communities, rules_accepted_at em community_members, revoked_at em invitations, tabela join_requests com índices e RLS ativo.
 8. Migração 0012, aplicada pelo dono: categorias de canais, posição e leitura em channels, tabela channel_reads com RLS e campos de capa em communities.
-Nota: o ajuste do botão flutuante e a etapa 9 não alteram o esquema; a etapa 10 usa a migração 0011 e a etapa 11 usa a migração 0012, ambas aplicadas pelo dono. A etapa 9 usa o bucket privado já previsto, cuja configuração e regra de ciclo de vida continuam a cargo do dono.
+9. Migração 0013, aplicada pelo dono: tabelas custom_emojis, stickers e message_stickers com índices e RLS ativo; alargamento de message_reactions.emoji para varchar(64).
+Nota: o ajuste do botão flutuante e a etapa 9 não alteram o esquema; a etapa 10 usa a migração 0011, a etapa 11 usa a migração 0012 e o esquema da etapa 8 usa a migração 0013, aplicadas pelo dono. A etapa 9 e a etapa 8 usam o bucket privado já previsto, cuja configuração e regra de ciclo de vida continuam a cargo do dono.
 
 ## 6. Fila de etapas (o dono envia o pedido de cada uma, por esta ordem)
 4 Menu das mensagens ao premir (sem os três pontos), silenciar e banir por tempo. SQL (1 coluna: community_bans.expires_at).

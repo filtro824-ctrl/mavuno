@@ -124,12 +124,54 @@ export const messageReactions = pgTable('message_reactions', {
   id: uuid('id').defaultRandom().primaryKey(),
   messageId: uuid('message_id').notNull().references(() => messages.id, { onDelete: 'cascade' }),
   userId: uuid('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
-  emoji: varchar('emoji', { length: 32 }).notNull(),
+  emoji: varchar('emoji', { length: 64 }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   uniqueIndex('message_reactions_message_user_emoji_unique').on(t.messageId, t.userId, t.emoji),
   index('message_reactions_message_idx').on(t.messageId),
 ]);
+
+export const customEmojis = pgTable('custom_emojis', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'cascade' }),
+  name: varchar('name', { length: 32 }).notNull(),
+  storageKey: varchar('storage_key', { length: 255 }).notNull().unique(),
+  mimeType: varchar('mime_type', { length: 120 }).notNull(),
+  width: integer('width').notNull(),
+  height: integer('height').notNull(),
+  animated: boolean('animated').notNull().default(false),
+  createdBy: uuid('created_by').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  removedAt: timestamp('removed_at', { withTimezone: true }),
+}, (t) => [
+  uniqueIndex('custom_emojis_community_name_active_unique').on(t.communityId, t.name).where(sql`${t.removedAt} is null`),
+  index('custom_emojis_community_idx').on(t.communityId),
+]);
+
+export const stickers = pgTable('stickers', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  communityId: uuid('community_id').notNull().references(() => communities.id, { onDelete: 'cascade' }),
+  name: varchar('name', { length: 32 }).notNull(),
+  description: varchar('description', { length: 120 }).notNull().default(''),
+  storageKey: varchar('storage_key', { length: 255 }).notNull().unique(),
+  mimeType: varchar('mime_type', { length: 120 }).notNull(),
+  width: integer('width').notNull(),
+  height: integer('height').notNull(),
+  animated: boolean('animated').notNull().default(false),
+  createdBy: uuid('created_by').notNull().references(() => users.id, { onDelete: 'restrict' }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  removedAt: timestamp('removed_at', { withTimezone: true }),
+}, (t) => [
+  uniqueIndex('stickers_community_name_active_unique').on(t.communityId, t.name).where(sql`${t.removedAt} is null`),
+  index('stickers_community_idx').on(t.communityId),
+]);
+
+export const messageStickers = pgTable('message_stickers', {
+  messageId: uuid('message_id').primaryKey().references(() => messages.id, { onDelete: 'cascade' }),
+  stickerId: uuid('sticker_id').references(() => stickers.id, { onDelete: 'set null' }),
+  stickerName: varchar('sticker_name', { length: 32 }).notNull(),
+  builtinKey: varchar('builtin_key', { length: 64 }),
+});
 
 export const channelPermissions = pgTable('channel_permissions', {
   channelId: uuid('channel_id').notNull().references(() => channels.id, { onDelete: 'cascade' }),
