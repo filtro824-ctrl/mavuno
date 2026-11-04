@@ -24,6 +24,7 @@ import { copyStoredObject, deleteStoredObject, inspectStoredObject, signReadUrl,
 import { createJoinFlowRouter, createPublicInvitePreviewRouter } from './join-flow-api.js';
 import { canWriteToChannel, categoryNameSchema, coverColorSchema, coverUrlSchema, summarizeUnreadRows } from './channel-utils.js';
 import { createCustomAssetsRouter } from './custom-assets-api.js';
+import { createDirectMessagesRouter } from './direct-messages-api.js';
 import { builtinEmoji, builtinSticker, builtinStickerUrl } from './builtin-assets.js';
 import { parseReactionValue, extractEmojiReferences } from './custom-asset-utils.js';
 
@@ -275,6 +276,7 @@ export function createApi(io: SocketServer): Router {
   router.use(createAttachmentsRouter(io));
   router.use(createCustomAssetsRouter(io));
   router.use(createProfileMediaRouter());
+  router.use('/dm', createDirectMessagesRouter(io));
   router.get('/auth/me', (_req, res) => res.json({ user: currentUser(res) }));
   router.get('/profile', asyncRoute(async (_req, res) => {
     const profile = await loadOwnProfile(currentUser(res).id);
