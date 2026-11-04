@@ -88,11 +88,12 @@ function MenuRow({ icon, children, danger, onClick }: { icon: string; children: 
   return <button type="button" className={`action-menu-row ${danger ? 'danger-text' : ''}`} onClick={onClick}><Icon name={icon}/><span>{children}</span></button>;
 }
 
-export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions, targetMember, onClose, onReply, onDelete, onDownload, onPin, onQuickReaction, onMoreReactions, onProfile, onCall, onModerate, onUnmute, onKick, notify }: {
+export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions, targetMember, onClose, onReply, onDelete, onDownload, onPin, onQuickReaction, onMoreReactions, onProfile, onCall, onModerate, onUnmute, onKick, notify, mode = 'channel' }: {
   target: ActionMenuTarget; actorId: string; actorRole: string | null; actorPermissions: string[]; targetMember?: Member;
   onClose: () => void; onReply: (message: Message) => void; onDelete: (message: Message) => Promise<void> | void; onDownload: (message: Message) => Promise<void> | void; onPin: (message: Message) => Promise<void> | void;
   onQuickReaction: (message: Message, emoji: string) => void; onMoreReactions: (message: Message) => void; onProfile: (userId: string) => void; onCall: (member: Member) => void;
   onModerate: (action: 'mute' | 'ban', member: Member) => void; onUnmute: (member: Member) => void; onKick: (member: Member) => Promise<void> | void; notify: (text: string) => void;
+  mode?: 'channel' | 'direct';
 }) {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const highlightRef = useRef<HTMLElement | null>(null);
@@ -103,7 +104,7 @@ export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions
   const message = target.kind === 'message' ? target.message : null;
   const member = target.kind === 'member' ? target.member : targetMember;
   const own = message?.authorId === actorId;
-  const mayPin = Boolean(message && can(actorPermissions, 'pin_messages'));
+  const mayPin = mode === 'channel' && Boolean(message && can(actorPermissions, 'pin_messages'));
   const mayDelete = Boolean(message && (own || can(actorPermissions, 'delete_messages')));
   const canTarget = canAct(actorRole, member);
   const mayMute = canTarget && can(actorPermissions, 'mute_members');
@@ -171,13 +172,13 @@ export function ActionMenuOverlay({ target, actorId, actorRole, actorPermissions
     {message && <article ref={highlightRef} className="action-message-highlight" style={{ top: highlightTop, left: Math.max(8, target.rect.left), width: Math.min(target.rect.width, window.innerWidth - 16) }} aria-hidden="true"><strong>{message.username}</strong><time>{new Intl.DateTimeFormat('pt-MZ', { hour: '2-digit', minute: '2-digit' }).format(new Date(message.createdAt))}</time><p>{message.pinnedAt && <span className="pinned-label">Fixada · </span>}{message.body}</p></article>}
     <section ref={menuRef} className={`action-menu-panel ${mobile ? 'mobile' : 'desktop'}`} style={panelStyle} role="dialog" aria-modal="true" aria-label={message ? 'Opções da mensagem' : `Ações de ${member?.username ?? 'membro'}`}>
       {mobile && <header className="action-menu-sheet-heading"><span className="action-menu-drag-handle"/><span>{message ? 'Mensagem' : member?.username}</span><button type="button" className="action-menu-close" aria-label="Fechar menu" onClick={onClose}>×</button></header>}
-      {message && <div className="action-menu-group action-menu-reactions" role="group" aria-label="Reações rápidas">
+      {message && mode === 'channel' && <div className="action-menu-group action-menu-reactions" role="group" aria-label="Reações rápidas">
         <div className="action-menu-reaction-row">{['👍', '❤️', '😂', '😮', '😢', '🙏'].map((emoji) => <button type="button" key={emoji} aria-label={`Reagir com ${emoji}`} onClick={() => run(() => onQuickReaction(message, emoji))}>{emoji}</button>)}</div>
         <MenuRow icon="plus" onClick={() => run(() => onMoreReactions(message))}>Adicionar reação</MenuRow>
       </div>}
       {message && <div className="action-menu-group"><h3>Mensagem</h3>
         {!message.delivery && <MenuRow icon="reply" onClick={() => run(() => onReply(message))}>Responder</MenuRow>}
-        {message.attachments?.length ? <MenuRow icon="download" onClick={() => run(() => { void onDownload(message); })}>Descarregar</MenuRow> : null}
+        {mode === 'channel' && message.attachments?.length ? <MenuRow icon="download" onClick={() => run(() => { void onDownload(message); })}>Descarregar</MenuRow> : null}
         {message.body && <MenuRow icon="copy" onClick={() => copyText(message.body)}>Copiar texto</MenuRow>}
         {message.body && 'speechSynthesis' in window && <MenuRow icon="speak" onClick={() => { if (speaking) { window.speechSynthesis.cancel(); setSpeaking(false); } else { toggleSpeech(message.body); } }}>{speaking ? 'Parar de falar' : 'Falar mensagem'}</MenuRow>}
         {mayPin && <MenuRow icon="pin" onClick={() => run(() => { void onPin(message); })}>{message.pinnedAt ? 'Desafixar' : 'Fixar'}</MenuRow>}

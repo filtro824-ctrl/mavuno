@@ -13,6 +13,7 @@ import { clampFloatingPosition, FLOATING_BUTTON_SIZE, floatingTuckOffset, neares
 import { ProfileImageCropper } from './profile-image-cropper';
 import { AssetReaction, CommunityEmojiPicker, CommunityStickerPicker, InlineEmojiText, MessageStickerView } from './community-assets';
 import CustomAssetsManager from './custom-assets-ui';
+import { DirectMessagesView } from './direct-messages';
 
 type ModalType = 'community' | 'channel' | 'profile' | 'memberProfile' | 'account' | 'settings' | 'admin' | null;
 type PendingAttachment = { key: string; file: File; previewUrl: string; mimeType: string; kind: AttachmentKind; width: number | null; height: number | null; attachmentId?: string; progress: number; status: 'queued' | 'uploading' | 'ready' | 'failed'; error?: string };
@@ -369,6 +370,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
   const [newMessages, setNewMessages] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [explore, setExplore] = useState(false);
+  const [directMessagesOpen, setDirectMessagesOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [publicCommunities, setPublicCommunities] = useState<Community[]>([]);
   const [modal, setModal] = useState<ModalType>(null);
@@ -567,21 +569,24 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     setMemberProfileError('');
     try {
       const result = await api<{ profile: MemberProfile }>(`/users/${encodeURIComponent(targetId)}/profile?communityId=${encodeURIComponent(communityId)}`);
-      if (request === profileRequestRef.current && memberProfileIdRef.current === targetId) setMemberProfile(result.profile);
+      if (request === profileRequestRef.current && memberProfileIdRef.current === targetId) { setMemberProfile(result.profile); return true; }
+      return false;
     } catch (cause) {
       if (request === profileRequestRef.current && memberProfileIdRef.current === targetId) setMemberProfileError(cause instanceof Error ? cause.message : 'Não foi possível abrir este perfil.');
+      return false;
     } finally {
       if (request === profileRequestRef.current && memberProfileIdRef.current === targetId) setMemberProfileLoading(false);
     }
   }, []);
   const openMemberProfile = useCallback((targetId: string) => {
     if (targetId === user.id) { void openOwnProfile(); return; }
-    if (!activeCommunityId) return;
+    const communityIds = [...new Set([activeCommunityId, ...communities.map((item) => item.id)].filter((id): id is string => Boolean(id)))];
+    if (!communityIds.length) return;
     memberProfileIdRef.current = targetId;
     setMemberProfile(null);
     setModal('memberProfile');
-    void loadMemberProfile(targetId, activeCommunityId);
-  }, [activeCommunityId, loadMemberProfile, openOwnProfile, user.id]);
+    void (async () => { for (const communityId of communityIds) if (await loadMemberProfile(targetId, communityId)) return; })();
+  }, [activeCommunityId, communities, loadMemberProfile, openOwnProfile, user.id]);
   const closeMemberProfile = useCallback(() => {
     memberProfileIdRef.current = null;
     profileRequestRef.current += 1;
@@ -589,6 +594,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     setModal(null);
   }, []);
   const openCommunity = useCallback(async (id: string, autoChannel = true) => {
+    setDirectMessagesOpen(false);
     try {
       const data = await api<CommunityDetails>(`/communities/${id}`);
       setDetails(data);
@@ -1258,17 +1264,18 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
     }
     finally { setProfileBusy(false); }
   };
-  const appClass = `app-shell ${mobileView === 'channels' ? 'mobile-channels' : 'mobile-chat'}`;
+  const appClass = `app-shell ${mobileView === 'channels' ? 'mobile-channels' : 'mobile-chat'}${directMessagesOpen ? ' direct-messages-mode' : ''}`;
   const communityUnread = Math.min(99, details?.channels.reduce((total, item) => total + (item.unreadCount ?? 0), 0) ?? 0);
 
   return <div className={appClass}>
     <nav className="community-rail" aria-label="Navegação principal">
-      <button className="rail-logo" aria-label="Início" onClick={() => { setDetails(null); setChannel(null); setExplore(false); }}>m</button>
+      <button className="rail-logo" aria-label="Início" onClick={() => { setDirectMessagesOpen(false); setDetails(null); setChannel(null); setExplore(false); }}>m</button>
       <div className="rail-divider"/>
+      <button className={`community-chip dm-rail-button${directMessagesOpen ? ' active' : ''}`} title="Mensagens privadas" aria-label="Mensagens privadas" aria-pressed={directMessagesOpen} onClick={() => { setQuickOpen(false); if (directMessagesOpen) { setDirectMessagesOpen(false); setMobileView('channels'); } else { setDirectMessagesOpen(true); setMobileView('chat'); } }}>m</button>
       {communities.map((item) => { const unread = details?.community.id === item.id ? communityUnread : item.unreadCount ?? 0; return <button key={item.id} title={item.name} aria-label={`${item.name}${unread ? `, ${unread} mensagens não lidas` : ''}`} className={`community-chip ${details?.community.id === item.id ? 'active' : ''}`} onClick={() => void openCommunity(item.id)}>{initials(item.name)}{unread > 0 && <span className="community-unread-badge">{unread > 99 ? '99+' : unread}</span>}</button>; })}
       <button className="community-chip" title="Criar comunidade" aria-label="Criar comunidade" onClick={() => setModal('community')}>＋</button>
       <div className="rail-divider"/>
-      <button className={`community-chip ${explore ? 'active' : ''}`} title="Explorar comunidades" aria-label="Explorar comunidades" onClick={() => void loadExplore()}>⌕</button>
+      <button className={`community-chip ${explore ? 'active' : ''}`} title="Explorar comunidades" aria-label="Explorar comunidades" onClick={() => { setDirectMessagesOpen(false); void loadExplore(); }}>⌕</button>
     </nav>
 
     <aside className="side-panel">
@@ -1322,17 +1329,17 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
 
     <main className="main-panel">
       <header className="topbar">
-        {mobileView === 'chat' && <button className="icon-button mobile-back" onClick={() => { if (mobileHistory.current.length > 1) window.history.back(); else navigateMobile('channels'); }} aria-label="Voltar aos canais">←</button>}
-        <h1>{explore ? 'Descobrir comunidades' : channel ? `${channel.kind === 'voice' ? '◖' : channel.readOnly ? '🔒' : '#'} ${channel.name}` : details?.community.name ?? 'Mavuno'}</h1>
+        {mobileView === 'chat' && <button className="icon-button mobile-back" onClick={() => { if (directMessagesOpen) { setDirectMessagesOpen(false); setMobileView('channels'); } else if (mobileHistory.current.length > 1) window.history.back(); else navigateMobile('channels'); }} aria-label={directMessagesOpen ? 'Fechar mensagens' : 'Voltar aos canais'}>←</button>}
+        <h1>{directMessagesOpen ? 'Mensagens' : explore ? 'Descobrir comunidades' : channel ? `${channel.kind === 'voice' ? '◖' : channel.readOnly ? '🔒' : '#'} ${channel.name}` : details?.community.name ?? 'Mavuno'}</h1>
         <span className={`network-status ${online ? '' : 'offline'}`}>{!online ? '● Sem ligação. A tentar novamente...' : reconnecting ? '● A reconectar…' : '● Ligado'}</span>
-        {channel?.kind === 'text' && <span className="muted">Mensagens</span>}
+        {!directMessagesOpen && channel?.kind === 'text' && <span className="muted">Mensagens</span>}
       </header>
 
-      {!explore && details && <CommunityCover community={details.community}/>}
+      {!directMessagesOpen && !explore && details && <CommunityCover community={details.community}/>}
 
-      {!explore && channel?.kind === 'text' && pinnedMessages.length > 0 && <div className="pinned-strip"><span aria-hidden="true">◆</span><strong>Fixadas</strong><button onClick={() => void openPinned()}>{pinnedMessages.length} mensagem(ns) · Ver lista</button></div>}
-      {!explore && channel?.kind === 'text' && newMessages > 0 && <div className="new-messages-strip" role="status"><span>{newMessages} {newMessages === 1 ? 'mensagem nova' : 'mensagens novas'}</span><button onClick={() => void markChannelRead(channel.id)}>Marcar como lida</button></div>}
-      {explore ? <section className="explore-view">
+      {!directMessagesOpen && !explore && channel?.kind === 'text' && pinnedMessages.length > 0 && <div className="pinned-strip"><span aria-hidden="true">◆</span><strong>Fixadas</strong><button onClick={() => void openPinned()}>{pinnedMessages.length} mensagem(ns) · Ver lista</button></div>}
+      {!directMessagesOpen && !explore && channel?.kind === 'text' && newMessages > 0 && <div className="new-messages-strip" role="status"><span>{newMessages} {newMessages === 1 ? 'mensagem nova' : 'mensagens novas'}</span><button onClick={() => void markChannelRead(channel.id)}>Marcar como lida</button></div>}
+      {directMessagesOpen ? <DirectMessagesView currentUserId={user.id} onCall={(peer) => { const member = details?.members.find((item) => item.id === peer.id); setCallTarget(member ?? { id: peer.id, username: peer.username, avatarUrl: peer.avatarUrl, role: 'member' }); }} onProfile={openMemberProfile} notify={notify}/> : explore ? <section className="explore-view">
         <h2>Encontra o teu espaço</h2><p className="muted">Explora comunidades abertas ou pesquisa por nome e categoria.</p>
         <div className="community-cards">{publicCommunities.map((item) => <article className="community-card" key={item.id}>
           <span className="muted" style={{ fontSize: 11 }}>{item.category}</span><h3>{item.name}</h3><p className="muted" style={{ fontSize: 13 }}>{item.description || 'Uma comunidade Mavuno.'}</p>
@@ -1394,7 +1401,7 @@ function Dashboard({ user, onUserChange, onLogout, inviteToken, onClearInvite }:
       <button ref={floatingButtonRef} className={`floating-button${tucked ? ` tucked-${floatingPosition.side}` : ''}`} aria-label="Abrir painel rápido; arrasta para mover. Usa as setas para posicionar." aria-expanded={quickOpen} onClick={() => { if (suppressFloatingClickRef.current) { suppressFloatingClickRef.current = false; return; } resetTuckTimer(); setQuickOpen((value) => !value); }} onPointerDown={startFloatingPointer} onPointerMove={moveFloatingPointer} onPointerUp={finishFloatingPointer} onPointerCancel={finishFloatingPointer} onKeyDown={moveFloatingWithKeyboard}>m</button>
       {quickOpen && <div className={`quick-panel${floatingPosition.side === 'left' ? ' quick-panel-left' : ''}`} onPointerDown={resetTuckTimer}><div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}><strong>Conversas rápidas</strong><button className="text-button" onClick={() => setQuickOpen(false)} aria-label="Fechar painel">×</button></div>
         {quickItems.length === 0 ? <p className="muted" style={{ fontSize: 13 }}>As tuas comunidades aparecem aqui.</p> : quickItems.map((item) => <button key={item.id} className="channel-row" onClick={() => { void openCommunity(item.id); setQuickOpen(false); }}>{item.name}</button>)}
-        <button className="text-button" onClick={() => { void loadExplore(); setQuickOpen(false); }}>Explorar comunidades</button>
+        <button className="text-button" onClick={() => { setDirectMessagesOpen(true); setMobileView('chat'); setQuickOpen(false); }}>Mensagens privadas</button><button className="text-button" onClick={() => { setDirectMessagesOpen(false); void loadExplore(); setQuickOpen(false); }}>Explorar comunidades</button>
       </div>}
     </div>
     {pinnedOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setPinnedOpen(false); }}><section className="modal pinned-modal" role="dialog" aria-modal="true" aria-labelledby="pinned-title"><h2 id="pinned-title">Mensagens fixadas</h2><div className="pinned-list">{pinnedMessages.map((item) => <article className="pinned-item" key={item.id}><strong>{item.username}</strong><time className="message-time">{formatTime(item.createdAt)}</time><p><InlineEmojiText text={item.body} assets={communityAssets}/></p>{item.sticker && <MessageStickerView sticker={item.sticker}/>}<AttachmentGallery attachments={item.attachments ?? []} onDownload={downloadAttachment} notify={notify}/>{!!item.reactions?.length && <div className="reaction-pills">{item.reactions.map((reaction) => <ReactionPill key={reaction.emoji} assets={communityAssets} reaction={reaction} pending={pendingReactionKeys.has(`${item.id}:${reaction.emoji}`)} onToggle={() => void toggleReaction(item, reaction.emoji)} onLongPress={() => void showReactionUsers(item.id, reaction.emoji)}/>)}</div>}</article>)}</div><div className="modal-actions"><button className="secondary" onClick={() => setPinnedOpen(false)}>Fechar</button></div></section></div>}
